@@ -450,6 +450,13 @@ for note in notes_list:
     st.text(note)
 st.markdown("---")
 
+# ▼▼▼▼▼ [추가 1] DART 접속 객체를 캐싱하는 함수 (if run_btn 바로 위에 넣으세요) ▼▼▼▼▼
+@st.cache_resource
+def get_dart_reader(api_key):
+    return OpenDartReader(api_key)
+# ▲▲▲▲▲ [여기까지 추가] ▲▲▲▲▲
+
+
 # 실행 로직
 if run_btn:
     if not api_key_input:
@@ -464,9 +471,14 @@ if run_btn:
             # 상태 표시 컨테이너
             status_container = st.status("데이터 분석 중...", expanded=True)
             progress_bar = st.progress(0)
-            
-            # API 초기화
-            dart = OpenDartReader(api_key_input)
+
+            # ▼▼▼▼▼ [수정 2] API 초기화 (캐싱 함수 사용 + 에러 처리) ▼▼▼▼▼
+            try:
+                dart = get_dart_reader(api_key_input)
+            except Exception as e:
+                st.error(f"DART 서버 접속 실패 (잠시 후 다시 시도하거나 로컬에서 실행하세요): {e}")
+                st.stop()
+            # ▲▲▲▲▲ [여기까지 수정] ▲▲▲▲▲
             
             # 변수 초기화
             base_year, base_qtr = parse_period(base_period_str)
