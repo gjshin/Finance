@@ -445,6 +445,22 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
 # 5. Streamlit App Layout
 # ==========================================
 st.set_page_config(page_title="Global GPCM Generator", layout="wide", page_icon="📊")
+
+# ---------------------------------------------------------
+# [User Access Log] 접속자 로그 기록 (Console 출력)
+# ---------------------------------------------------------
+try:
+    # Streamlit Cloud (Private) 환경에서 이메일 가져오기
+    user_email = st.experimental_user.email if st.experimental_user.email else "Anonymous"
+except:
+    user_email = "Local_Dev"
+
+# 현재 시간 (이미 import datetime이 되어 있으므로 바로 사용)
+now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# 로그 출력 (Manage app > Logs 터미널에서 확인 가능)
+print(f"👉 [접속 알림] {now_str} / 사용자: {user_email}")
+
 st.title("📊 GPCM Calculator with yfinance")
 st.write("yfinance 라이브러리를 통해 기준일 시점 선정된 Peer들의 재무제표, 주가, 시가총액 등을 크롤링하여 기준일 시점 Peer Group GPCM Multiple을 자동계산하는 어플리케이션입니다(Made by SGJ, 2026-02-10)")
 
