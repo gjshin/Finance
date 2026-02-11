@@ -2,3 +2,8 @@ streamlit
 yfinance
 pandas
 openpyxl
+opendartreader
+finance-datareader
+numpy
+requests
+lxml
