@@ -4,6 +4,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import io
 import numpy as np
+import time 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -13,6 +14,7 @@ from openpyxl.chart.axis import ChartLines
 # ==========================================
 # 1. Helper Functions (v17 Logic)
 # ==========================================
+@st.cache_data(ttl=3600)  # <--- [추가] 1시간 동안 데이터를 저장해서 재사용함
 def get_gpcm_data(tickers_list, base_date_str):
     """
     GPCM 데이터 수집 및 엑셀 생성을 위한 데이터 구조 반환
@@ -59,6 +61,7 @@ def get_gpcm_data(tickers_list, base_date_str):
     total_tickers = len(tickers_list)
 
     for idx, ticker in enumerate(tickers_list):
+        time.sleep(1)
         status_text.text(f"Processing: {ticker}...")
         progress_bar.progress((idx + 1) / total_tickers)
 
@@ -545,14 +548,25 @@ if btn_run:
 
         # 2. Statistics Table
         st.subheader("📊 Multiples Statistics")
-        stats = []
-        for col in ['EV/EBITDA', 'EV/EBIT', 'PER', 'PBR', 'PSR']:
-            vals = [x for x in df_sum[col] if pd.notnull(x)]
-            if vals:
-                stats.append({'Metric': col, 'Mean': np.mean(vals), 'Median': np.median(vals), 'Max': np.max(vals), 'Min': np.min(vals)})
+       
+        # [안전장치] 데이터가 비어있지 않은 경우에만 통계 계산 수행
+        if not df_sum.empty:
+            stats = []
+            for col in ['EV/EBITDA', 'EV/EBIT', 'PER', 'PBR', 'PSR']:
+                # 해당 컬럼이 실제로 존재하는지 확인 (KeyError 방지)
+                if col in df_sum.columns:
+                    vals = [x for x in df_sum[col] if pd.notnull(x)]
+                    if vals:
+                        stats.append({'Metric': col, 'Mean': np.mean(vals), 'Median': np.median(vals), 'Max': np.max(vals), 'Min': np.min(vals)})
+                    else:
+                        stats.append({'Metric': col, 'Mean': None, 'Median': None, 'Max': None, 'Min': None})
+            
+            if stats:
+                st.dataframe(pd.DataFrame(stats).set_index('Metric').style.format('{:.1f}x', na_rep='N/M'))
             else:
-                stats.append({'Metric': col, 'Mean': None, 'Median': None, 'Max': None, 'Min': None})
-        st.dataframe(pd.DataFrame(stats).set_index('Metric').style.format('{:.1f}x', na_rep='N/M'))
+                st.warning("통계를 산출할 유효한 데이터가 없습니다.")
+        else:
+            st.error("데이터를 불러오지 못했습니다. 잠시 후 다시 시도해주세요 (Yahoo Rate Limit).")
 
         # 3. Excel Download
         excel_data = create_excel(gpcm_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel, base_date_str, t_map)
