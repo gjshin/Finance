@@ -4,16 +4,102 @@ import pandas as pd
 from datetime import datetime, timedelta
 import io
 import numpy as np
-import time 
+import time
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.chart import LineChart, Reference, Series
 from openpyxl.chart.axis import ChartLines
+import FinanceDataReader as fdr
+from scipy import stats
 
 # ==========================================
-# 1. Helper Functions (v17 Logic)
+# 1. Helper Functions (v17 Logic + Beta Calculation)
 # ==========================================
+
+def get_market_index(ticker):
+    """티커 기반으로 거래소 및 시장지수 코드 반환"""
+    if ticker.endswith('.KS'):
+        return 'KOSPI', 'KS11'
+    elif ticker.endswith('.KQ'):
+        return 'KOSDAQ', 'KQ11'
+    elif ticker.endswith('.T'):
+        return 'TSE', '^N225'
+    elif ticker.endswith('.TO'):
+        return 'TSX', '^GSPTSE'
+    elif ticker.endswith('.F') or ticker.endswith('.DE'):
+        return 'XETRA', '^GDAXI'
+    elif ticker.endswith('.VI'):
+        return 'VSE', '^ATX'
+    else:
+        return 'US', '^GSPC'  # S&P 500
+
+def calculate_beta(stock_returns, market_returns, min_periods=20):
+    """
+    주식 수익률과 시장 수익률로부터 베타 계산
+    Returns: raw_beta, adjusted_beta
+    """
+    if len(stock_returns) < min_periods or len(market_returns) < min_periods:
+        return None, None
+
+    # 공통 인덱스로 정렬
+    common_idx = stock_returns.index.intersection(market_returns.index)
+    if len(common_idx) < min_periods:
+        return None, None
+
+    stock_ret = stock_returns.loc[common_idx].dropna()
+    market_ret = market_returns.loc[common_idx].dropna()
+
+    common_idx2 = stock_ret.index.intersection(market_ret.index)
+    if len(common_idx2) < min_periods:
+        return None, None
+
+    stock_ret = stock_ret.loc[common_idx2]
+    market_ret = market_ret.loc[common_idx2]
+
+    # 선형회귀로 베타 계산
+    slope, intercept, r_value, p_value, std_err = stats.linregress(market_ret, stock_ret)
+    raw_beta = slope
+
+    # 조정 베타: 2/3 * Raw Beta + 1/3 * 1.0 (Bloomberg 방식)
+    adjusted_beta = (2/3) * raw_beta + (1/3) * 1.0
+
+    return raw_beta, adjusted_beta
+
+def get_korean_marginal_tax_rate(pretax_income_millions):
+    """
+    한국 법인세 한계세율 산출
+    과세표준 기준 (단위: 백만원)
+    - 2억 이하: 10%
+    - 2억 초과 ~ 200억 이하: 20%
+    - 200억 초과 ~ 3,000억 이하: 22%
+    - 3,000억 초과: 25%
+    """
+    if pd.isna(pretax_income_millions) or pretax_income_millions == 0:
+        return 0.22  # 기본값
+
+    # 백만원 단위로 들어온 값
+    if pretax_income_millions <= 200:
+        return 0.10
+    elif pretax_income_millions <= 20000:
+        return 0.20
+    elif pretax_income_millions <= 300000:
+        return 0.22
+    else:
+        return 0.25
+
+def calculate_unlevered_beta(levered_beta, debt, equity, tax_rate):
+    """
+    하마다 모형으로 Unlevered Beta 계산
+    Unlevered Beta = Levered Beta / (1 + (1 - Tax Rate) * (Debt / Equity))
+    """
+    if pd.isna(levered_beta) or levered_beta is None:
+        return None
+    if pd.isna(debt) or pd.isna(equity) or equity == 0:
+        return levered_beta
+
+    unlevered = levered_beta / (1 + (1 - tax_rate) * (debt / equity))
+    return unlevered
 @st.cache_data(ttl=3600)  # <--- [추가] 1시간 동안 데이터를 저장해서 재사용함
 def get_gpcm_data(tickers_list, base_date_str):
     """
@@ -74,10 +160,15 @@ def get_gpcm_data(tickers_list, base_date_str):
 
             gpcm = {
                 'Company': company_name, 'Ticker': ticker, 'Currency': currency,
-                'Base_Date': base_date_str, 
+                'Base_Date': base_date_str,
                 'Cash': 0, 'IBD': 0, 'NCI': 0, 'NOA(Option)': 0, 'Equity': 0,
                 'Revenue': 0, 'EBIT': 0, 'EBITDA': 0, 'NI_Parent': 0,
                 'Close': 0, 'Shares': 0, 'Market_Cap_M': 0, 'PL_Source': '',
+                'Exchange': '', 'Market_Index': '',
+                'Beta_5Y_Monthly_Raw': None, 'Beta_5Y_Monthly_Adj': None,
+                'Beta_2Y_Weekly_Raw': None, 'Beta_2Y_Weekly_Adj': None,
+                'Pretax_Income': 0, 'Tax_Rate': 0.22,
+                'Debt_Ratio': 0, 'Unlevered_Beta_5Y': None, 'Unlevered_Beta_2Y': None,
             }
 
             # [0] Price History (10Y)
@@ -178,6 +269,94 @@ def get_gpcm_data(tickers_list, base_date_str):
                 da_amount = (ebitda_yf - ebit_yf) if (ebitda_yf != 0 and ebit_yf != 0) else 0
                 gpcm['EBITDA'] = calc_sums['OpIncome'] + da_amount
                 gpcm['NI_Parent'] = calc_sums['NI_Parent']
+
+            # [4] Beta Calculation
+            exchange, market_idx = get_market_index(ticker)
+            gpcm['Exchange'] = exchange
+            gpcm['Market_Index'] = market_idx
+
+            try:
+                # 5년 월간 베타 계산
+                start_5y = (base_dt - timedelta(days=365*5+20)).strftime('%Y-%m-%d')
+                end_date = base_dt.strftime('%Y-%m-%d')
+
+                # FinanceDataReader로 데이터 수집
+                if ticker.endswith('.KS') or ticker.endswith('.KQ'):
+                    # 한국 주식은 FinanceDataReader 사용
+                    stock_data_5y = fdr.DataReader(ticker, start_5y, end_date)
+                    market_data_5y = fdr.DataReader(market_idx, start_5y, end_date)
+                else:
+                    # 해외 주식은 yfinance 사용
+                    stock_data_5y = yf.download(ticker, start=start_5y, end=end_date, progress=False)['Close']
+                    market_data_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)['Close']
+
+                if not stock_data_5y.empty and not market_data_5y.empty:
+                    # Close 컬럼 추출
+                    if isinstance(stock_data_5y, pd.DataFrame):
+                        stock_prices_5y = stock_data_5y['Close'] if 'Close' in stock_data_5y.columns else stock_data_5y.iloc[:, 0]
+                    else:
+                        stock_prices_5y = stock_data_5y
+
+                    if isinstance(market_data_5y, pd.DataFrame):
+                        market_prices_5y = market_data_5y['Close'] if 'Close' in market_data_5y.columns else market_data_5y.iloc[:, 0]
+                    else:
+                        market_prices_5y = market_data_5y
+
+                    # 월간 수익률 계산
+                    stock_monthly = stock_prices_5y.resample('ME').last().pct_change().dropna()
+                    market_monthly = market_prices_5y.resample('ME').last().pct_change().dropna()
+
+                    # 베타 계산
+                    raw_beta_5y, adj_beta_5y = calculate_beta(stock_monthly, market_monthly)
+                    gpcm['Beta_5Y_Monthly_Raw'] = raw_beta_5y
+                    gpcm['Beta_5Y_Monthly_Adj'] = adj_beta_5y
+
+                # 2년 주간 베타 계산
+                start_2y = (base_dt - timedelta(days=365*2+20)).strftime('%Y-%m-%d')
+
+                if ticker.endswith('.KS') or ticker.endswith('.KQ'):
+                    stock_data_2y = fdr.DataReader(ticker, start_2y, end_date)
+                    market_data_2y = fdr.DataReader(market_idx, start_2y, end_date)
+                else:
+                    stock_data_2y = yf.download(ticker, start=start_2y, end=end_date, progress=False)['Close']
+                    market_data_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)['Close']
+
+                if not stock_data_2y.empty and not market_data_2y.empty:
+                    if isinstance(stock_data_2y, pd.DataFrame):
+                        stock_prices_2y = stock_data_2y['Close'] if 'Close' in stock_data_2y.columns else stock_data_2y.iloc[:, 0]
+                    else:
+                        stock_prices_2y = stock_data_2y
+
+                    if isinstance(market_data_2y, pd.DataFrame):
+                        market_prices_2y = market_data_2y['Close'] if 'Close' in market_data_2y.columns else market_data_2y.iloc[:, 0]
+                    else:
+                        market_prices_2y = market_data_2y
+
+                    # 주간 수익률 계산
+                    stock_weekly = stock_prices_2y.resample('W').last().pct_change().dropna()
+                    market_weekly = market_prices_2y.resample('W').last().pct_change().dropna()
+
+                    # 베타 계산
+                    raw_beta_2y, adj_beta_2y = calculate_beta(stock_weekly, market_weekly)
+                    gpcm['Beta_2Y_Weekly_Raw'] = raw_beta_2y
+                    gpcm['Beta_2Y_Weekly_Adj'] = adj_beta_2y
+
+            except Exception as e:
+                st.warning(f"Beta calculation failed for {ticker}: {e}")
+
+            # [5] Pretax Income for Tax Rate Calculation
+            if pl_data is not None and 'Pretax Income' in pl_data.index:
+                pretax_vals = []
+                for d in pl_dates:
+                    val = pl_data.loc['Pretax Income', d]
+                    if pd.notna(val):
+                        pretax_vals.append(float(val) / 1e6)
+                if pretax_vals:
+                    gpcm['Pretax_Income'] = sum(pretax_vals)
+
+                    # 한국 기업인 경우 한계세율 계산
+                    if ticker.endswith('.KS') or ticker.endswith('.KQ'):
+                        gpcm['Tax_Rate'] = get_korean_marginal_tax_rate(gpcm['Pretax_Income'])
 
             gpcm_data[ticker] = gpcm
 
@@ -300,64 +479,121 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
     # [Sheet 4] GPCM
     ws = wb.create_sheet('GPCM')
     wb.move_sheet('GPCM', offset=-3)
-    TOTAL_COLS = 23
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=TOTAL_COLS); sc(ws.cell(1,1,'GPCM Valuation Summary'), fo=fT)
+    TOTAL_COLS = 35
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=TOTAL_COLS); sc(ws.cell(1,1,'GPCM Valuation Summary with Beta Analysis'), fo=fT)
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=TOTAL_COLS); sc(ws.cell(2,1,f'Base: {base_date_str} | Unit: Millions (local currency) | EV = MCap + IBD − Cash + NCI'), fo=fS)
-    
+
     r=4
-    sections = [(1,3,'Company Info'),(4,2,'Other Information'),(6,6,'BS → EV Components'),(12,4,'PL (LTM / Annual)'),(16,3,'Market Data'),(19,5,'Valuation Multiples')]
+    sections = [(1,3,'Company Info'),(4,4,'Other Information'),(8,6,'BS → EV Components'),(14,4,'PL (LTM / Annual)'),(18,3,'Market Data'),(21,5,'Valuation Multiples'),(26,10,'Beta & Risk Analysis')]
     for start,span,txt in sections:
         ws.merge_cells(start_row=r, start_column=start, end_row=r, end_column=start+span-1)
         sc(ws.cell(r,start,txt), fo=fSEC, fi=pSEC, al=aC, bd=BD)
         for c_idx in range(start,start+span): sc(ws.cell(r,c_idx), bd=BD)
-    
+
     r=5
-    headers = ['Company','Ticker','Base Date','Curr','PL Source','Cash','IBD','Net Debt','NCI','Equity','EV','Revenue','EBIT','EBITDA','NI (Parent)','Price','Shares','Mkt Cap','EV/EBITDA','EV/EBIT','PER','PBR','PSR']
-    widths = [18,10,11,6,16, 14,14,14,12,14, 16, 14,14,14,14, 12,16,16, 12,12,10,10,10]
+    headers = ['Company','Ticker','Base Date','Curr','PL Source','Exchange','Mkt Index',
+               'Cash','IBD','Net Debt','NCI','Equity','EV',
+               'Revenue','EBIT','EBITDA','NI (Parent)',
+               'Price','Shares','Mkt Cap',
+               'EV/EBITDA','EV/EBIT','PER','PBR','PSR',
+               'β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','D/E Ratio','Unlevered β 5Y','Unlevered β 2Y','Debt Ratio']
+    widths = [18,10,11,6,16,10,10,
+              14,14,14,12,14,16,
+              14,14,14,14,
+              12,16,16,
+              12,12,10,10,10,
+              10,10,10,10,14,9,10,12,12,10]
     for i,(h,w) in enumerate(zip(headers,widths)): ws.column_dimensions[get_column_letter(i+1)].width=w; sc(ws.cell(r,i+1,h), fo=fH, fi=pH, al=aC, bd=BD)
     
     DATA_START=6; n_companies=len(gpcm_data); DATA_END=DATA_START+n_companies-1
+    NF_BETA='0.00;(0.00);"-"'; NF_PCT='0.0%;(0.0%);"-"'; NF_RATIO='0.00;(0.00);"-"'
+    pBETA=PatternFill('solid',fgColor='E8F5E9')
     for idx,(ticker, gpcm) in enumerate(gpcm_data.items()):
         r=DATA_START+idx; mc_row=MC_DATA_START+idx; ev_row=(r%2==0); base_fi=pST if ev_row else pW
-        # A-E
-        vals=[gpcm['Company'],ticker,gpcm['Base_Date'],gpcm['Currency'],gpcm['PL_Source']]
+        # A-G: Company Info + Other Info
+        vals=[gpcm['Company'],ticker,gpcm['Base_Date'],gpcm['Currency'],gpcm['PL_Source'],gpcm['Exchange'],gpcm['Market_Index']]
         for ci,v in enumerate(vals,1): ws.cell(r,ci,v); sc(ws.cell(r,ci), fo=fA, fi=base_fi, al=aL, bd=BD)
-        # F-J (Formulas)
-        ws.cell(r,6).value=f'=SUMIFS(BS_Full!$G:$G,BS_Full!$B:$B,$B{r},BS_Full!$F:$F,"Cash")'; sc(ws.cell(r,6), fo=fLINK_B, fi=ev_fills['Cash'], al=aR, bd=BD, nf=NF_M)
-        ws.cell(r,7).value=f'=SUMIFS(BS_Full!$G:$G,BS_Full!$B:$B,$B{r},BS_Full!$F:$F,"IBD")'; sc(ws.cell(r,7), fo=fLINK_B, fi=ev_fills['IBD'], al=aR, bd=BD, nf=NF_M)
-        ws.cell(r,8).value=f'=G{r}-F{r}'; sc(ws.cell(r,8), fo=fFRM_B, fi=base_fi, al=aR, bd=BD, nf=NF_M)
-        ws.cell(r,9).value=f'=SUMIFS(BS_Full!$G:$G,BS_Full!$B:$B,$B{r},BS_Full!$F:$F,"NCI")'; sc(ws.cell(r,9), fo=fLINK_B, fi=ev_fills['NCI'], al=aR, bd=BD, nf=NF_M)
-        ws.cell(r,10).value=f'=SUMIFS(BS_Full!$G:$G,BS_Full!$B:$B,$B{r},BS_Full!$F:$F,"Equity")'; sc(ws.cell(r,10), fo=fLINK_B, fi=ev_fills['Equity'], al=aR, bd=BD, nf=NF_M)
-        # K (EV)
-        ws.cell(r,11).value=f'=R{r}+G{r}-F{r}+I{r}'; sc(ws.cell(r,11), fo=fFRM_B, fi=PatternFill('solid',fgColor=C_PB), al=aR, bd=BD, nf=NF_M)
-        # L-O (PL)
-        ws.cell(r,12).value=f'=SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$E:$E,"Revenue")'; sc(ws.cell(r,12), fo=fLINK_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
-        ws.cell(r,13).value=f'=SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$D:$D,"Operating Income")'; sc(ws.cell(r,13), fo=fLINK_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
-        ws.cell(r,14).value=f'=M{r}+SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$D:$D,"EBITDA")-SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$D:$D,"EBIT")'; sc(ws.cell(r,14), fo=fFRM_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
-        ws.cell(r,15).value=f'=SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$E:$E,"NI_Parent")'; sc(ws.cell(r,15), fo=fLINK_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
-        # P-R (Market)
-        ws.cell(r,16).value=f'=Market_Cap!F{mc_row}'; sc(ws.cell(r,16), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_PRC)
-        ws.cell(r,17).value=f'=Market_Cap!G{mc_row}'; sc(ws.cell(r,17), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_INT)
-        ws.cell(r,18).value=f'=Market_Cap!H{mc_row}'; sc(ws.cell(r,18), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_M1)
-        # S-W (Multiples)
+
+        # H-M: BS → EV Components (Formulas)
+        ws.cell(r,8).value=f'=SUMIFS(BS_Full!$G:$G,BS_Full!$B:$B,$B{r},BS_Full!$F:$F,"Cash")'; sc(ws.cell(r,8), fo=fLINK_B, fi=ev_fills['Cash'], al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,9).value=f'=SUMIFS(BS_Full!$G:$G,BS_Full!$B:$B,$B{r},BS_Full!$F:$F,"IBD")'; sc(ws.cell(r,9), fo=fLINK_B, fi=ev_fills['IBD'], al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,10).value=f'=I{r}-H{r}'; sc(ws.cell(r,10), fo=fFRM_B, fi=base_fi, al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,11).value=f'=SUMIFS(BS_Full!$G:$G,BS_Full!$B:$B,$B{r},BS_Full!$F:$F,"NCI")'; sc(ws.cell(r,11), fo=fLINK_B, fi=ev_fills['NCI'], al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,12).value=f'=SUMIFS(BS_Full!$G:$G,BS_Full!$B:$B,$B{r},BS_Full!$F:$F,"Equity")'; sc(ws.cell(r,12), fo=fLINK_B, fi=ev_fills['Equity'], al=aR, bd=BD, nf=NF_M)
+        # M (EV)
+        ws.cell(r,13).value=f'=T{r}+I{r}-H{r}+K{r}'; sc(ws.cell(r,13), fo=fFRM_B, fi=PatternFill('solid',fgColor=C_PB), al=aR, bd=BD, nf=NF_M)
+
+        # N-Q: PL (LTM/Annual)
+        ws.cell(r,14).value=f'=SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$E:$E,"Revenue")'; sc(ws.cell(r,14), fo=fLINK_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,15).value=f'=SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$D:$D,"Operating Income")'; sc(ws.cell(r,15), fo=fLINK_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,16).value=f'=O{r}+SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$D:$D,"EBITDA")-SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$D:$D,"EBIT")'; sc(ws.cell(r,16), fo=fFRM_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,17).value=f'=SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$E:$E,"NI_Parent")'; sc(ws.cell(r,17), fo=fLINK_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
+
+        # R-T: Market Data
+        ws.cell(r,18).value=f'=Market_Cap!F{mc_row}'; sc(ws.cell(r,18), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_PRC)
+        ws.cell(r,19).value=f'=Market_Cap!G{mc_row}'; sc(ws.cell(r,19), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_INT)
+        ws.cell(r,20).value=f'=Market_Cap!H{mc_row}'; sc(ws.cell(r,20), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_M1)
+
+        # U-Y: Valuation Multiples
         pMULT=PatternFill('solid',fgColor=C_PB)
-        ws.cell(r,19).value=f'=IF(N{r}>0,K{r}/N{r},"N/M")'; sc(ws.cell(r,19), fo=fMUL, fi=pMULT, al=aR, bd=BD, nf=NF_X)
-        ws.cell(r,20).value=f'=IF(M{r}>0,K{r}/M{r},"N/M")'; sc(ws.cell(r,20), fo=fMUL, fi=pMULT, al=aR, bd=BD, nf=NF_X)
-        ws.cell(r,21).value=f'=IF(O{r}>0,R{r}/O{r},"N/M")'; sc(ws.cell(r,21), fo=fMUL, fi=pMULT, al=aR, bd=BD, nf=NF_X)
-        ws.cell(r,22).value=f'=IF(J{r}>0,R{r}/J{r},"N/M")'; sc(ws.cell(r,22), fo=fMUL, fi=pMULT, al=aR, bd=BD, nf=NF_X)
-        ws.cell(r,23).value=f'=IF(L{r}>0,R{r}/L{r},"N/M")'; sc(ws.cell(r,23), fo=fMUL, fi=pMULT, al=aR, bd=BD, nf=NF_X)
+        ws.cell(r,21).value=f'=IF(P{r}>0,M{r}/P{r},"N/M")'; sc(ws.cell(r,21), fo=fMUL, fi=pMULT, al=aR, bd=BD, nf=NF_X)
+        ws.cell(r,22).value=f'=IF(O{r}>0,M{r}/O{r},"N/M")'; sc(ws.cell(r,22), fo=fMUL, fi=pMULT, al=aR, bd=BD, nf=NF_X)
+        ws.cell(r,23).value=f'=IF(Q{r}>0,T{r}/Q{r},"N/M")'; sc(ws.cell(r,23), fo=fMUL, fi=pMULT, al=aR, bd=BD, nf=NF_X)
+        ws.cell(r,24).value=f'=IF(L{r}>0,T{r}/L{r},"N/M")'; sc(ws.cell(r,24), fo=fMUL, fi=pMULT, al=aR, bd=BD, nf=NF_X)
+        ws.cell(r,25).value=f'=IF(N{r}>0,T{r}/N{r},"N/M")'; sc(ws.cell(r,25), fo=fMUL, fi=pMULT, al=aR, bd=BD, nf=NF_X)
+
+        # Z-AI: Beta & Risk Analysis
+        # Beta 5Y Raw, Beta 5Y Adj, Beta 2Y Raw, Beta 2Y Adj
+        ws.cell(r,26,gpcm['Beta_5Y_Monthly_Raw']); sc(ws.cell(r,26), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
+        ws.cell(r,27,gpcm['Beta_5Y_Monthly_Adj']); sc(ws.cell(r,27), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
+        ws.cell(r,28,gpcm['Beta_2Y_Weekly_Raw']); sc(ws.cell(r,28), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
+        ws.cell(r,29,gpcm['Beta_2Y_Weekly_Adj']); sc(ws.cell(r,29), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
+
+        # Pretax Income (Formula)
+        ws.cell(r,30).value=f'=SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$D:$D,"Pretax Income")'; sc(ws.cell(r,30), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_M)
+
+        # Tax Rate
+        ws.cell(r,31,gpcm['Tax_Rate']); sc(ws.cell(r,31), fo=fA, fi=base_fi, al=aR, bd=BD, nf=NF_PCT)
+
+        # D/E Ratio = IBD / Equity
+        ws.cell(r,32).value=f'=IF(L{r}>0,I{r}/L{r},0)'; sc(ws.cell(r,32), fo=fFRM_B, fi=base_fi, al=aR, bd=BD, nf=NF_RATIO)
+
+        # Unlevered Beta 5Y = Beta 5Y Adj / (1 + (1 - Tax Rate) * (D/E))
+        ws.cell(r,33).value=f'=IF(AA{r}>0,AA{r}/(1+(1-AE{r})*AF{r}),AA{r})'; sc(ws.cell(r,33), fo=fFRM_B, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
+
+        # Unlevered Beta 2Y = Beta 2Y Adj / (1 + (1 - Tax Rate) * (D/E))
+        ws.cell(r,34).value=f'=IF(AC{r}>0,AC{r}/(1+(1-AE{r})*AF{r}),AC{r})'; sc(ws.cell(r,34), fo=fFRM_B, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
+
+        # Debt Ratio = IBD / Market Cap (추가)
+        ws.cell(r,35).value=f'=IF(T{r}>0,I{r}/T{r},0)'; sc(ws.cell(r,35), fo=fFRM_B, fi=base_fi, al=aR, bd=BD, nf=NF_RATIO)
 
     # Stats
     r=DATA_END+2
     stat_labels=['Mean','Median','Max','Min']; func_map={'Mean':'AVERAGE','Median':'MEDIAN','Max':'MAX','Min':'MIN'}
-    mult_cols=[19,20,21,22,23]
+    # Multiples: 21-25 (EV/EBITDA, EV/EBIT, PER, PBR, PSR)
+    # Betas: 26-29, 33-35 (Beta 5Y Raw, Beta 5Y Adj, Beta 2Y Raw, Beta 2Y Adj, Unlevered Beta 5Y, Unlevered Beta 2Y, Debt Ratio)
+    mult_cols=[21,22,23,24,25]
+    beta_cols=[26,27,28,29,33,34]
+    ratio_cols=[32,35]
+
     for sn in stat_labels:
-        sc(ws.cell(r,18,sn), fo=fSTAT, fi=pSTAT, al=aC, bd=BD)
+        sc(ws.cell(r,20,sn), fo=fSTAT, fi=pSTAT, al=aC, bd=BD)
         fn=func_map[sn]
+        # Multiples
         for ci in mult_cols:
             col=get_column_letter(ci)
             ws.cell(r,ci).value=f'=IFERROR({fn}({col}{DATA_START}:{col}{DATA_END}),"N/M")'
             sc(ws.cell(r,ci), fo=fSTAT, fi=pSTAT, al=aR, bd=BD, nf=NF_X)
+        # Betas
+        for ci in beta_cols:
+            col=get_column_letter(ci)
+            ws.cell(r,ci).value=f'=IFERROR({fn}({col}{DATA_START}:{col}{DATA_END}),"N/M")'
+            sc(ws.cell(r,ci), fo=fSTAT, fi=pSTAT, al=aR, bd=BD, nf=NF_BETA)
+        # Ratios
+        for ci in ratio_cols:
+            col=get_column_letter(ci)
+            ws.cell(r,ci).value=f'=IFERROR({fn}({col}{DATA_START}:{col}{DATA_END}),"N/M")'
+            sc(ws.cell(r,ci), fo=fSTAT, fi=pSTAT, al=aR, bd=BD, nf=NF_RATIO)
         r+=1
     
     # Notes
@@ -377,9 +613,21 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         '• PSR = Market Cap ÷ Revenue',
         '• Market Cap = Ordinary Shares Number × Close Price',
         '• PL Source: LTM prioritized',
+        '',
+        '[ Beta & Risk Analysis ]',
+        '• Beta 5Y: Calculated using 5-year monthly returns vs market index',
+        '• Beta 2Y: Calculated using 2-year weekly returns vs market index',
+        '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1.0 (Bloomberg methodology)',
+        '• Market Index: KOSPI (KS11), KOSDAQ (KQ11), Nikkei 225 (^N225), S&P/TSX (^GSPTSE), etc.',
+        '• Tax Rate: Korean marginal corporate tax rate based on Pretax Income',
+        '   - ≤ 200M: 10% | 200M-20,000M: 20% | 20,000M-300,000M: 22% | > 300,000M: 25%',
+        '• D/E Ratio = IBD ÷ Equity',
+        '• Unlevered Beta = Levered Beta ÷ (1 + (1 - Tax Rate) × D/E Ratio) [Hamada Model]',
+        '• Debt Ratio = IBD ÷ Market Cap',
+        '',
         '• N/M = Not Meaningful (negative or zero)',
         '• All values in GPCM are calculated via Excel Formulas linking to BS_Full and PL_Data sheets.',
-        '', '⚠ Data from Yahoo Finance. Verify with official sources.'
+        '', '⚠ Data from Yahoo Finance & FinanceDataReader. Verify with official sources.'
     ]
     for note in notes:
         ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=TOTAL_COLS)
@@ -484,6 +732,19 @@ notes = [
     '• PL Source: LTM prioritized (Current + Prior Annual - Prior Same Q)',
 ]
 for note in notes:
+    st.text(note)
+
+st.subheader("📊 Beta & Risk Analysis")
+beta_notes = [
+    '• Beta 5Y: Calculated using 5-year monthly returns vs market index',
+    '• Beta 2Y: Calculated using 2-year weekly returns vs market index',
+    '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1.0 (Bloomberg methodology)',
+    '• Market Index: KOSPI (KS11), KOSDAQ (KQ11), Nikkei 225, S&P/TSX, DAX, etc.',
+    '• Tax Rate: Korean marginal corporate tax rate based on Pretax Income',
+    '• Unlevered Beta = Levered Beta ÷ (1 + (1 - Tax Rate) × D/E Ratio) [Hamada Model]',
+    '• D/E Ratio = IBD ÷ Equity | Debt Ratio = IBD ÷ Market Cap',
+]
+for note in beta_notes:
     st.text(note)
 st.markdown("---")
 
