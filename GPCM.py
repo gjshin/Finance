@@ -106,6 +106,12 @@ def calculate_beta(stock_returns, market_returns, min_periods=20):
     Returns: raw_beta, adjusted_beta (None if invalid)
     """
     try:
+        # [수정됨] Timezone 문제 해결: yfinance(tz-aware)와 FDR(tz-naive) 간 인덱스 통일
+        if stock_returns.index.tz is not None:
+            stock_returns.index = stock_returns.index.tz_localize(None)
+        if market_returns.index.tz is not None:
+            market_returns.index = market_returns.index.tz_localize(None)
+
         if len(stock_returns) < min_periods or len(market_returns) < min_periods:
             return None, None
 
@@ -997,17 +1003,17 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         beta_2y_raw = gpcm['Beta_2Y_Weekly_Raw']
         beta_2y_adj = gpcm['Beta_2Y_Weekly_Adj']
 
-        # None, NaN, inf 체크 후 Excel에 쓰기
-        ws.cell(r,26, beta_5y_raw if beta_5y_raw is not None and np.isfinite(beta_5y_raw) else None)
+        # [수정됨] None, NaN, inf 체크 후 Excel에 쓰기 (명시적으로 .value 할당)
+        ws.cell(r,26).value = beta_5y_raw if beta_5y_raw is not None and np.isfinite(beta_5y_raw) else None
         sc(ws.cell(r,26), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
 
-        ws.cell(r,27, beta_5y_adj if beta_5y_adj is not None and np.isfinite(beta_5y_adj) else None)
+        ws.cell(r,27).value = beta_5y_adj if beta_5y_adj is not None and np.isfinite(beta_5y_adj) else None
         sc(ws.cell(r,27), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
 
-        ws.cell(r,28, beta_2y_raw if beta_2y_raw is not None and np.isfinite(beta_2y_raw) else None)
+        ws.cell(r,28).value = beta_2y_raw if beta_2y_raw is not None and np.isfinite(beta_2y_raw) else None
         sc(ws.cell(r,28), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
 
-        ws.cell(r,29, beta_2y_adj if beta_2y_adj is not None and np.isfinite(beta_2y_adj) else None)
+        ws.cell(r,29).value = beta_2y_adj if beta_2y_adj is not None and np.isfinite(beta_2y_adj) else None
         sc(ws.cell(r,29), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
 
         # Pretax Income (Formula)
