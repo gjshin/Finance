@@ -628,26 +628,27 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, size_pr
                     except:
                         pass
 
-                if not stock_data_5y.empty and not market_data_5y.empty:
-                    # Close 컬럼 추출
-                    if isinstance(stock_data_5y, pd.DataFrame):
-                        stock_prices_5y = stock_data_5y['Close'] if 'Close' in stock_data_5y.columns else stock_data_5y.iloc[:, 0]
-                    else:
-                        stock_prices_5y = stock_data_5y
+                if stock_data_5y is not None and market_data_5y is not None:
+                    if not stock_data_5y.empty and not market_data_5y.empty:
+                        # Close 컬럼 추출
+                        if isinstance(stock_data_5y, pd.DataFrame):
+                            stock_prices_5y = stock_data_5y['Close'] if 'Close' in stock_data_5y.columns else stock_data_5y.iloc[:, 0]
+                        else:
+                            stock_prices_5y = stock_data_5y
 
-                    if isinstance(market_data_5y, pd.DataFrame):
-                        market_prices_5y = market_data_5y['Close'] if 'Close' in market_data_5y.columns else market_data_5y.iloc[:, 0]
-                    else:
-                        market_prices_5y = market_data_5y
+                        if isinstance(market_data_5y, pd.DataFrame):
+                            market_prices_5y = market_data_5y['Close'] if 'Close' in market_data_5y.columns else market_data_5y.iloc[:, 0]
+                        else:
+                            market_prices_5y = market_data_5y
 
-                    # 월간 수익률 계산
-                    stock_monthly = stock_prices_5y.resample('ME').last().pct_change().dropna()
-                    market_monthly = market_prices_5y.resample('ME').last().pct_change().dropna()
+                        # 월간 수익률 계산
+                        stock_monthly = stock_prices_5y.resample('ME').last().pct_change().dropna()
+                        market_monthly = market_prices_5y.resample('ME').last().pct_change().dropna()
 
-                    # 베타 계산
-                    raw_beta_5y, adj_beta_5y = calculate_beta(stock_monthly, market_monthly)
-                    gpcm['Beta_5Y_Monthly_Raw'] = raw_beta_5y
-                    gpcm['Beta_5Y_Monthly_Adj'] = adj_beta_5y
+                        # 베타 계산
+                        raw_beta_5y, adj_beta_5y = calculate_beta(stock_monthly, market_monthly)
+                        gpcm['Beta_5Y_Monthly_Raw'] = raw_beta_5y
+                        gpcm['Beta_5Y_Monthly_Adj'] = adj_beta_5y
 
                 # 2년 주간 베타 계산: 한국 주식은 FinanceDataReader 우선
                 start_2y = (base_dt - timedelta(days=365*2+20)).strftime('%Y-%m-%d')
@@ -681,25 +682,26 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, size_pr
                     except:
                         pass
 
-                if not stock_data_2y.empty and not market_data_2y.empty:
-                    if isinstance(stock_data_2y, pd.DataFrame):
-                        stock_prices_2y = stock_data_2y['Close'] if 'Close' in stock_data_2y.columns else stock_data_2y.iloc[:, 0]
-                    else:
-                        stock_prices_2y = stock_data_2y
+                if stock_data_2y is not None and market_data_2y is not None:
+                    if not stock_data_2y.empty and not market_data_2y.empty:
+                        if isinstance(stock_data_2y, pd.DataFrame):
+                            stock_prices_2y = stock_data_2y['Close'] if 'Close' in stock_data_2y.columns else stock_data_2y.iloc[:, 0]
+                        else:
+                            stock_prices_2y = stock_data_2y
 
-                    if isinstance(market_data_2y, pd.DataFrame):
-                        market_prices_2y = market_data_2y['Close'] if 'Close' in market_data_2y.columns else market_data_2y.iloc[:, 0]
-                    else:
-                        market_prices_2y = market_data_2y
+                        if isinstance(market_data_2y, pd.DataFrame):
+                            market_prices_2y = market_data_2y['Close'] if 'Close' in market_data_2y.columns else market_data_2y.iloc[:, 0]
+                        else:
+                            market_prices_2y = market_data_2y
 
-                    # 주간 수익률 계산
-                    stock_weekly = stock_prices_2y.resample('W').last().pct_change().dropna()
-                    market_weekly = market_prices_2y.resample('W').last().pct_change().dropna()
+                        # 주간 수익률 계산
+                        stock_weekly = stock_prices_2y.resample('W').last().pct_change().dropna()
+                        market_weekly = market_prices_2y.resample('W').last().pct_change().dropna()
 
-                    # 베타 계산
-                    raw_beta_2y, adj_beta_2y = calculate_beta(stock_weekly, market_weekly)
-                    gpcm['Beta_2Y_Weekly_Raw'] = raw_beta_2y
-                    gpcm['Beta_2Y_Weekly_Adj'] = adj_beta_2y
+                        # 베타 계산
+                        raw_beta_2y, adj_beta_2y = calculate_beta(stock_weekly, market_weekly)
+                        gpcm['Beta_2Y_Weekly_Raw'] = raw_beta_2y
+                        gpcm['Beta_2Y_Weekly_Adj'] = adj_beta_2y
 
             except Exception as e:
                 st.warning(f"Beta calculation failed for {ticker}: {e}")
