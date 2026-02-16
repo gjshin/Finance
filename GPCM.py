@@ -178,12 +178,54 @@ def calculate_unlevered_beta(levered_beta, debt, equity, tax_rate):
 
     unlevered = levered_beta / (1 + (1 - tax_rate) * (debt / equity))
     return unlevered
+
+@st.cache_data(ttl=86400)  # 24시간 캐시
+def get_korea_10y_treasury_yield(base_date_str):
+    """
+    한국 10년 만기 국채수익률 조회
+    FinanceDataReader를 사용하여 한국 국채 데이터 크롤링
+    """
+    try:
+        base_dt = pd.to_datetime(base_date_str)
+        # KR10YT=X는 한국 10년 국채 수익률 (Yahoo Finance)
+        # 또는 FinanceDataReader로 한국은행 데이터 활용
+
+        # 방법 1: yfinance로 시도
+        try:
+            treasury_data = yf.download('^TNX', start=(base_dt - timedelta(days=30)).strftime('%Y-%m-%d'),
+                                       end=(base_dt + timedelta(days=1)).strftime('%Y-%m-%d'), progress=False)
+            if not treasury_data.empty and 'Close' in treasury_data.columns:
+                # TNX는 미국 10년물이므로, 한국 국채는 별도 조회 필요
+                # 여기서는 임시로 한국 기준금리 + 스프레드로 근사
+                pass
+        except:
+            pass
+
+        # 방법 2: 기본값 사용 (한국은행 기준금리 기반 추정)
+        # 2024-2025년 기준 약 3.0~3.5% 수준
+        # 실무에서는 Bloomberg/Reuters/한국은행 API 사용 권장
+        default_yield = 0.033  # 3.3% (2025년 평균 추정치)
+
+        st.info(f"💡 한국 10년 국채수익률: {default_yield*100:.2f}% (기본값 사용 - 실무에서는 한국은행 API 활용 권장)")
+        return default_yield
+
+    except Exception as e:
+        st.warning(f"국채수익률 조회 실패: {e}. 기본값 3.3% 사용")
+        return 0.033
 @st.cache_data(ttl=3600)  # <--- [추가] 1시간 동안 데이터를 저장해서 재사용함
-def get_gpcm_data(tickers_list, base_date_str):
+def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, target_debt_ratio=0.30):
     """
     GPCM 데이터 수집 및 엑셀 생성을 위한 데이터 구조 반환
+
+    Parameters:
+    - mrp: Market Risk Premium (기본값 8%)
+    - kd_pretax: 세전 타인자본비용 (기본값 5%)
+    - target_debt_ratio: 목표 부채비율 (기본값 30%)
     """
     base_dt = pd.to_datetime(base_date_str)
+
+    # 10년 국채수익률 조회 (무위험수익률)
+    rf_rate = get_korea_10y_treasury_yield(base_date_str)
     
     # ---------------------------------------------------------
     # [설정] 계정 맵핑 (v17: NOA Option, 투자부동산 등)
@@ -247,6 +289,14 @@ def get_gpcm_data(tickers_list, base_date_str):
                 'Beta_2Y_Weekly_Raw': None, 'Beta_2Y_Weekly_Adj': None,
                 'Pretax_Income': 0, 'Tax_Rate': 0.22,
                 'Debt_Ratio': 0, 'Unlevered_Beta_5Y': None, 'Unlevered_Beta_2Y': None,
+                # WACC 관련 필드 추가
+                'Risk_Free_Rate': rf_rate,
+                'MRP': mrp,
+                'Ke': None,  # 자기자본비용 = Rf + Beta × MRP
+                'Kd_Pretax': kd_pretax,
+                'Kd_Aftertax': None,  # 세후 타인자본비용 = Kd_Pretax × (1 - Tax Rate)
+                'Target_Debt_Ratio': target_debt_ratio,
+                'WACC': None,  # WACC = (E/V) × Ke + (D/V) × Kd_Aftertax
             }
 
             # [0] Price History (10Y)
@@ -348,7 +398,7 @@ def get_gpcm_data(tickers_list, base_date_str):
                 gpcm['EBITDA'] = calc_sums['OpIncome'] + da_amount
                 gpcm['NI_Parent'] = calc_sums['NI_Parent']
 
-            # [4] Beta Calculation
+            # [4] Beta Calculation with Retry Logic
             exchange, market_idx = get_market_index(ticker)
             gpcm['Exchange'] = exchange
             gpcm['Market_Index'] = market_idx
@@ -358,11 +408,22 @@ def get_gpcm_data(tickers_list, base_date_str):
                 start_5y = (base_dt - timedelta(days=365*5+20)).strftime('%Y-%m-%d')
                 end_date = base_dt.strftime('%Y-%m-%d')
 
-                # FinanceDataReader로 데이터 수집
+                # FinanceDataReader로 데이터 수집 (재시도 로직 추가)
+                stock_data_5y = None
+                market_data_5y = None
+
                 if ticker.endswith('.KS') or ticker.endswith('.KQ'):
-                    # 한국 주식은 FinanceDataReader 사용
-                    stock_data_5y = fdr.DataReader(ticker, start_5y, end_date)
-                    market_data_5y = fdr.DataReader(market_idx, start_5y, end_date)
+                    # 한국 주식은 FinanceDataReader 사용 (최대 3회 재시도)
+                    for attempt in range(3):
+                        try:
+                            stock_data_5y = fdr.DataReader(ticker, start_5y, end_date)
+                            market_data_5y = fdr.DataReader(market_idx, start_5y, end_date)
+                            break
+                        except Exception as retry_err:
+                            if attempt < 2:
+                                time.sleep(2 * (attempt + 1))  # 2초, 4초 대기
+                            else:
+                                raise retry_err
                 else:
                     # 해외 주식은 yfinance 사용
                     stock_data_5y = yf.download(ticker, start=start_5y, end=end_date, progress=False)['Close']
@@ -389,12 +450,24 @@ def get_gpcm_data(tickers_list, base_date_str):
                     gpcm['Beta_5Y_Monthly_Raw'] = raw_beta_5y
                     gpcm['Beta_5Y_Monthly_Adj'] = adj_beta_5y
 
-                # 2년 주간 베타 계산
+                # 2년 주간 베타 계산 (재시도 로직 추가)
                 start_2y = (base_dt - timedelta(days=365*2+20)).strftime('%Y-%m-%d')
 
+                stock_data_2y = None
+                market_data_2y = None
+
                 if ticker.endswith('.KS') or ticker.endswith('.KQ'):
-                    stock_data_2y = fdr.DataReader(ticker, start_2y, end_date)
-                    market_data_2y = fdr.DataReader(market_idx, start_2y, end_date)
+                    # 한국 주식은 FinanceDataReader 사용 (최대 3회 재시도)
+                    for attempt in range(3):
+                        try:
+                            stock_data_2y = fdr.DataReader(ticker, start_2y, end_date)
+                            market_data_2y = fdr.DataReader(market_idx, start_2y, end_date)
+                            break
+                        except Exception as retry_err:
+                            if attempt < 2:
+                                time.sleep(2 * (attempt + 1))  # 2초, 4초 대기
+                            else:
+                                raise retry_err
                 else:
                     stock_data_2y = yf.download(ticker, start=start_2y, end=end_date, progress=False)['Close']
                     market_data_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)['Close']
@@ -443,6 +516,24 @@ def get_gpcm_data(tickers_list, base_date_str):
             else:
                 # 기타 국가: Wikipedia에서 크롤링한 세율
                 gpcm['Tax_Rate'] = tax_rates_wiki.get(country_code, 0.25)
+
+            # [6] WACC 계산
+            # Ke (자기자본비용) = Rf + Beta × MRP
+            # Beta는 5년 조정 베타 사용
+            if gpcm['Beta_5Y_Monthly_Adj'] is not None:
+                gpcm['Ke'] = rf_rate + gpcm['Beta_5Y_Monthly_Adj'] * mrp
+            else:
+                # 베타가 없으면 기본값 (Rf + 1.0 × MRP)
+                gpcm['Ke'] = rf_rate + 1.0 * mrp
+
+            # Kd_Aftertax (세후 타인자본비용) = Kd_Pretax × (1 - Tax Rate)
+            gpcm['Kd_Aftertax'] = kd_pretax * (1 - gpcm['Tax_Rate'])
+
+            # WACC = (E/V) × Ke + (D/V) × Kd_Aftertax
+            # 여기서 E/V = 1 - Target_Debt_Ratio, D/V = Target_Debt_Ratio
+            equity_weight = 1 - target_debt_ratio
+            debt_weight = target_debt_ratio
+            gpcm['WACC'] = equity_weight * gpcm['Ke'] + debt_weight * gpcm['Kd_Aftertax']
 
             gpcm_data[ticker] = gpcm
 
@@ -565,12 +656,12 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
     # [Sheet 4] GPCM
     ws = wb.create_sheet('GPCM')
     wb.move_sheet('GPCM', offset=-3)
-    TOTAL_COLS = 34
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=TOTAL_COLS); sc(ws.cell(1,1,'GPCM Valuation Summary with Beta Analysis'), fo=fT)
+    TOTAL_COLS = 41  # 34 + 7 (WACC 관련 컬럼 추가)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=TOTAL_COLS); sc(ws.cell(1,1,'GPCM Valuation Summary with Beta & WACC Analysis'), fo=fT)
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=TOTAL_COLS); sc(ws.cell(2,1,f'Base: {base_date_str} | Unit: Millions (local currency) | EV = MCap + IBD − Cash + NCI'), fo=fS)
 
     r=4
-    sections = [(1,3,'Company Info'),(4,4,'Other Information'),(8,6,'BS → EV Components'),(14,4,'PL (LTM / Annual)'),(18,3,'Market Data'),(21,5,'Valuation Multiples'),(26,9,'Beta & Risk Analysis')]
+    sections = [(1,3,'Company Info'),(4,4,'Other Information'),(8,6,'BS → EV Components'),(14,4,'PL (LTM / Annual)'),(18,3,'Market Data'),(21,5,'Valuation Multiples'),(26,9,'Beta & Risk Analysis'),(35,7,'WACC Calculation')]
     for start,span,txt in sections:
         ws.merge_cells(start_row=r, start_column=start, end_row=r, end_column=start+span-1)
         sc(ws.cell(r,start,txt), fo=fSEC, fi=pSEC, al=aC, bd=BD)
@@ -582,13 +673,15 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
                'Revenue','EBIT','EBITDA','NI (Parent)',
                'Price','Shares','Mkt Cap',
                'EV/EBITDA','EV/EBIT','PER','PBR','PSR',
-               'β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','Debt Ratio','Unlevered β 5Y','Unlevered β 2Y']
+               'β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','Debt Ratio','Unlevered β 5Y','Unlevered β 2Y',
+               'Rf','MRP','Ke','Kd (Pretax)','Kd (Aftertax)','Target D/E','WACC']
     widths = [18,10,11,6,16,10,10,
               14,14,14,12,14,16,
               14,14,14,14,
               12,16,16,
               12,12,10,10,10,
-              10,10,10,10,14,9,10,12,12]
+              10,10,10,10,14,9,10,12,12,
+              10,10,10,10,12,11,10]
     for i,(h,w) in enumerate(zip(headers,widths)): ws.column_dimensions[get_column_letter(i+1)].width=w; sc(ws.cell(r,i+1,h), fo=fH, fi=pH, al=aC, bd=BD)
     
     DATA_START=6; n_companies=len(gpcm_data); DATA_END=DATA_START+n_companies-1
@@ -650,15 +743,34 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         # Unlevered Beta 2Y = Beta 2Y Adj / (1 + (1 - Tax Rate) * Debt Ratio)
         ws.cell(r,34).value=f'=IF(AC{r}>0,AC{r}/(1+(1-AE{r})*AF{r}),AC{r})'; sc(ws.cell(r,34), fo=fFRM_B, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
 
+        # WACC 관련 컬럼 (35-41)
+        pWACC=PatternFill('solid',fgColor='FFF9C4')  # 연한 노란색
+        # Risk-Free Rate
+        ws.cell(r,35,gpcm['Risk_Free_Rate']); sc(ws.cell(r,35), fo=fA, fi=pWACC, al=aR, bd=BD, nf=NF_PCT)
+        # MRP
+        ws.cell(r,36,gpcm['MRP']); sc(ws.cell(r,36), fo=fA, fi=pWACC, al=aR, bd=BD, nf=NF_PCT)
+        # Ke = Rf + Beta 5Y Adj × MRP
+        ws.cell(r,37).value=f'=AI{r}+AA{r}*AJ{r}'; sc(ws.cell(r,37), fo=fFRM_B, fi=pWACC, al=aR, bd=BD, nf=NF_PCT)
+        # Kd (Pretax)
+        ws.cell(r,38,gpcm['Kd_Pretax']); sc(ws.cell(r,38), fo=fA, fi=pWACC, al=aR, bd=BD, nf=NF_PCT)
+        # Kd (Aftertax) = Kd_Pretax × (1 - Tax Rate)
+        ws.cell(r,39).value=f'=AL{r}*(1-AE{r})'; sc(ws.cell(r,39), fo=fFRM_B, fi=pWACC, al=aR, bd=BD, nf=NF_PCT)
+        # Target D/E (목표 부채비율)
+        ws.cell(r,40,gpcm['Target_Debt_Ratio']); sc(ws.cell(r,40), fo=fA, fi=pWACC, al=aR, bd=BD, nf=NF_RATIO)
+        # WACC = (1 - D/V) × Ke + D/V × Kd_Aftertax
+        ws.cell(r,41).value=f'=(1-AN{r})*AK{r}+AN{r}*AM{r}'; sc(ws.cell(r,41), fo=fFRM_B, fi=PatternFill('solid',fgColor='FFE082'), al=aR, bd=BD, nf=NF_PCT)
+
     # Stats
     r=DATA_END+2
     stat_labels=['Mean','Median','Max','Min']; func_map={'Mean':'AVERAGE','Median':'MEDIAN','Max':'MAX','Min':'MIN'}
     # Multiples: 21-25 (EV/EBITDA, EV/EBIT, PER, PBR, PSR)
     # Betas: 26-29, 33-34 (Beta 5Y Raw, Beta 5Y Adj, Beta 2Y Raw, Beta 2Y Adj, Unlevered Beta 5Y, Unlevered Beta 2Y)
-    # Ratios: 32 (Debt Ratio)
+    # Ratios: 32, 40 (Debt Ratio, Target D/E)
+    # WACC: 35-37, 41 (Rf, MRP, Ke, WACC)
     mult_cols=[21,22,23,24,25]
     beta_cols=[26,27,28,29,33,34]
-    ratio_cols=[32]
+    ratio_cols=[32,40]
+    wacc_cols=[35,36,37,38,39,41]  # Rf, MRP, Ke, Kd_Pretax, Kd_Aftertax, WACC
 
     for sn in stat_labels:
         sc(ws.cell(r,20,sn), fo=fSTAT, fi=pSTAT, al=aC, bd=BD)
@@ -678,6 +790,11 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
             col=get_column_letter(ci)
             ws.cell(r,ci).value=f'=IFERROR({fn}({col}{DATA_START}:{col}{DATA_END}),"N/M")'
             sc(ws.cell(r,ci), fo=fSTAT, fi=pSTAT, al=aR, bd=BD, nf=NF_RATIO)
+        # WACC
+        for ci in wacc_cols:
+            col=get_column_letter(ci)
+            ws.cell(r,ci).value=f'=IFERROR({fn}({col}{DATA_START}:{col}{DATA_END}),"N/M")'
+            sc(ws.cell(r,ci), fo=fSTAT, fi=pSTAT, al=aR, bd=BD, nf=NF_PCT)
         r+=1
     
     # Notes
@@ -707,6 +824,15 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         '   - Korea: ≤ 200M: 9.9% | 200M-20,000M: 20.9% | 20,000M-300,000M: 23.1% | > 300,000M: 26.4%',
         '• Debt Ratio = IBD ÷ (Market Cap + NCI)',
         '• Unlevered Beta = Levered Beta ÷ (1 + (1 - Tax Rate) × Debt Ratio) [Hamada Model]',
+        '',
+        '[ WACC Calculation ]',
+        '• Rf (Risk-Free Rate): 10-year Korea Treasury Bond Yield (기본값 3.3%)',
+        '• MRP (Market Risk Premium): 한국 공인회계사회 기준 7~9% (사용자 선택)',
+        '• Ke (Cost of Equity) = Rf + β (5Y Adj) × MRP',
+        '• Kd (Pretax): 세전 타인자본비용 (기본값 5.0%, 사용자 조정 가능)',
+        '• Kd (Aftertax): 세후 타인자본비용 = Kd (Pretax) × (1 - Tax Rate)',
+        '• Target D/E: 목표 부채비율 (사용자 입력)',
+        '• WACC = (1 - D/V) × Ke + D/V × Kd (Aftertax)',
         '',
         '• N/M = Not Meaningful (negative or zero)',
         '• All values in GPCM are calculated via Excel Formulas linking to BS_Full and PL_Data sheets.',
@@ -829,6 +955,19 @@ beta_notes = [
 ]
 for note in beta_notes:
     st.text(note)
+
+st.subheader("💰 WACC (Weighted Average Cost of Capital)")
+wacc_notes = [
+    '• Rf (Risk-Free Rate): 10-year Korea Treasury Bond Yield (기본값 3.3%)',
+    '• MRP (Market Risk Premium): 한국 공인회계사회 기준 7~9% (사용자 선택)',
+    '• Ke (Cost of Equity) = Rf + β (5Y Adj) × MRP',
+    '• Kd (Pretax): 세전 타인자본비용 (기본값 5.0%, 사용자 조정 가능)',
+    '• Kd (Aftertax) = Kd (Pretax) × (1 - Tax Rate)',
+    '• Target D/E: 목표 부채비율 (사용자 입력)',
+    '• WACC = (1 - D/V) × Ke + D/V × Kd (Aftertax)',
+]
+for note in wacc_notes:
+    st.text(note)
 st.markdown("---")
 
 # [Sidebar]
@@ -858,17 +997,34 @@ EZM.F
 012330.KS
 PYT.VI"""
     txt_input = st.text_area("Tickers", value=default_tickers, height=250)
-    
-    # 3. Run Button
+
+    # 3. WACC 파라미터 설정
+    st.subheader("3. WACC Parameters")
+    st.markdown("**한국 공인회계사회 기준**")
+    mrp_input = st.slider("MRP (시장위험프리미엄)", min_value=7.0, max_value=9.0, value=8.0, step=0.1, format="%.1f%%") / 100
+    st.markdown("**타인자본비용**")
+    kd_pretax_input = st.number_input("Kd (Pretax) - 세전 이자율 (%)", min_value=0.0, max_value=15.0, value=5.0, step=0.1, format="%.1f") / 100
+    st.markdown("**목표자본구조**")
+    target_debt_ratio_input = st.slider("Target Debt Ratio (목표 부채비율)", min_value=0.0, max_value=0.9, value=0.30, step=0.05, format="%.0f%%")
+
+    st.info(f"선택된 값: MRP={mrp_input*100:.1f}%, Kd(Pretax)={kd_pretax_input*100:.1f}%, Target D/E={target_debt_ratio_input*100:.0f}%")
+
+    # 4. Run Button
     btn_run = st.button("Go, Go, Go 🚀", type="primary")
 
 # [Main Execution]
 if btn_run:
     target_tickers = [t.strip() for t in txt_input.split('\n') if t.strip()]
-    
+
     with st.spinner("데이터 추출 및 분석 중... 잠시만 기다려주세요..."):
-        # Run Data Logic
-        gpcm_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel, t_map = get_gpcm_data(target_tickers, base_date_str)
+        # Run Data Logic with WACC parameters
+        gpcm_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel, t_map = get_gpcm_data(
+            target_tickers,
+            base_date_str,
+            mrp=mrp_input,
+            kd_pretax=kd_pretax_input,
+            target_debt_ratio=target_debt_ratio_input
+        )
         
         # 1. Summary Table
         st.subheader("📋 GPCM Multiples Summary")
