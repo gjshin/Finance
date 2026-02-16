@@ -20,19 +20,83 @@ from bs4 import BeautifulSoup
 # ==========================================
 
 def get_market_index(ticker):
-    """티커 기반으로 거래소 및 시장지수 코드 반환"""
-    if ticker.endswith('.KS'):
+    """
+    티커 기반으로 거래소 및 시장지수 코드 반환
+    Returns: (exchange_name, index_symbol)
+    """
+    ticker_upper = ticker.upper()
+
+    # 아시아
+    if ticker_upper.endswith('.KS'):
         return 'KOSPI', 'KS11'
-    elif ticker.endswith('.KQ'):
+    elif ticker_upper.endswith('.KQ'):
         return 'KOSDAQ', 'KQ11'
-    elif ticker.endswith('.T'):
-        return 'TSE', '^N225'
-    elif ticker.endswith('.TO'):
-        return 'TSX', '^GSPTSE'
-    elif ticker.endswith('.F') or ticker.endswith('.DE'):
-        return 'XETRA', '^GDAXI'
-    elif ticker.endswith('.VI'):
-        return 'VSE', '^ATX'
+    elif ticker_upper.endswith('.T'):
+        return 'TSE', '^N225'  # Nikkei 225
+    elif ticker_upper.endswith('.SS'):
+        return 'SSE', '000001.SS'  # Shanghai Composite
+    elif ticker_upper.endswith('.SZ'):
+        return 'SZSE', '399001.SZ'  # Shenzhen Component
+    elif ticker_upper.endswith('.HK'):
+        return 'HKEX', '^HSI'  # Hang Seng
+    elif ticker_upper.endswith('.SI'):
+        return 'SGX', '^STI'  # Straits Times Index
+    elif ticker_upper.endswith('.TW'):
+        return 'TWSE', '^TWII'  # Taiwan Weighted
+    elif ticker_upper.endswith('.BO') or ticker_upper.endswith('.NS'):
+        return 'NSE', '^NSEI'  # Nifty 50
+
+    # 북미
+    elif ticker_upper.endswith('.TO') or ticker_upper.endswith('.V'):
+        return 'TSX', '^GSPTSE'  # S&P/TSX Composite
+    elif ticker_upper.endswith('.MX'):
+        return 'BMV', '^MXX'  # IPC Mexico
+
+    # 유럽
+    elif ticker_upper.endswith('.F') or ticker_upper.endswith('.DE') or ticker_upper.endswith('.BE'):
+        return 'XETRA', '^GDAXI'  # DAX
+    elif ticker_upper.endswith('.PA'):
+        return 'Euronext', '^FCHI'  # CAC 40
+    elif ticker_upper.endswith('.L'):
+        return 'LSE', '^FTSE'  # FTSE 100
+    elif ticker_upper.endswith('.MI'):
+        return 'Borsa', 'FTSEMIB.MI'  # FTSE MIB
+    elif ticker_upper.endswith('.MC'):
+        return 'BME', '^IBEX'  # IBEX 35
+    elif ticker_upper.endswith('.AS'):
+        return 'Euronext', '^AEX'  # AEX Amsterdam
+    elif ticker_upper.endswith('.SW') or ticker_upper.endswith('.VX'):
+        return 'SIX', '^SSMI'  # Swiss Market Index
+    elif ticker_upper.endswith('.VI'):
+        return 'VSE', '^ATX'  # ATX Vienna
+    elif ticker_upper.endswith('.BR'):
+        return 'Euronext', '^BFX'  # BEL 20
+    elif ticker_upper.endswith('.ST'):
+        return 'OMX', '^OMX'  # OMX Stockholm 30
+    elif ticker_upper.endswith('.OL'):
+        return 'OSE', 'OSEBX.OL'  # Oslo Børs Index
+    elif ticker_upper.endswith('.CO'):
+        return 'OMX', '^OMXC20'  # OMX Copenhagen 20
+    elif ticker_upper.endswith('.HE'):
+        return 'OMX', '^OMXH25'  # OMX Helsinki 25
+    elif ticker_upper.endswith('.IR'):
+        return 'Euronext', '^ISEQ'  # ISEQ Overall
+
+    # 오세아니아
+    elif ticker_upper.endswith('.AX'):
+        return 'ASX', '^AORD'  # All Ordinaries
+    elif ticker_upper.endswith('.NZ'):
+        return 'NZX', '^NZ50'  # NZX 50
+
+    # 기타
+    elif ticker_upper.endswith('.SA'):
+        return 'B3', '^BVSP'  # Bovespa
+    elif ticker_upper.endswith('.ME'):
+        return 'MOEX', 'IMOEX.ME'  # MOEX Russia
+    elif ticker_upper.endswith('.JO'):
+        return 'JSE', 'J203.JO'  # FTSE/JSE Top 40
+
+    # 기본값: 미국 S&P 500
     else:
         return 'US', '^GSPC'  # S&P 500
 
@@ -71,18 +135,70 @@ def calculate_beta(stock_returns, market_returns, min_periods=20):
 @st.cache_data(ttl=86400)  # 24시간 캐시
 def get_corporate_tax_rates_from_wikipedia():
     """
-    Wikipedia에서 국가별 법인세율 크롤링
+    국가별 법인세율 조회 (Wikipedia 크롤링 + 견고한 기본값)
     Returns: dict {country_code: tax_rate}
     """
-    url = "https://en.wikipedia.org/wiki/List_of_countries_by_tax_rates"
-    tax_rates = {}
+    # [1] 견고한 기본값 설정 (2025년 기준, 지방세 포함)
+    tax_rates = {
+        # 아시아
+        'KR': 0.231,  # 한국: 21% + 지방세 2.1% = 23.1% (중간 구간)
+        'JP': 0.304,  # 일본: 23.2% (국세) + 지방세 ~7% = 30.4%
+        'CN': 0.25,   # 중국: 25%
+        'HK': 0.165,  # 홍콩: 16.5%
+        'SG': 0.17,   # 싱가포르: 17%
+        'TW': 0.20,   # 대만: 20%
+        'IN': 0.304,  # 인도: 25.17% + 할증세 = 30.4%
 
+        # 북미
+        'US': 0.21,   # 미국: 21% (연방세, 주세 별도)
+        'CA': 0.265,  # 캐나다: 15% (연방) + 11.5% (평균 주세) = 26.5%
+        'MX': 0.30,   # 멕시코: 30%
+
+        # 유럽
+        'DE': 0.30,   # 독일: 15% + 연대세 + 영업세 = ~30%
+        'FR': 0.25,   # 프랑스: 25%
+        'GB': 0.25,   # 영국: 25%
+        'IT': 0.24,   # 이탈리아: 24%
+        'ES': 0.25,   # 스페인: 25%
+        'NL': 0.256,  # 네덜란드: 25.8%
+        'CH': 0.148,  # 스위스: 14.8% (평균)
+        'AT': 0.24,   # 오스트리아: 24%
+        'BE': 0.25,   # 벨기에: 25%
+        'SE': 0.206,  # 스웨덴: 20.6%
+        'NO': 0.22,   # 노르웨이: 22%
+        'DK': 0.22,   # 덴마크: 22%
+        'FI': 0.20,   # 핀란드: 20%
+        'IE': 0.125,  # 아일랜드: 12.5%
+        'LU': 0.245,  # 룩셈부르크: 24.5%
+
+        # 오세아니아
+        'AU': 0.30,   # 호주: 30%
+        'NZ': 0.28,   # 뉴질랜드: 28%
+
+        # 기타
+        'BR': 0.34,   # 브라질: 34%
+        'RU': 0.20,   # 러시아: 20%
+        'ZA': 0.27,   # 남아공: 27%
+    }
+
+    # [2] Wikipedia에서 최신 세율 업데이트 시도
     try:
+        url = "https://en.wikipedia.org/wiki/List_of_countries_by_tax_rates"
         response = requests.get(url, timeout=10)
         soup = BeautifulSoup(response.content, 'html.parser')
 
-        # Wikipedia 테이블에서 법인세율 추출 (테이블 구조에 따라 조정 필요)
+        # Wikipedia 테이블에서 법인세율 추출
         tables = soup.find_all('table', {'class': 'wikitable'})
+        country_map = {
+            'United States': 'US', 'Japan': 'JP', 'Canada': 'CA', 'Germany': 'DE',
+            'Austria': 'AT', 'South Korea': 'KR', 'China': 'CN', 'Hong Kong': 'HK',
+            'Singapore': 'SG', 'Taiwan': 'TW', 'India': 'IN', 'Mexico': 'MX',
+            'France': 'FR', 'United Kingdom': 'GB', 'Italy': 'IT', 'Spain': 'ES',
+            'Netherlands': 'NL', 'Switzerland': 'CH', 'Belgium': 'BE', 'Sweden': 'SE',
+            'Norway': 'NO', 'Denmark': 'DK', 'Finland': 'FI', 'Ireland': 'IE',
+            'Luxembourg': 'LU', 'Australia': 'AU', 'New Zealand': 'NZ', 'Brazil': 'BR',
+            'Russia': 'RU', 'South Africa': 'ZA',
+        }
 
         for table in tables:
             rows = table.find_all('tr')
@@ -98,34 +214,18 @@ def get_corporate_tax_rates_from_wikipedia():
                     if match:
                         rate = float(match.group(1)) / 100
 
-                        # 국가명을 코드로 매핑 (간단한 매핑)
-                        country_map = {
-                            'United States': 'US',
-                            'Japan': 'JP',
-                            'Canada': 'CA',
-                            'Germany': 'DE',
-                            'Austria': 'AT',
-                            'South Korea': 'KR',
-                        }
-
+                        # 국가명 매칭
                         for name, code in country_map.items():
                             if name.lower() in country.lower():
                                 tax_rates[code] = rate
                                 break
-    except Exception as e:
-        st.warning(f"Wikipedia 법인세율 크롤링 실패: {e}")
 
-    # 기본값 설정
-    if 'US' not in tax_rates:
-        tax_rates['US'] = 0.21
-    if 'JP' not in tax_rates:
-        tax_rates['JP'] = 0.304
-    if 'CA' not in tax_rates:
-        tax_rates['CA'] = 0.265
-    if 'DE' not in tax_rates:
-        tax_rates['DE'] = 0.30
-    if 'AT' not in tax_rates:
-        tax_rates['AT'] = 0.24
+        # Wikipedia 크롤링 성공 시 알림
+        # st.info(f"✅ Wikipedia에서 {len(tax_rates)}개 국가 법인세율 업데이트 완료")
+
+    except Exception as e:
+        # 크롤링 실패 시 기본값 사용 (경고 제거 - 너무 많이 뜸)
+        pass
 
     return tax_rates
 
@@ -152,17 +252,81 @@ def get_korean_marginal_tax_rate(pretax_income_millions):
         return 0.264
 
 def get_country_from_ticker(ticker):
-    """티커로부터 국가 코드 추출"""
-    if ticker.endswith('.KS') or ticker.endswith('.KQ'):
-        return 'KR'
-    elif ticker.endswith('.T'):
-        return 'JP'
-    elif ticker.endswith('.TO'):
-        return 'CA'
-    elif ticker.endswith('.F') or ticker.endswith('.DE'):
-        return 'DE'
-    elif ticker.endswith('.VI'):
-        return 'AT'
+    """
+    티커로부터 국가 코드 추출 (거래소 suffix 기반)
+    참고: https://help.yahoo.com/kb/SLN2310.html
+    """
+    ticker_upper = ticker.upper()
+
+    # 아시아
+    if ticker_upper.endswith('.KS') or ticker_upper.endswith('.KQ'):
+        return 'KR'  # 한국 (KOSPI, KOSDAQ)
+    elif ticker_upper.endswith('.T'):
+        return 'JP'  # 일본 (Tokyo)
+    elif ticker_upper.endswith('.SS'):
+        return 'CN'  # 중국 (Shanghai)
+    elif ticker_upper.endswith('.SZ'):
+        return 'CN'  # 중국 (Shenzhen)
+    elif ticker_upper.endswith('.HK'):
+        return 'HK'  # 홍콩
+    elif ticker_upper.endswith('.SI'):
+        return 'SG'  # 싱가포르
+    elif ticker_upper.endswith('.TW'):
+        return 'TW'  # 대만
+    elif ticker_upper.endswith('.BO') or ticker_upper.endswith('.NS'):
+        return 'IN'  # 인도 (Bombay, National Stock Exchange)
+
+    # 북미
+    elif ticker_upper.endswith('.TO') or ticker_upper.endswith('.V'):
+        return 'CA'  # 캐나다 (Toronto, Vancouver)
+    elif ticker_upper.endswith('.MX'):
+        return 'MX'  # 멕시코
+
+    # 유럽
+    elif ticker_upper.endswith('.F') or ticker_upper.endswith('.DE') or ticker_upper.endswith('.BE'):
+        return 'DE'  # 독일 (Frankfurt, Xetra, Berlin)
+    elif ticker_upper.endswith('.PA'):
+        return 'FR'  # 프랑스 (Paris)
+    elif ticker_upper.endswith('.L'):
+        return 'GB'  # 영국 (London)
+    elif ticker_upper.endswith('.MI'):
+        return 'IT'  # 이탈리아 (Milan)
+    elif ticker_upper.endswith('.MC'):
+        return 'ES'  # 스페인 (Madrid)
+    elif ticker_upper.endswith('.AS'):
+        return 'NL'  # 네덜란드 (Amsterdam)
+    elif ticker_upper.endswith('.SW') or ticker_upper.endswith('.VX'):
+        return 'CH'  # 스위스 (Swiss Exchange, Virt-X)
+    elif ticker_upper.endswith('.VI'):
+        return 'AT'  # 오스트리아 (Vienna)
+    elif ticker_upper.endswith('.BR'):
+        return 'BE'  # 벨기에 (Brussels)
+    elif ticker_upper.endswith('.ST'):
+        return 'SE'  # 스웨덴 (Stockholm)
+    elif ticker_upper.endswith('.OL'):
+        return 'NO'  # 노르웨이 (Oslo)
+    elif ticker_upper.endswith('.CO'):
+        return 'DK'  # 덴마크 (Copenhagen)
+    elif ticker_upper.endswith('.HE'):
+        return 'FI'  # 핀란드 (Helsinki)
+    elif ticker_upper.endswith('.IR'):
+        return 'IE'  # 아일랜드 (Irish)
+
+    # 오세아니아
+    elif ticker_upper.endswith('.AX'):
+        return 'AU'  # 호주
+    elif ticker_upper.endswith('.NZ'):
+        return 'NZ'  # 뉴질랜드
+
+    # 기타
+    elif ticker_upper.endswith('.SA'):
+        return 'BR'  # 브라질
+    elif ticker_upper.endswith('.ME'):
+        return 'RU'  # 러시아 (MOEX)
+    elif ticker_upper.endswith('.JO'):
+        return 'ZA'  # 남아프리카공화국
+
+    # 기본값: 미국 (suffix 없는 경우)
     else:
         return 'US'
 
