@@ -1,3 +1,9 @@
+# 최신 수정: 2026-02-16 13:00 KST
+# 주요 변경사항:
+# - 국내 베타 계산 수정: 시장 지수는 FDR 사용 (KS11, KQ11은 yfinance 미지원)
+# - Debt Ratio 수식 수정: IBD/(시총+IBD+NCI) [총부채/총자산]
+# - 노트 업데이트: 주가 데이터 소스 명시
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -577,10 +583,24 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
                     if not stock_hist_5y.empty:
                         stock_data_5y = stock_hist_5y
 
-                    # 시장 지수 데이터: yfinance 사용
-                    market_hist_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)
-                    if not market_hist_5y.empty:
-                        market_data_5y = market_hist_5y
+                    # 시장 지수 데이터: 한국 지수는 FDR 사용 (yfinance 미지원)
+                    if ticker.endswith('.KS') or ticker.endswith('.KQ'):
+                        # 한국 시장 지수: FinanceDataReader 사용
+                        try:
+                            market_data_5y = fdr.DataReader(market_idx, start_5y, end_date)
+                            # FDR 데이터 인덱스를 timezone-naive DatetimeIndex로 변환
+                            if market_data_5y is not None and not market_data_5y.empty:
+                                if not isinstance(market_data_5y.index, pd.DatetimeIndex):
+                                    market_data_5y.index = pd.to_datetime(market_data_5y.index)
+                                if market_data_5y.index.tz is not None:
+                                    market_data_5y.index = market_data_5y.index.tz_localize(None)
+                        except Exception as fdr_err:
+                            st.warning(f"{ticker} 시장 지수 수집 실패 (FDR): {fdr_err}")
+                    else:
+                        # 해외 시장 지수: yfinance 사용
+                        market_hist_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)
+                        if not market_hist_5y.empty:
+                            market_data_5y = market_hist_5y
 
                 except Exception as e:
                     st.warning(f"{ticker} 5Y 데이터 수집 실패: {e}")
@@ -649,10 +669,24 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
                     if not stock_hist_2y.empty:
                         stock_data_2y = stock_hist_2y
 
-                    # 시장 지수 데이터: yfinance 사용
-                    market_hist_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
-                    if not market_hist_2y.empty:
-                        market_data_2y = market_hist_2y
+                    # 시장 지수 데이터: 한국 지수는 FDR 사용
+                    if ticker.endswith('.KS') or ticker.endswith('.KQ'):
+                        # 한국 시장 지수: FinanceDataReader 사용
+                        try:
+                            market_data_2y = fdr.DataReader(market_idx, start_2y, end_date)
+                            # FDR 데이터 인덱스를 timezone-naive DatetimeIndex로 변환
+                            if market_data_2y is not None and not market_data_2y.empty:
+                                if not isinstance(market_data_2y.index, pd.DatetimeIndex):
+                                    market_data_2y.index = pd.to_datetime(market_data_2y.index)
+                                if market_data_2y.index.tz is not None:
+                                    market_data_2y.index = market_data_2y.index.tz_localize(None)
+                        except Exception as fdr_err:
+                            st.warning(f"{ticker} 시장 지수 수집 실패 (FDR): {fdr_err}")
+                    else:
+                        # 해외 시장 지수: yfinance 사용
+                        market_hist_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
+                        if not market_hist_2y.empty:
+                            market_data_2y = market_hist_2y
 
                 except Exception as e:
                     st.warning(f"{ticker} 2Y 데이터 수집 실패: {e}")
@@ -1229,8 +1263,8 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         # Tax Rate
         ws.cell(r,31,gpcm['Tax_Rate']); sc(ws.cell(r,31), fo=fA, fi=base_fi, al=aR, bd=BD, nf=NF_PCT)
 
-        # Debt Ratio = IBD / (Market Cap + NCI)
-        ws.cell(r,32).value=f'=IF((T{r}+K{r})>0,I{r}/(T{r}+K{r}),0)'; sc(ws.cell(r,32), fo=fFRM_B, fi=base_fi, al=aR, bd=BD, nf=NF_RATIO)
+        # Debt Ratio = IBD / (Market Cap + IBD + NCI) [총부채/총자산]
+        ws.cell(r,32).value=f'=IF((T{r}+I{r}+K{r})>0,I{r}/(T{r}+I{r}+K{r}),0)'; sc(ws.cell(r,32), fo=fFRM_B, fi=base_fi, al=aR, bd=BD, nf=NF_RATIO)
 
         # Unlevered Beta 5Y = Beta 5Y Adj / (1 + (1 - Tax Rate) * Debt Ratio)
         ws.cell(r,33).value=f'=IF(AA{r}>0,AA{r}/(1+(1-AE{r})*AF{r}),AA{r})'; sc(ws.cell(r,33), fo=fFRM_B, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
@@ -1288,7 +1322,7 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         '',
         '[ Beta & Risk Analysis ]',
         '• Data Source:',
-        '  - 한국 주식 (.KS, .KQ): Yahoo Finance (yfinance)',
+        '  - 한국 주식 (.KS, .KQ): 주가 yfinance, 시장지수 FinanceDataReader (KS11, KQ11)',
         '  - 해외 주식: Yahoo Finance (yfinance)',
         '• Beta 계산 방법:',
         '  - 5Y Monthly Beta: 5년간 월말 종가 기준 월간 수익률 계산 → 시장지수 대비 선형회귀',
@@ -1299,7 +1333,7 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         '• 값 검증: NaN, inf, 극단값(-10 ~ 10 범위 벗어남) 필터링 → None 처리',
         '• Tax Rate: Wikipedia 기반 법인세율; 한국은 한계세율 적용 (지방세 포함, 2025)',
         '   - Korea: ≤ 200M: 9.9% | 200M-20,000M: 20.9% | 20,000M-300,000M: 23.1% | > 300,000M: 26.4%',
-        '• Debt Ratio = IBD ÷ (IBD + Market Cap + NCI)',
+        '• Debt Ratio = IBD ÷ (Market Cap + IBD + NCI) [총부채/총자산]',
         '• Unlevered Beta = Levered Beta ÷ (1 + (1 - Tax Rate) × Debt Ratio) [Hamada Model]',
         '• 베타 값은 Python에서 계산되어 엑셀에 저장됩니다 (실시간 데이터 기반)',
         '',
@@ -1314,7 +1348,7 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         '',
         '• N/M = Not Meaningful (negative or zero)',
         '• All values in GPCM are calculated via Excel Formulas linking to BS_Full and PL_Data sheets.',
-        '', '⚠ Data from Yahoo Finance. Verify with official sources.'
+        '', '⚠ 주가 데이터: Yahoo Finance (yfinance) | 한국 시장지수: FinanceDataReader | Verify with official sources.'
     ]
     for note in notes:
         ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=TOTAL_COLS)
