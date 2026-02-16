@@ -374,7 +374,7 @@ def get_korea_10y_treasury_yield(base_date_str, user_rf_rate=0.033):
     st.info(f"💡 무위험이자율 (사용자 입력): {user_rf_rate*100:.2f}%")
     return user_rf_rate
 @st.cache_data(ttl=3600)  # <--- [추가] 1시간 동안 데이터를 저장해서 재사용함
-def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_premium=0.0402, target_tax_rate=0.264, user_rf_rate=None):
+def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_premium=0.0402, target_tax_rate=0.264, user_rf_rate=None, beta_type="5Y"):
     """
     GPCM 데이터 수집 및 엑셀 생성을 위한 데이터 구조 반환
 
@@ -384,6 +384,7 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
     - size_premium: Size Premium (기본값 4.02%, 한국공인회계사회 Micro 기준)
     - target_tax_rate: Target 기업 법인세율 (기본값 26.4%, 한국 대기업 기준)
     - user_rf_rate: 사용자 입력 무위험이자율 (None이면 자동 조회)
+    - beta_type: WACC 계산에 사용할 베타 유형 ("5Y" 또는 "2Y", 기본값 "5Y")
 
     Note: 목표 부채비율은 피어들의 평균 자본구조로 자동 계산됨
           개별 peer의 WACC이 아닌 Target 기업의 WACC을 계산함
@@ -575,6 +576,20 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
                     try:
                         stock_data_5y = fdr.DataReader(ticker, start_5y, end_date)
                         market_data_5y = fdr.DataReader(market_idx, start_5y, end_date)
+
+                        # FDR 데이터 인덱스를 timezone-naive DatetimeIndex로 변환
+                        if stock_data_5y is not None and not stock_data_5y.empty:
+                            if not isinstance(stock_data_5y.index, pd.DatetimeIndex):
+                                stock_data_5y.index = pd.to_datetime(stock_data_5y.index)
+                            if stock_data_5y.index.tz is not None:
+                                stock_data_5y.index = stock_data_5y.index.tz_localize(None)
+
+                        if market_data_5y is not None and not market_data_5y.empty:
+                            if not isinstance(market_data_5y.index, pd.DatetimeIndex):
+                                market_data_5y.index = pd.to_datetime(market_data_5y.index)
+                            if market_data_5y.index.tz is not None:
+                                market_data_5y.index = market_data_5y.index.tz_localize(None)
+
                     except Exception as fdr_err:
                         # FinanceDataReader 실패 시 yfinance 시도
                         try:
@@ -610,13 +625,29 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
                         else:
                             market_prices_5y = market_data_5y
 
+                        # 인덱스 확인 및 변환 (timezone-naive DatetimeIndex)
+                        if not isinstance(stock_prices_5y.index, pd.DatetimeIndex):
+                            stock_prices_5y.index = pd.to_datetime(stock_prices_5y.index)
+                        if stock_prices_5y.index.tz is not None:
+                            stock_prices_5y.index = stock_prices_5y.index.tz_localize(None)
+
+                        if not isinstance(market_prices_5y.index, pd.DatetimeIndex):
+                            market_prices_5y.index = pd.to_datetime(market_prices_5y.index)
+                        if market_prices_5y.index.tz is not None:
+                            market_prices_5y.index = market_prices_5y.index.tz_localize(None)
+
                         # 월말 종가 저장
-                        stock_monthly_prices = stock_prices_5y.resample('ME').last()
-                        market_monthly_prices = market_prices_5y.resample('ME').last()
+                        stock_monthly_prices = stock_prices_5y.resample('ME').last().dropna()
+                        market_monthly_prices = market_prices_5y.resample('ME').last().dropna()
 
                         # 데이터 저장 (엑셀에서 사용)
-                        gpcm['Stock_Monthly_Prices_5Y'] = stock_monthly_prices
-                        gpcm['Market_Monthly_Prices_5Y'] = market_monthly_prices
+                        if len(stock_monthly_prices) >= 12 and len(market_monthly_prices) >= 12:  # 최소 12개월 데이터 필요
+                            gpcm['Stock_Monthly_Prices_5Y'] = stock_monthly_prices
+                            gpcm['Market_Monthly_Prices_5Y'] = market_monthly_prices
+                        else:
+                            st.warning(f"{ticker}: 월별 데이터가 부족합니다 (Stock: {len(stock_monthly_prices)}, Market: {len(market_monthly_prices)})")
+                            gpcm['Stock_Monthly_Prices_5Y'] = None
+                            gpcm['Market_Monthly_Prices_5Y'] = None
 
                         # 베타는 엑셀에서 계산하므로 None으로 설정
                         gpcm['Beta_5Y_Monthly_Raw'] = None
@@ -632,7 +663,93 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
                     gpcm['Beta_5Y_Monthly_Raw'] = None
                     gpcm['Beta_5Y_Monthly_Adj'] = None
 
-                # [4-2] 2년 주간 베타는 제거 (5년 월간 베타만 사용)
+                # [4-2] 2년 주간 베타 데이터 수집
+                start_2y = (base_dt - timedelta(days=365*2+20)).strftime('%Y-%m-%d')
+                stock_data_2y = None
+                market_data_2y = None
+
+                if ticker.endswith('.KS') or ticker.endswith('.KQ'):
+                    # 한국 주식: FinanceDataReader 우선 사용
+                    try:
+                        stock_data_2y = fdr.DataReader(ticker, start_2y, end_date)
+                        market_data_2y = fdr.DataReader(market_idx, start_2y, end_date)
+
+                        # FDR 데이터 인덱스를 timezone-naive DatetimeIndex로 변환
+                        if stock_data_2y is not None and not stock_data_2y.empty:
+                            if not isinstance(stock_data_2y.index, pd.DatetimeIndex):
+                                stock_data_2y.index = pd.to_datetime(stock_data_2y.index)
+                            if stock_data_2y.index.tz is not None:
+                                stock_data_2y.index = stock_data_2y.index.tz_localize(None)
+
+                        if market_data_2y is not None and not market_data_2y.empty:
+                            if not isinstance(market_data_2y.index, pd.DatetimeIndex):
+                                market_data_2y.index = pd.to_datetime(market_data_2y.index)
+                            if market_data_2y.index.tz is not None:
+                                market_data_2y.index = market_data_2y.index.tz_localize(None)
+
+                    except:
+                        # FinanceDataReader 실패 시 yfinance 시도
+                        try:
+                            stock_hist_2y = yf.download(ticker, start=start_2y, end=end_date, progress=False)
+                            market_hist_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
+                            if not stock_hist_2y.empty and not market_hist_2y.empty:
+                                stock_data_2y = stock_hist_2y
+                                market_data_2y = market_hist_2y
+                        except:
+                            pass
+                else:
+                    # 해외 주식: yfinance 사용
+                    try:
+                        stock_hist_2y = yf.download(ticker, start=start_2y, end=end_date, progress=False)
+                        market_hist_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
+                        if not stock_hist_2y.empty and not market_hist_2y.empty:
+                            stock_data_2y = stock_hist_2y
+                            market_data_2y = market_hist_2y
+                    except:
+                        pass
+
+                # 주간 종가 저장
+                if stock_data_2y is not None and market_data_2y is not None:
+                    if not stock_data_2y.empty and not market_data_2y.empty:
+                        # Close 컬럼 추출
+                        if isinstance(stock_data_2y, pd.DataFrame):
+                            stock_prices_2y = stock_data_2y['Close'] if 'Close' in stock_data_2y.columns else stock_data_2y.iloc[:, 0]
+                        else:
+                            stock_prices_2y = stock_data_2y
+
+                        if isinstance(market_data_2y, pd.DataFrame):
+                            market_prices_2y = market_data_2y['Close'] if 'Close' in market_data_2y.columns else market_data_2y.iloc[:, 0]
+                        else:
+                            market_prices_2y = market_data_2y
+
+                        # 인덱스 확인 및 변환
+                        if not isinstance(stock_prices_2y.index, pd.DatetimeIndex):
+                            stock_prices_2y.index = pd.to_datetime(stock_prices_2y.index)
+                        if stock_prices_2y.index.tz is not None:
+                            stock_prices_2y.index = stock_prices_2y.index.tz_localize(None)
+
+                        if not isinstance(market_prices_2y.index, pd.DatetimeIndex):
+                            market_prices_2y.index = pd.to_datetime(market_prices_2y.index)
+                        if market_prices_2y.index.tz is not None:
+                            market_prices_2y.index = market_prices_2y.index.tz_localize(None)
+
+                        # 주말 종가 저장 (W-FRI: 금요일 기준)
+                        stock_weekly_prices = stock_prices_2y.resample('W-FRI').last().dropna()
+                        market_weekly_prices = market_prices_2y.resample('W-FRI').last().dropna()
+
+                        if len(stock_weekly_prices) >= 50 and len(market_weekly_prices) >= 50:  # 최소 50주 데이터 필요
+                            gpcm['Stock_Weekly_Prices_2Y'] = stock_weekly_prices
+                            gpcm['Market_Weekly_Prices_2Y'] = market_weekly_prices
+                        else:
+                            gpcm['Stock_Weekly_Prices_2Y'] = None
+                            gpcm['Market_Weekly_Prices_2Y'] = None
+                    else:
+                        gpcm['Stock_Weekly_Prices_2Y'] = None
+                        gpcm['Market_Weekly_Prices_2Y'] = None
+                else:
+                    gpcm['Stock_Weekly_Prices_2Y'] = None
+                    gpcm['Market_Weekly_Prices_2Y'] = None
+
                 gpcm['Beta_2Y_Weekly_Raw'] = None
                 gpcm['Beta_2Y_Weekly_Adj'] = None
 
@@ -695,18 +812,21 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
         avg_debt_ratio = 0.30
         st.warning(f"⚠️ 부채비율 계산 불가. 기본값 {avg_debt_ratio*100:.0f}% 사용")
 
-    # 7-2. Unlevered Beta 평균 계산
-    unlevered_betas_5y = []
-    for gpcm in gpcm_data.values():
-        if gpcm['Unlevered_Beta_5Y'] is not None and gpcm['Unlevered_Beta_5Y'] > 0:
-            unlevered_betas_5y.append(gpcm['Unlevered_Beta_5Y'])
+    # 7-2. Unlevered Beta 평균 계산 (선택된 beta_type에 따라)
+    unlevered_betas = []
+    beta_field = 'Unlevered_Beta_5Y' if beta_type == '5Y' else 'Unlevered_Beta_2Y'
+    beta_label = "5Y Monthly" if beta_type == '5Y' else "2Y Weekly"
 
-    if unlevered_betas_5y:
-        avg_unlevered_beta = np.mean(unlevered_betas_5y)
-        st.info(f"📊 피어 평균 Unlevered Beta (5Y): {avg_unlevered_beta:.4f}")
+    for gpcm in gpcm_data.values():
+        if gpcm[beta_field] is not None and gpcm[beta_field] > 0:
+            unlevered_betas.append(gpcm[beta_field])
+
+    if unlevered_betas:
+        avg_unlevered_beta = np.mean(unlevered_betas)
+        st.info(f"📊 피어 평균 Unlevered Beta ({beta_label}): {avg_unlevered_beta:.4f}")
     else:
         avg_unlevered_beta = 1.0
-        st.warning(f"⚠️ Unlevered Beta 계산 불가. 기본값 {avg_unlevered_beta:.2f} 사용")
+        st.warning(f"⚠️ Unlevered Beta ({beta_label}) 계산 불가. 기본값 {avg_unlevered_beta:.2f} 사용")
 
     # 7-3. Target의 Relevered Beta 계산
     # Relevered Beta = Unlevered Beta × (1 + (1 - Tax Rate) × (D/E))
@@ -755,7 +875,7 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
     return gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs, price_rel_dfs, ticker_to_name, avg_debt_ratio, target_wacc_data
 
 
-def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs, price_rel_dfs, base_date_str, ticker_to_name, target_wacc_data):
+def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs, price_rel_dfs, base_date_str, ticker_to_name, target_wacc_data, beta_type="5Y"):
     output = io.BytesIO()
     wb = Workbook(); wb.remove(wb.active)
 
@@ -865,7 +985,7 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
 
     # [Sheet 3.5] Beta_Calculation (엑셀 수식으로 베타 계산)
     ws_beta = wb.create_sheet('Beta_Calculation')
-    wb.move_sheet('Beta_Calculation', offset=-1)  # Market_Cap 다음에 위치
+    wb.move_sheet('Beta_Calculation', offset=-3)  # 맨 앞으로 (Sheet 위치: 0)
 
     # 제목
     ws_beta.merge_cells('A1:F1')
@@ -874,29 +994,32 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
 
     ws_beta.merge_cells('A2:F2')
     sc(ws_beta['A2'], fo=Font(name='Arial', size=9, color=C_MG, italic=True))
-    ws_beta['A2'] = f'5-Year Monthly Returns | Base: {base_date_str}'
+    ws_beta['A2'] = f'5-Year Monthly & 2-Year Weekly Returns | Base: {base_date_str}'
 
     r_beta = 4
 
     # 각 ticker별로 베타 계산 섹션 생성
-    beta_result_rows = {}  # ticker: (raw_beta_row, adj_beta_row) 매핑
+    beta_result_rows = {}  # ticker: (raw_5y, adj_5y, raw_2y, adj_2y) 매핑
 
     for idx, (ticker, gpcm) in enumerate(gpcm_data.items()):
-        # 섹션 제목
+        # 회사 정보
         company_name = gpcm['Company']
         market_idx = gpcm['Market_Index']
 
+        # ========== 5Y Monthly Beta Section ==========
         ws_beta.merge_cells(f'A{r_beta}:F{r_beta}')
         sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', bold=True, size=10, color=C_W),
            fi=PatternFill('solid', fgColor='607D8B'), al=Alignment(horizontal='center'))
-        ws_beta.cell(r_beta, 1, f'{company_name} ({ticker}) vs {market_idx}')
+        ws_beta.cell(r_beta, 1, f'{company_name} ({ticker}) vs {market_idx} - 5Y Monthly')
         r_beta += 1
 
-        # 데이터 확인
-        stock_prices = gpcm.get('Stock_Monthly_Prices_5Y')
-        market_prices = gpcm.get('Market_Monthly_Prices_5Y')
+        # 5Y 데이터 확인
+        stock_prices_5y = gpcm.get('Stock_Monthly_Prices_5Y')
+        market_prices_5y = gpcm.get('Market_Monthly_Prices_5Y')
+        raw_5y_row = None
+        adj_5y_row = None
 
-        if stock_prices is not None and market_prices is not None and not stock_prices.empty and not market_prices.empty:
+        if stock_prices_5y is not None and market_prices_5y is not None and not stock_prices_5y.empty and not market_prices_5y.empty:
             # 헤더
             ws_beta.cell(r_beta, 1, 'Date')
             ws_beta.cell(r_beta, 2, f'{ticker} Price')
@@ -910,22 +1033,20 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
 
             data_start_row = r_beta
 
-            # 공통 날짜 인덱스 (align)
-            common_dates = stock_prices.index.intersection(market_prices.index)
+            # 공통 날짜 인덱스
+            common_dates = stock_prices_5y.index.intersection(market_prices_5y.index)
 
             # 데이터 행 작성
             for date in common_dates:
                 ws_beta.cell(r_beta, 1, date.strftime('%Y-%m'))
-                ws_beta.cell(r_beta, 2, float(stock_prices.loc[date]))
-                ws_beta.cell(r_beta, 3, float(market_prices.loc[date]))
+                ws_beta.cell(r_beta, 2, float(stock_prices_5y.loc[date]))
+                ws_beta.cell(r_beta, 3, float(market_prices_5y.loc[date]))
 
                 # 수익률 계산 (엑셀 수식)
                 if r_beta > data_start_row:
-                    # Stock Return = (Price - Prev Price) / Prev Price
                     ws_beta.cell(r_beta, 4).value = f'=(B{r_beta}-B{r_beta-1})/B{r_beta-1}'
                     ws_beta.cell(r_beta, 5).value = f'=(C{r_beta}-C{r_beta-1})/C{r_beta-1}'
                 else:
-                    # 첫 번째 행은 수익률 계산 불가
                     ws_beta.cell(r_beta, 4, None)
                     ws_beta.cell(r_beta, 5, None)
 
@@ -943,34 +1064,108 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
             # 베타 계산 (SLOPE 함수)
             r_beta += 1
             ws_beta.cell(r_beta, 1, 'Raw Beta (5Y Monthly)')
-            # SLOPE(y_range, x_range) = SLOPE(stock_returns, market_returns)
             ws_beta.cell(r_beta, 2).value = f'=SLOPE(D{data_start_row+1}:D{data_end_row},E{data_start_row+1}:E{data_end_row})'
             sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', bold=True, size=9), bd=BD)
             sc(ws_beta.cell(r_beta, 2), fo=Font(name='Arial', bold=True, size=9), fi=PatternFill('solid', fgColor='E8F5E9'),
                bd=BD, al=aR, nf='0.0000')
-
-            raw_beta_row = r_beta
+            raw_5y_row = r_beta
             r_beta += 1
 
-            # Adjusted Beta (Bloomberg 방법론)
-            ws_beta.cell(r_beta, 1, 'Adjusted Beta')
+            # Adjusted Beta
+            ws_beta.cell(r_beta, 1, 'Adjusted Beta (5Y)')
             ws_beta.cell(r_beta, 2).value = f'=2/3*B{r_beta-1}+1/3*1'
             sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', bold=True, size=9), bd=BD)
             sc(ws_beta.cell(r_beta, 2), fo=Font(name='Arial', bold=True, size=9), fi=PatternFill('solid', fgColor='E8F5E9'),
                bd=BD, al=aR, nf='0.0000')
-
-            adj_beta_row = r_beta
-
-            # 결과 저장
-            beta_result_rows[ticker] = (raw_beta_row, adj_beta_row)
+            adj_5y_row = r_beta
 
         else:
-            # 데이터 없음
-            ws_beta.cell(r_beta, 1, 'No price data available')
+            ws_beta.cell(r_beta, 1, 'No 5Y price data available')
             sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', size=9, color='FF0000'))
-            beta_result_rows[ticker] = (None, None)
 
-        r_beta += 2  # 다음 섹션과 간격
+        r_beta += 2  # 간격
+
+        # ========== 2Y Weekly Beta Section ==========
+        ws_beta.merge_cells(f'A{r_beta}:F{r_beta}')
+        sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', bold=True, size=10, color=C_W),
+           fi=PatternFill('solid', fgColor='455A64'), al=Alignment(horizontal='center'))
+        ws_beta.cell(r_beta, 1, f'{company_name} ({ticker}) vs {market_idx} - 2Y Weekly')
+        r_beta += 1
+
+        # 2Y 데이터 확인
+        stock_prices_2y = gpcm.get('Stock_Weekly_Prices_2Y')
+        market_prices_2y = gpcm.get('Market_Weekly_Prices_2Y')
+        raw_2y_row = None
+        adj_2y_row = None
+
+        if stock_prices_2y is not None and market_prices_2y is not None and not stock_prices_2y.empty and not market_prices_2y.empty:
+            # 헤더
+            ws_beta.cell(r_beta, 1, 'Date')
+            ws_beta.cell(r_beta, 2, f'{ticker} Price')
+            ws_beta.cell(r_beta, 3, f'{market_idx} Price')
+            ws_beta.cell(r_beta, 4, f'{ticker} Return')
+            ws_beta.cell(r_beta, 5, f'{market_idx} Return')
+            for col in range(1, 6):
+                sc(ws_beta.cell(r_beta, col), fo=Font(name='Arial', bold=True, size=9, color=C_W),
+                   fi=PatternFill('solid', fgColor=C_BL), al=Alignment(horizontal='center'), bd=BD)
+            r_beta += 1
+
+            data_start_row = r_beta
+
+            # 공통 날짜 인덱스
+            common_dates = stock_prices_2y.index.intersection(market_prices_2y.index)
+
+            # 데이터 행 작성
+            for date in common_dates:
+                ws_beta.cell(r_beta, 1, date.strftime('%Y-%m-%d'))
+                ws_beta.cell(r_beta, 2, float(stock_prices_2y.loc[date]))
+                ws_beta.cell(r_beta, 3, float(market_prices_2y.loc[date]))
+
+                # 수익률 계산 (엑셀 수식)
+                if r_beta > data_start_row:
+                    ws_beta.cell(r_beta, 4).value = f'=(B{r_beta}-B{r_beta-1})/B{r_beta-1}'
+                    ws_beta.cell(r_beta, 5).value = f'=(C{r_beta}-C{r_beta-1})/C{r_beta-1}'
+                else:
+                    ws_beta.cell(r_beta, 4, None)
+                    ws_beta.cell(r_beta, 5, None)
+
+                # 스타일
+                sc(ws_beta.cell(r_beta, 1), fo=fA, al=aC, bd=BD)
+                sc(ws_beta.cell(r_beta, 2), fo=fA, al=aR, bd=BD, nf='#,##0.00')
+                sc(ws_beta.cell(r_beta, 3), fo=fA, al=aR, bd=BD, nf='#,##0.00')
+                sc(ws_beta.cell(r_beta, 4), fo=fA, al=aR, bd=BD, nf='0.00%')
+                sc(ws_beta.cell(r_beta, 5), fo=fA, al=aR, bd=BD, nf='0.00%')
+
+                r_beta += 1
+
+            data_end_row = r_beta - 1
+
+            # 베타 계산 (SLOPE 함수)
+            r_beta += 1
+            ws_beta.cell(r_beta, 1, 'Raw Beta (2Y Weekly)')
+            ws_beta.cell(r_beta, 2).value = f'=SLOPE(D{data_start_row+1}:D{data_end_row},E{data_start_row+1}:E{data_end_row})'
+            sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', bold=True, size=9), bd=BD)
+            sc(ws_beta.cell(r_beta, 2), fo=Font(name='Arial', bold=True, size=9), fi=PatternFill('solid', fgColor='FFF9C4'),
+               bd=BD, al=aR, nf='0.0000')
+            raw_2y_row = r_beta
+            r_beta += 1
+
+            # Adjusted Beta
+            ws_beta.cell(r_beta, 1, 'Adjusted Beta (2Y)')
+            ws_beta.cell(r_beta, 2).value = f'=2/3*B{r_beta-1}+1/3*1'
+            sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', bold=True, size=9), bd=BD)
+            sc(ws_beta.cell(r_beta, 2), fo=Font(name='Arial', bold=True, size=9), fi=PatternFill('solid', fgColor='FFF9C4'),
+               bd=BD, al=aR, nf='0.0000')
+            adj_2y_row = r_beta
+
+        else:
+            ws_beta.cell(r_beta, 1, 'No 2Y price data available')
+            sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', size=9, color='FF0000'))
+
+        # 결과 저장 (4개 값)
+        beta_result_rows[ticker] = (raw_5y_row, adj_5y_row, raw_2y_row, adj_2y_row)
+
+        r_beta += 2  # 다음 회사와 간격
 
     ws_beta.column_dimensions['A'].width = 15
     ws_beta.column_dimensions['B'].width = 15
@@ -982,7 +1177,7 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
 
     # [Sheet 4] GPCM
     ws = wb.create_sheet('GPCM')
-    wb.move_sheet('GPCM', offset=-3)
+    wb.move_sheet('GPCM', offset=-5)  # 맨 앞으로 (Sheet 위치: 0)
     TOTAL_COLS = 34  # WACC 컬럼 제거 (별도 시트로 분리)
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=TOTAL_COLS); sc(ws.cell(1,1,'GPCM Valuation Summary with Beta Analysis'), fo=fT)
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=TOTAL_COLS); sc(ws.cell(2,1,f'Base: {base_date_str} | Unit: Millions (local currency) | EV = MCap + IBD − Cash + NCI | Target WACC: See WACC_Calculation Sheet'), fo=fS)
@@ -1048,28 +1243,35 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
 
         # Z-AI: Beta & Risk Analysis
         # Beta 값은 Beta_Calculation 시트에서 엑셀 수식으로 참조
-        raw_beta_row, adj_beta_row = beta_result_rows.get(ticker, (None, None))
+        raw_5y_row, adj_5y_row, raw_2y_row, adj_2y_row = beta_result_rows.get(ticker, (None, None, None, None))
 
         # Beta 5Y Raw - Beta_Calculation 시트 참조
-        if raw_beta_row is not None:
-            ws.cell(r,26).value = f'=Beta_Calculation!$B${raw_beta_row}'
+        if raw_5y_row is not None:
+            ws.cell(r,26).value = f'=Beta_Calculation!$B${raw_5y_row}'
         else:
             ws.cell(r,26, None)
         sc(ws.cell(r,26), fo=fLINK, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
 
         # Beta 5Y Adj - Beta_Calculation 시트 참조
-        if adj_beta_row is not None:
-            ws.cell(r,27).value = f'=Beta_Calculation!$B${adj_beta_row}'
+        if adj_5y_row is not None:
+            ws.cell(r,27).value = f'=Beta_Calculation!$B${adj_5y_row}'
         else:
             ws.cell(r,27, None)
         sc(ws.cell(r,27), fo=fLINK, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
 
-        # Beta 2Y Raw/Adj는 제거 (5년 월간 베타만 사용)
-        ws.cell(r,28, None)
-        sc(ws.cell(r,28), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
+        # Beta 2Y Raw - Beta_Calculation 시트 참조
+        if raw_2y_row is not None:
+            ws.cell(r,28).value = f'=Beta_Calculation!$B${raw_2y_row}'
+        else:
+            ws.cell(r,28, None)
+        sc(ws.cell(r,28), fo=fLINK, fi=PatternFill('solid',fgColor='FFF9C4'), al=aR, bd=BD, nf=NF_BETA)
 
-        ws.cell(r,29, None)
-        sc(ws.cell(r,29), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
+        # Beta 2Y Adj - Beta_Calculation 시트 참조
+        if adj_2y_row is not None:
+            ws.cell(r,29).value = f'=Beta_Calculation!$B${adj_2y_row}'
+        else:
+            ws.cell(r,29, None)
+        sc(ws.cell(r,29), fo=fLINK, fi=PatternFill('solid',fgColor='FFF9C4'), al=aR, bd=BD, nf=NF_BETA)
 
         # Pretax Income (Formula)
         ws.cell(r,30).value=f'=SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$D:$D,"Pretax Income")'; sc(ws.cell(r,30), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_M)
@@ -1173,7 +1375,7 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
 
     # [Sheet 4.5] WACC_Calculation (Target 기업의 WACC 계산)
     ws_wacc = wb.create_sheet('WACC_Calculation')
-    wb.move_sheet('WACC_Calculation', offset=-2)  # GPCM 다음에 위치
+    wb.move_sheet('WACC_Calculation', offset=-5)  # GPCM 다음 위치 (Sheet 위치: 1)
 
     # WACC 시트 제목
     ws_wacc.merge_cells('A1:D1')
@@ -1252,10 +1454,12 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
            fi=PatternFill('solid', fgColor=C_BL), al=Alignment(horizontal='center'), bd=BD)
     r_wacc += 1
 
-    # Avg Unlevered Beta - 엑셀 수식으로 GPCM 시트 참조
+    # Avg Unlevered Beta - 엑셀 수식으로 GPCM 시트 참조 (선택된 beta_type에 따라)
     row_unlevered_beta = r_wacc
-    ws_wacc.cell(r_wacc, 1, 'Avg Unlevered Beta (5Y)')
-    ws_wacc.cell(r_wacc, 2).value = f'=GPCM!AG{mean_row}'  # 컬럼 33 (AG) = Unlevered Beta 5Y
+    beta_label = "5Y Monthly" if beta_type == "5Y" else "2Y Weekly"
+    beta_col = 'AG' if beta_type == "5Y" else 'AH'  # AG = 컬럼 33 (Unlevered Beta 5Y), AH = 컬럼 34 (Unlevered Beta 2Y)
+    ws_wacc.cell(r_wacc, 1, f'Avg Unlevered Beta ({beta_label})')
+    ws_wacc.cell(r_wacc, 2).value = f'=GPCM!{beta_col}{mean_row}'
     ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Avg_Unlevered_Beta']:.4f}")
     ws_wacc.cell(r_wacc, 4, '피어 평균 (GPCM Mean)')
     sc(ws_wacc.cell(r_wacc, 1), fo=fA, bd=BD)
@@ -1647,6 +1851,15 @@ PYT.VI"""
                                        help="Target 기업의 시가총액에 맞는 Size Premium 선택")
     size_premium_input = size_premium_options[size_premium_choice]
 
+    st.markdown("**Beta 계산 기준 선택**")
+    beta_type_options = {
+        "5년 월간 베타 (5Y Monthly)": "5Y",
+        "2년 주간 베타 (2Y Weekly)": "2Y"
+    }
+    beta_type_choice = st.selectbox("WACC 계산에 사용할 Beta", list(beta_type_options.keys()), index=0,
+                                    help="Target WACC 계산 시 사용할 베타 유형을 선택하세요. 두 베타 모두 엑셀에 표시됩니다.")
+    beta_type_input = beta_type_options[beta_type_choice]
+
     st.markdown("**타인자본비용 (Kd) 파라미터**")
     kd_pretax_input = st.number_input("Kd (Pretax) - 세전 이자율 (%)", min_value=0.0, max_value=15.0, value=3.5, step=0.1, format="%.1f") / 100
 
@@ -1672,7 +1885,8 @@ if btn_run:
             kd_pretax=kd_pretax_input,
             size_premium=size_premium_input,
             target_tax_rate=target_tax_rate_input,
-            user_rf_rate=rf_input
+            user_rf_rate=rf_input,
+            beta_type=beta_type_input
         )
         
         # 1. Summary Table
@@ -1721,7 +1935,7 @@ if btn_run:
             st.error("데이터를 불러오지 못했습니다. 잠시 후 다시 시도해주세요 (Yahoo Rate Limit).")
 
         # 3. Excel Download
-        excel_data = create_excel(gpcm_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel, base_date_str, t_map, target_wacc_data)
+        excel_data = create_excel(gpcm_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel, base_date_str, t_map, target_wacc_data, beta_type=beta_type_input)
         
         # 다운로드 버튼 (누르고 있어도 화면 유지됨)
         st.download_button(
