@@ -106,6 +106,12 @@ def calculate_beta(stock_returns, market_returns, min_periods=20):
     Returns: raw_beta, adjusted_beta (None if invalid)
     """
     try:
+        # [수정됨] Timezone 문제 해결: yfinance(tz-aware)와 FDR(tz-naive) 간 인덱스 통일
+        if stock_returns.index.tz is not None:
+            stock_returns.index = stock_returns.index.tz_localize(None)
+        if market_returns.index.tz is not None:
+            market_returns.index = market_returns.index.tz_localize(None)
+
         if len(stock_returns) < min_periods or len(market_returns) < min_periods:
             return None, None
 
