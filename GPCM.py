@@ -389,14 +389,15 @@ def get_korea_10y_treasury_yield(base_date_str):
         st.warning(f"국채수익률 조회 실패: {e}. 기본값 3.3% 사용")
         return 0.033
 @st.cache_data(ttl=3600)  # <--- [추가] 1시간 동안 데이터를 저장해서 재사용함
-def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, target_debt_ratio=0.30):
+def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05):
     """
     GPCM 데이터 수집 및 엑셀 생성을 위한 데이터 구조 반환
 
     Parameters:
     - mrp: Market Risk Premium (기본값 8%)
     - kd_pretax: 세전 타인자본비용 (기본값 5%)
-    - target_debt_ratio: 목표 부채비율 (기본값 30%)
+
+    Note: 목표 부채비율은 피어들의 평균 자본구조로 자동 계산됨
     """
     base_dt = pd.to_datetime(base_date_str)
 
@@ -471,7 +472,7 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, target_
                 'Ke': None,  # 자기자본비용 = Rf + Beta × MRP
                 'Kd_Pretax': kd_pretax,
                 'Kd_Aftertax': None,  # 세후 타인자본비용 = Kd_Pretax × (1 - Tax Rate)
-                'Target_Debt_Ratio': target_debt_ratio,
+                'Target_Debt_Ratio': 0,  # 나중에 평균값으로 업데이트
                 'WACC': None,  # WACC = (E/V) × Ke + (D/V) × Kd_Aftertax
             }
 
@@ -693,7 +694,7 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, target_
                 # 기타 국가: Wikipedia에서 크롤링한 세율
                 gpcm['Tax_Rate'] = tax_rates_wiki.get(country_code, 0.25)
 
-            # [6] WACC 계산
+            # [6] Ke 및 Kd 계산 (WACC는 나중에 평균 부채비율로 계산)
             # Ke (자기자본비용) = Rf + Beta × MRP
             # Beta는 5년 조정 베타 사용
             if gpcm['Beta_5Y_Monthly_Adj'] is not None:
@@ -705,20 +706,49 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, target_
             # Kd_Aftertax (세후 타인자본비용) = Kd_Pretax × (1 - Tax Rate)
             gpcm['Kd_Aftertax'] = kd_pretax * (1 - gpcm['Tax_Rate'])
 
-            # WACC = (E/V) × Ke + (D/V) × Kd_Aftertax
-            # 여기서 E/V = 1 - Target_Debt_Ratio, D/V = Target_Debt_Ratio
-            equity_weight = 1 - target_debt_ratio
-            debt_weight = target_debt_ratio
-            gpcm['WACC'] = equity_weight * gpcm['Ke'] + debt_weight * gpcm['Kd_Aftertax']
+            # 실제 부채비율 계산: IBD / (Market Cap + NCI)
+            total_value = gpcm['Market_Cap_M'] + gpcm['NCI']
+            if total_value > 0:
+                gpcm['Debt_Ratio'] = gpcm['IBD'] / total_value
+            else:
+                gpcm['Debt_Ratio'] = 0
 
             gpcm_data[ticker] = gpcm
 
         except Exception as e:
             st.error(f"Error fetching {ticker}: {e}")
             continue
-    
+
+    # ========================================
+    # [7] 평균 부채비율 계산 및 WACC 계산
+    # ========================================
+    status_text.text("평균 자본구조 계산 중...")
+
+    # 모든 기업의 실제 부채비율 수집
+    debt_ratios = [gpcm['Debt_Ratio'] for gpcm in gpcm_data.values() if gpcm['Debt_Ratio'] > 0]
+
+    if debt_ratios:
+        avg_debt_ratio = np.mean(debt_ratios)
+        st.info(f"📊 피어 평균 부채비율: {avg_debt_ratio*100:.1f}% (목표 자본구조로 사용)")
+    else:
+        avg_debt_ratio = 0.30  # 기본값 30%
+        st.warning(f"⚠️ 부채비율 계산 불가. 기본값 {avg_debt_ratio*100:.0f}% 사용")
+
+    # 각 기업의 Target_Debt_Ratio 업데이트 및 WACC 계산
+    for ticker, gpcm in gpcm_data.items():
+        gpcm['Target_Debt_Ratio'] = avg_debt_ratio
+
+        # WACC = (E/V) × Ke + (D/V) × Kd_Aftertax
+        equity_weight = 1 - avg_debt_ratio
+        debt_weight = avg_debt_ratio
+
+        if gpcm['Ke'] is not None and gpcm['Kd_Aftertax'] is not None:
+            gpcm['WACC'] = equity_weight * gpcm['Ke'] + debt_weight * gpcm['Kd_Aftertax']
+        else:
+            gpcm['WACC'] = None
+
     status_text.text("Data collection complete!")
-    return gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs, price_rel_dfs, ticker_to_name
+    return gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs, price_rel_dfs, ticker_to_name, avg_debt_ratio
 
 
 def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs, price_rel_dfs, base_date_str, ticker_to_name):
@@ -1002,12 +1032,12 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         '• Unlevered Beta = Levered Beta ÷ (1 + (1 - Tax Rate) × Debt Ratio) [Hamada Model]',
         '',
         '[ WACC Calculation ]',
-        '• Rf (Risk-Free Rate): 10-year Korea Treasury Bond Yield (기본값 3.3%)',
+        '• Rf (Risk-Free Rate): 10-year Korea Treasury Bond Yield (FinanceDataReader 실시간 조회)',
         '• MRP (Market Risk Premium): 한국 공인회계사회 기준 7~9% (사용자 선택)',
         '• Ke (Cost of Equity) = Rf + β (5Y Adj) × MRP',
-        '• Kd (Pretax): 세전 타인자본비용 (기본값 5.0%, 사용자 조정 가능)',
+        '• Kd (Pretax): 세전 타인자본비용 (사용자 조정 가능)',
         '• Kd (Aftertax): 세후 타인자본비용 = Kd (Pretax) × (1 - Tax Rate)',
-        '• Target D/E: 목표 부채비율 (사용자 입력)',
+        '• Target D/E: 목표 부채비율 = 피어들의 평균 자본구조 (자동 계산)',
         '• WACC = (1 - D/V) × Ke + D/V × Kd (Aftertax)',
         '',
         '• N/M = Not Meaningful (negative or zero)',
@@ -1134,12 +1164,12 @@ for note in beta_notes:
 
 st.subheader("💰 WACC (Weighted Average Cost of Capital)")
 wacc_notes = [
-    '• Rf (Risk-Free Rate): 10-year Korea Treasury Bond Yield (기본값 3.3%)',
+    '• Rf (Risk-Free Rate): 10-year Korea Treasury Bond Yield (FinanceDataReader 실시간 조회)',
     '• MRP (Market Risk Premium): 한국 공인회계사회 기준 7~9% (사용자 선택)',
     '• Ke (Cost of Equity) = Rf + β (5Y Adj) × MRP',
-    '• Kd (Pretax): 세전 타인자본비용 (기본값 5.0%, 사용자 조정 가능)',
+    '• Kd (Pretax): 세전 타인자본비용 (사용자 조정 가능)',
     '• Kd (Aftertax) = Kd (Pretax) × (1 - Tax Rate)',
-    '• Target D/E: 목표 부채비율 (사용자 입력)',
+    '• Target D/E: 목표 부채비율 = 피어들의 평균 자본구조 (자동 계산)',
     '• WACC = (1 - D/V) × Ke + D/V × Kd (Aftertax)',
 ]
 for note in wacc_notes:
@@ -1180,10 +1210,8 @@ PYT.VI"""
     mrp_input = st.slider("MRP (시장위험프리미엄)", min_value=7.0, max_value=9.0, value=8.0, step=0.1, format="%.1f%%") / 100
     st.markdown("**타인자본비용**")
     kd_pretax_input = st.number_input("Kd (Pretax) - 세전 이자율 (%)", min_value=0.0, max_value=15.0, value=5.0, step=0.1, format="%.1f") / 100
-    st.markdown("**목표자본구조**")
-    target_debt_ratio_input = st.slider("Target Debt Ratio (목표 부채비율)", min_value=0.0, max_value=0.9, value=0.30, step=0.05, format="%.0f%%")
 
-    st.info(f"선택된 값: MRP={mrp_input*100:.1f}%, Kd(Pretax)={kd_pretax_input*100:.1f}%, Target D/E={target_debt_ratio_input*100:.0f}%")
+    st.info(f"💡 목표 부채비율은 피어들의 평균 자본구조로 자동 계산됩니다.")
 
     # 4. Run Button
     btn_run = st.button("Go, Go, Go 🚀", type="primary")
@@ -1193,13 +1221,12 @@ if btn_run:
     target_tickers = [t.strip() for t in txt_input.split('\n') if t.strip()]
 
     with st.spinner("데이터 추출 및 분석 중... 잠시만 기다려주세요..."):
-        # Run Data Logic with WACC parameters
-        gpcm_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel, t_map = get_gpcm_data(
+        # Run Data Logic with WACC parameters (목표 부채비율은 자동 계산)
+        gpcm_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel, t_map, avg_debt_ratio = get_gpcm_data(
             target_tickers,
             base_date_str,
             mrp=mrp_input,
-            kd_pretax=kd_pretax_input,
-            target_debt_ratio=target_debt_ratio_input
+            kd_pretax=kd_pretax_input
         )
         
         # 1. Summary Table
@@ -1221,6 +1248,9 @@ if btn_run:
         st.dataframe(df_sum.style.format({
             'EV/EBITDA': '{:.1f}x', 'EV/EBIT': '{:.1f}x', 'PER': '{:.1f}x', 'PBR': '{:.1f}x', 'PSR': '{:.1f}x'
         }, na_rep='N/M'))
+
+        # 평균 자본구조 표시
+        st.success(f"✅ **피어 평균 부채비율 (목표 자본구조)**: {avg_debt_ratio*100:.1f}%")
 
         # 2. Statistics Table
         st.subheader("📊 Multiples Statistics")
