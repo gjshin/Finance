@@ -567,49 +567,24 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
                 start_5y = (base_dt - timedelta(days=365*5+20)).strftime('%Y-%m-%d')
                 end_date = base_dt.strftime('%Y-%m-%d')
 
-                # 주가 데이터 수집: 한국 주식은 FinanceDataReader 우선, 해외는 yfinance
+                # ⭐ 주가 데이터는 stock.history() 재사용 (이미 yfinance 객체 생성됨)
                 stock_data_5y = None
                 market_data_5y = None
 
-                if ticker.endswith('.KS') or ticker.endswith('.KQ'):
-                    # 한국 주식: FinanceDataReader 우선 사용
-                    try:
-                        stock_data_5y = fdr.DataReader(ticker, start_5y, end_date)
-                        market_data_5y = fdr.DataReader(market_idx, start_5y, end_date)
+                try:
+                    # 주가 데이터: 이미 생성된 stock 객체 사용
+                    stock_hist_5y = stock.history(start=start_5y, end=end_date, auto_adjust=False)
+                    if not stock_hist_5y.empty:
+                        stock_data_5y = stock_hist_5y
 
-                        # FDR 데이터 인덱스를 timezone-naive DatetimeIndex로 변환
-                        if stock_data_5y is not None and not stock_data_5y.empty:
-                            if not isinstance(stock_data_5y.index, pd.DatetimeIndex):
-                                stock_data_5y.index = pd.to_datetime(stock_data_5y.index)
-                            if stock_data_5y.index.tz is not None:
-                                stock_data_5y.index = stock_data_5y.index.tz_localize(None)
+                    # 시장 지수 데이터: yfinance 사용
+                    market_hist_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)
+                    if not market_hist_5y.empty:
+                        market_data_5y = market_hist_5y
 
-                        if market_data_5y is not None and not market_data_5y.empty:
-                            if not isinstance(market_data_5y.index, pd.DatetimeIndex):
-                                market_data_5y.index = pd.to_datetime(market_data_5y.index)
-                            if market_data_5y.index.tz is not None:
-                                market_data_5y.index = market_data_5y.index.tz_localize(None)
-
-                    except Exception as fdr_err:
-                        # FinanceDataReader 실패 시 yfinance 시도
-                        try:
-                            stock_hist_5y = yf.download(ticker, start=start_5y, end=end_date, progress=False)
-                            market_hist_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)
-                            if not stock_hist_5y.empty and not market_hist_5y.empty:
-                                stock_data_5y = stock_hist_5y
-                                market_data_5y = market_hist_5y
-                        except:
-                            pass  # 둘 다 실패
-                else:
-                    # 해외 주식: yfinance 사용
-                    try:
-                        stock_hist_5y = yf.download(ticker, start=start_5y, end=end_date, progress=False)
-                        market_hist_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)
-                        if not stock_hist_5y.empty and not market_hist_5y.empty:
-                            stock_data_5y = stock_hist_5y
-                            market_data_5y = market_hist_5y
-                    except:
-                        pass
+                except Exception as e:
+                    st.warning(f"{ticker} 5Y 데이터 수집 실패: {e}")
+                    pass
 
                 # 월말 종가 저장 (엑셀에서 베타 계산에 사용)
                 if stock_data_5y is not None and market_data_5y is not None:
@@ -668,45 +643,20 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
                 stock_data_2y = None
                 market_data_2y = None
 
-                if ticker.endswith('.KS') or ticker.endswith('.KQ'):
-                    # 한국 주식: FinanceDataReader 우선 사용
-                    try:
-                        stock_data_2y = fdr.DataReader(ticker, start_2y, end_date)
-                        market_data_2y = fdr.DataReader(market_idx, start_2y, end_date)
+                try:
+                    # 주가 데이터: 이미 생성된 stock 객체 사용
+                    stock_hist_2y = stock.history(start=start_2y, end=end_date, auto_adjust=False)
+                    if not stock_hist_2y.empty:
+                        stock_data_2y = stock_hist_2y
 
-                        # FDR 데이터 인덱스를 timezone-naive DatetimeIndex로 변환
-                        if stock_data_2y is not None and not stock_data_2y.empty:
-                            if not isinstance(stock_data_2y.index, pd.DatetimeIndex):
-                                stock_data_2y.index = pd.to_datetime(stock_data_2y.index)
-                            if stock_data_2y.index.tz is not None:
-                                stock_data_2y.index = stock_data_2y.index.tz_localize(None)
+                    # 시장 지수 데이터: yfinance 사용
+                    market_hist_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
+                    if not market_hist_2y.empty:
+                        market_data_2y = market_hist_2y
 
-                        if market_data_2y is not None and not market_data_2y.empty:
-                            if not isinstance(market_data_2y.index, pd.DatetimeIndex):
-                                market_data_2y.index = pd.to_datetime(market_data_2y.index)
-                            if market_data_2y.index.tz is not None:
-                                market_data_2y.index = market_data_2y.index.tz_localize(None)
-
-                    except:
-                        # FinanceDataReader 실패 시 yfinance 시도
-                        try:
-                            stock_hist_2y = yf.download(ticker, start=start_2y, end=end_date, progress=False)
-                            market_hist_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
-                            if not stock_hist_2y.empty and not market_hist_2y.empty:
-                                stock_data_2y = stock_hist_2y
-                                market_data_2y = market_hist_2y
-                        except:
-                            pass
-                else:
-                    # 해외 주식: yfinance 사용
-                    try:
-                        stock_hist_2y = yf.download(ticker, start=start_2y, end=end_date, progress=False)
-                        market_hist_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
-                        if not stock_hist_2y.empty and not market_hist_2y.empty:
-                            stock_data_2y = stock_hist_2y
-                            market_data_2y = market_hist_2y
-                    except:
-                        pass
+                except Exception as e:
+                    st.warning(f"{ticker} 2Y 데이터 수집 실패: {e}")
+                    pass
 
                 # 주간 종가 저장
                 if stock_data_2y is not None and market_data_2y is not None:
@@ -1338,7 +1288,7 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         '',
         '[ Beta & Risk Analysis ]',
         '• Data Source:',
-        '  - 한국 주식 (.KS, .KQ): FinanceDataReader 우선 → yfinance 백업',
+        '  - 한국 주식 (.KS, .KQ): Yahoo Finance (yfinance)',
         '  - 해외 주식: Yahoo Finance (yfinance)',
         '• Beta 계산 방법:',
         '  - 5Y Monthly Beta: 5년간 월말 종가 기준 월간 수익률 계산 → 시장지수 대비 선형회귀',
@@ -1364,7 +1314,7 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         '',
         '• N/M = Not Meaningful (negative or zero)',
         '• All values in GPCM are calculated via Excel Formulas linking to BS_Full and PL_Data sheets.',
-        '', '⚠ Data from Yahoo Finance & FinanceDataReader. Verify with official sources.'
+        '', '⚠ Data from Yahoo Finance. Verify with official sources.'
     ]
     for note in notes:
         ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=TOTAL_COLS)
