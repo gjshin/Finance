@@ -12,6 +12,8 @@ from openpyxl.chart import LineChart, Reference, Series
 from openpyxl.chart.axis import ChartLines
 import FinanceDataReader as fdr
 from scipy import stats
+import requests
+from bs4 import BeautifulSoup
 
 # ==========================================
 # 1. Helper Functions (v17 Logic + Beta Calculation)
@@ -66,27 +68,103 @@ def calculate_beta(stock_returns, market_returns, min_periods=20):
 
     return raw_beta, adjusted_beta
 
+@st.cache_data(ttl=86400)  # 24시간 캐시
+def get_corporate_tax_rates_from_wikipedia():
+    """
+    Wikipedia에서 국가별 법인세율 크롤링
+    Returns: dict {country_code: tax_rate}
+    """
+    url = "https://en.wikipedia.org/wiki/List_of_countries_by_tax_rates"
+    tax_rates = {}
+
+    try:
+        response = requests.get(url, timeout=10)
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # Wikipedia 테이블에서 법인세율 추출 (테이블 구조에 따라 조정 필요)
+        tables = soup.find_all('table', {'class': 'wikitable'})
+
+        for table in tables:
+            rows = table.find_all('tr')
+            for row in rows[1:]:  # 헤더 제외
+                cols = row.find_all('td')
+                if len(cols) >= 2:
+                    country = cols[0].get_text(strip=True)
+                    tax_text = cols[1].get_text(strip=True) if len(cols) > 1 else ''
+
+                    # 숫자만 추출 (예: "21%" → 0.21)
+                    import re
+                    match = re.search(r'(\d+\.?\d*)', tax_text)
+                    if match:
+                        rate = float(match.group(1)) / 100
+
+                        # 국가명을 코드로 매핑 (간단한 매핑)
+                        country_map = {
+                            'United States': 'US',
+                            'Japan': 'JP',
+                            'Canada': 'CA',
+                            'Germany': 'DE',
+                            'Austria': 'AT',
+                            'South Korea': 'KR',
+                        }
+
+                        for name, code in country_map.items():
+                            if name.lower() in country.lower():
+                                tax_rates[code] = rate
+                                break
+    except Exception as e:
+        st.warning(f"Wikipedia 법인세율 크롤링 실패: {e}")
+
+    # 기본값 설정
+    if 'US' not in tax_rates:
+        tax_rates['US'] = 0.21
+    if 'JP' not in tax_rates:
+        tax_rates['JP'] = 0.304
+    if 'CA' not in tax_rates:
+        tax_rates['CA'] = 0.265
+    if 'DE' not in tax_rates:
+        tax_rates['DE'] = 0.30
+    if 'AT' not in tax_rates:
+        tax_rates['AT'] = 0.24
+
+    return tax_rates
+
 def get_korean_marginal_tax_rate(pretax_income_millions):
     """
-    한국 법인세 한계세율 산출
+    한국 법인세 한계세율 산출 (2025년 기준, 지방세 포함)
     과세표준 기준 (단위: 백만원)
-    - 2억 이하: 10%
-    - 2억 초과 ~ 200억 이하: 20%
-    - 200억 초과 ~ 3,000억 이하: 22%
-    - 3,000억 초과: 25%
+    - 2억 이하: 9% (국세) + 0.9% (지방세 10%) = 9.9%
+    - 2억 ~ 200억: 19% + 1.9% = 20.9%
+    - 200억 ~ 3,000억: 21% + 2.1% = 23.1%
+    - 3,000억 초과: 24% + 2.4% = 26.4%
     """
     if pd.isna(pretax_income_millions) or pretax_income_millions == 0:
-        return 0.22  # 기본값
+        return 0.231  # 기본값 (중간 구간)
 
     # 백만원 단위로 들어온 값
     if pretax_income_millions <= 200:
-        return 0.10
+        return 0.099
     elif pretax_income_millions <= 20000:
-        return 0.20
+        return 0.209
     elif pretax_income_millions <= 300000:
-        return 0.22
+        return 0.231
     else:
-        return 0.25
+        return 0.264
+
+def get_country_from_ticker(ticker):
+    """티커로부터 국가 코드 추출"""
+    if ticker.endswith('.KS') or ticker.endswith('.KQ'):
+        return 'KR'
+    elif ticker.endswith('.T'):
+        return 'JP'
+    elif ticker.endswith('.TO'):
+        return 'CA'
+    elif ticker.endswith('.F') or ticker.endswith('.DE'):
+        return 'DE'
+    elif ticker.endswith('.VI'):
+        return 'AT'
+    else:
+        return 'US'
 
 def calculate_unlevered_beta(levered_beta, debt, equity, tax_rate):
     """
@@ -344,7 +422,11 @@ def get_gpcm_data(tickers_list, base_date_str):
             except Exception as e:
                 st.warning(f"Beta calculation failed for {ticker}: {e}")
 
-            # [5] Pretax Income for Tax Rate Calculation
+            # [5] Tax Rate Calculation
+            # Wikipedia에서 법인세율 가져오기
+            tax_rates_wiki = get_corporate_tax_rates_from_wikipedia()
+            country_code = get_country_from_ticker(ticker)
+
             if pl_data is not None and 'Pretax Income' in pl_data.index:
                 pretax_vals = []
                 for d in pl_dates:
@@ -354,9 +436,13 @@ def get_gpcm_data(tickers_list, base_date_str):
                 if pretax_vals:
                     gpcm['Pretax_Income'] = sum(pretax_vals)
 
-                    # 한국 기업인 경우 한계세율 계산
-                    if ticker.endswith('.KS') or ticker.endswith('.KQ'):
-                        gpcm['Tax_Rate'] = get_korean_marginal_tax_rate(gpcm['Pretax_Income'])
+            # 세율 결정
+            if country_code == 'KR':
+                # 한국: 세전순이익 기반 한계세율 (지방세 포함)
+                gpcm['Tax_Rate'] = get_korean_marginal_tax_rate(gpcm['Pretax_Income'])
+            else:
+                # 기타 국가: Wikipedia에서 크롤링한 세율
+                gpcm['Tax_Rate'] = tax_rates_wiki.get(country_code, 0.25)
 
             gpcm_data[ticker] = gpcm
 
@@ -479,12 +565,12 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
     # [Sheet 4] GPCM
     ws = wb.create_sheet('GPCM')
     wb.move_sheet('GPCM', offset=-3)
-    TOTAL_COLS = 35
+    TOTAL_COLS = 34
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=TOTAL_COLS); sc(ws.cell(1,1,'GPCM Valuation Summary with Beta Analysis'), fo=fT)
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=TOTAL_COLS); sc(ws.cell(2,1,f'Base: {base_date_str} | Unit: Millions (local currency) | EV = MCap + IBD − Cash + NCI'), fo=fS)
 
     r=4
-    sections = [(1,3,'Company Info'),(4,4,'Other Information'),(8,6,'BS → EV Components'),(14,4,'PL (LTM / Annual)'),(18,3,'Market Data'),(21,5,'Valuation Multiples'),(26,10,'Beta & Risk Analysis')]
+    sections = [(1,3,'Company Info'),(4,4,'Other Information'),(8,6,'BS → EV Components'),(14,4,'PL (LTM / Annual)'),(18,3,'Market Data'),(21,5,'Valuation Multiples'),(26,9,'Beta & Risk Analysis')]
     for start,span,txt in sections:
         ws.merge_cells(start_row=r, start_column=start, end_row=r, end_column=start+span-1)
         sc(ws.cell(r,start,txt), fo=fSEC, fi=pSEC, al=aC, bd=BD)
@@ -496,13 +582,13 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
                'Revenue','EBIT','EBITDA','NI (Parent)',
                'Price','Shares','Mkt Cap',
                'EV/EBITDA','EV/EBIT','PER','PBR','PSR',
-               'β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','D/E Ratio','Unlevered β 5Y','Unlevered β 2Y','Debt Ratio']
+               'β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','Debt Ratio','Unlevered β 5Y','Unlevered β 2Y']
     widths = [18,10,11,6,16,10,10,
               14,14,14,12,14,16,
               14,14,14,14,
               12,16,16,
               12,12,10,10,10,
-              10,10,10,10,14,9,10,12,12,10]
+              10,10,10,10,14,9,10,12,12]
     for i,(h,w) in enumerate(zip(headers,widths)): ws.column_dimensions[get_column_letter(i+1)].width=w; sc(ws.cell(r,i+1,h), fo=fH, fi=pH, al=aC, bd=BD)
     
     DATA_START=6; n_companies=len(gpcm_data); DATA_END=DATA_START+n_companies-1
@@ -555,26 +641,24 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         # Tax Rate
         ws.cell(r,31,gpcm['Tax_Rate']); sc(ws.cell(r,31), fo=fA, fi=base_fi, al=aR, bd=BD, nf=NF_PCT)
 
-        # D/E Ratio = IBD / Equity
-        ws.cell(r,32).value=f'=IF(L{r}>0,I{r}/L{r},0)'; sc(ws.cell(r,32), fo=fFRM_B, fi=base_fi, al=aR, bd=BD, nf=NF_RATIO)
+        # Debt Ratio = IBD / (Market Cap + NCI)
+        ws.cell(r,32).value=f'=IF((T{r}+K{r})>0,I{r}/(T{r}+K{r}),0)'; sc(ws.cell(r,32), fo=fFRM_B, fi=base_fi, al=aR, bd=BD, nf=NF_RATIO)
 
-        # Unlevered Beta 5Y = Beta 5Y Adj / (1 + (1 - Tax Rate) * (D/E))
+        # Unlevered Beta 5Y = Beta 5Y Adj / (1 + (1 - Tax Rate) * Debt Ratio)
         ws.cell(r,33).value=f'=IF(AA{r}>0,AA{r}/(1+(1-AE{r})*AF{r}),AA{r})'; sc(ws.cell(r,33), fo=fFRM_B, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
 
-        # Unlevered Beta 2Y = Beta 2Y Adj / (1 + (1 - Tax Rate) * (D/E))
+        # Unlevered Beta 2Y = Beta 2Y Adj / (1 + (1 - Tax Rate) * Debt Ratio)
         ws.cell(r,34).value=f'=IF(AC{r}>0,AC{r}/(1+(1-AE{r})*AF{r}),AC{r})'; sc(ws.cell(r,34), fo=fFRM_B, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
-
-        # Debt Ratio = IBD / Market Cap (추가)
-        ws.cell(r,35).value=f'=IF(T{r}>0,I{r}/T{r},0)'; sc(ws.cell(r,35), fo=fFRM_B, fi=base_fi, al=aR, bd=BD, nf=NF_RATIO)
 
     # Stats
     r=DATA_END+2
     stat_labels=['Mean','Median','Max','Min']; func_map={'Mean':'AVERAGE','Median':'MEDIAN','Max':'MAX','Min':'MIN'}
     # Multiples: 21-25 (EV/EBITDA, EV/EBIT, PER, PBR, PSR)
-    # Betas: 26-29, 33-35 (Beta 5Y Raw, Beta 5Y Adj, Beta 2Y Raw, Beta 2Y Adj, Unlevered Beta 5Y, Unlevered Beta 2Y, Debt Ratio)
+    # Betas: 26-29, 33-34 (Beta 5Y Raw, Beta 5Y Adj, Beta 2Y Raw, Beta 2Y Adj, Unlevered Beta 5Y, Unlevered Beta 2Y)
+    # Ratios: 32 (Debt Ratio)
     mult_cols=[21,22,23,24,25]
     beta_cols=[26,27,28,29,33,34]
-    ratio_cols=[32,35]
+    ratio_cols=[32]
 
     for sn in stat_labels:
         sc(ws.cell(r,20,sn), fo=fSTAT, fi=pSTAT, al=aC, bd=BD)
@@ -619,11 +703,10 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         '• Beta 2Y: Calculated using 2-year weekly returns vs market index',
         '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1.0 (Bloomberg methodology)',
         '• Market Index: KOSPI (KS11), KOSDAQ (KQ11), Nikkei 225 (^N225), S&P/TSX (^GSPTSE), etc.',
-        '• Tax Rate: Korean marginal corporate tax rate based on Pretax Income',
-        '   - ≤ 200M: 10% | 200M-20,000M: 20% | 20,000M-300,000M: 22% | > 300,000M: 25%',
-        '• D/E Ratio = IBD ÷ Equity',
-        '• Unlevered Beta = Levered Beta ÷ (1 + (1 - Tax Rate) × D/E Ratio) [Hamada Model]',
-        '• Debt Ratio = IBD ÷ Market Cap',
+        '• Tax Rate: Wikipedia-sourced corporate tax rates; Korean rates include local tax (2025)',
+        '   - Korea: ≤ 200M: 9.9% | 200M-20,000M: 20.9% | 20,000M-300,000M: 23.1% | > 300,000M: 26.4%',
+        '• Debt Ratio = IBD ÷ (Market Cap + NCI)',
+        '• Unlevered Beta = Levered Beta ÷ (1 + (1 - Tax Rate) × Debt Ratio) [Hamada Model]',
         '',
         '• N/M = Not Meaningful (negative or zero)',
         '• All values in GPCM are calculated via Excel Formulas linking to BS_Full and PL_Data sheets.',
@@ -740,9 +823,9 @@ beta_notes = [
     '• Beta 2Y: Calculated using 2-year weekly returns vs market index',
     '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1.0 (Bloomberg methodology)',
     '• Market Index: KOSPI (KS11), KOSDAQ (KQ11), Nikkei 225, S&P/TSX, DAX, etc.',
-    '• Tax Rate: Korean marginal corporate tax rate based on Pretax Income',
-    '• Unlevered Beta = Levered Beta ÷ (1 + (1 - Tax Rate) × D/E Ratio) [Hamada Model]',
-    '• D/E Ratio = IBD ÷ Equity | Debt Ratio = IBD ÷ Market Cap',
+    '• Tax Rate: Wikipedia-sourced corporate tax rates; Korean rates include local tax (2025)',
+    '• Debt Ratio = IBD ÷ (Market Cap + NCI)',
+    '• Unlevered Beta = Levered Beta ÷ (1 + (1 - Tax Rate) × Debt Ratio) [Hamada Model]',
 ]
 for note in beta_notes:
     st.text(note)
