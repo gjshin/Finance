@@ -344,52 +344,54 @@ def calculate_unlevered_beta(levered_beta, debt, equity, tax_rate):
     return unlevered
 
 @st.cache_data(ttl=86400)  # 24시간 캐시
-def get_korea_10y_treasury_yield(base_date_str):
+def get_korea_10y_treasury_yield(base_date_str, user_rf_rate=None):
     """
     한국 10년 만기 국채수익률 조회
-    FinanceDataReader를 사용하여 한국 국채 데이터 크롤링
+
+    Parameters:
+    - user_rf_rate: 사용자가 직접 입력한 무위험이자율 (우선순위 높음)
     """
+    # 사용자 입력값이 있으면 우선 사용
+    if user_rf_rate is not None:
+        st.info(f"💡 무위험이자율 (사용자 입력): {user_rf_rate*100:.2f}%")
+        return user_rf_rate
+
+    # 자동 조회 시도
     try:
         base_dt = pd.to_datetime(base_date_str)
-
-        # FinanceDataReader로 한국 10년 국채 수익률 조회
-        # 'KR10YT=X' 또는 'KR10YT' 심볼 사용
         start_date = (base_dt - timedelta(days=30)).strftime('%Y-%m-%d')
         end_date = (base_dt + timedelta(days=1)).strftime('%Y-%m-%d')
 
-        # 재시도 로직 추가 (최대 3회)
-        for attempt in range(3):
+        # 여러 심볼 시도
+        symbols_to_try = [
+            ('KR10YT=X', '한국 10년 국채 (Yahoo)'),
+            ('^KRX10Y', '한국 10년 국채 (KRX)'),
+            ('KR10Y.BOND', '한국 10년 국채'),
+        ]
+
+        for symbol, desc in symbols_to_try:
             try:
-                # 한국 10년 국채 수익률 조회
-                treasury_data = fdr.DataReader('KR10YT=X', start_date, end_date)
-
+                treasury_data = fdr.DataReader(symbol, start_date, end_date)
                 if not treasury_data.empty and 'Close' in treasury_data.columns:
-                    # 가장 최근 데이터 사용
                     latest_yield = float(treasury_data['Close'].iloc[-1])
-
-                    # 이미 백분율(%)로 제공되므로 100으로 나눔
-                    yield_rate = latest_yield / 100
-
+                    # 이미 백분율이면 100으로 나누고, 아니면 그대로 사용
+                    yield_rate = latest_yield / 100 if latest_yield > 1 else latest_yield
                     actual_date = treasury_data.index[-1].strftime('%Y-%m-%d')
-                    st.info(f"💡 한국 10년 국채수익률: {yield_rate*100:.3f}% (조회일: {actual_date})")
+                    st.info(f"💡 무위험이자율: {yield_rate*100:.2f}% ({desc}, 조회일: {actual_date})")
                     return yield_rate
+            except:
+                continue
 
-            except Exception as retry_err:
-                if attempt < 2:
-                    time.sleep(2 * (attempt + 1))  # 2초, 4초 대기
-                else:
-                    st.warning(f"FinanceDataReader 조회 실패: {retry_err}")
-
-        # FinanceDataReader 실패 시 기본값 사용
-        default_yield = 0.033  # 3.3% (2025년 평균 추정치)
-        st.warning(f"⚠️ 한국 10년 국채수익률 조회 실패. 기본값 {default_yield*100:.2f}% 사용 (실무에서는 한국은행 API 활용 권장)")
+        # 모든 심볼 실패 시 기본값
+        default_yield = 0.033
+        st.warning(f"⚠️ 국채수익률 자동 조회 실패. 기본값 {default_yield*100:.2f}% 사용 (사이드바에서 직접 입력 가능)")
         return default_yield
 
     except Exception as e:
-        st.warning(f"국채수익률 조회 실패: {e}. 기본값 3.3% 사용")
+        st.warning(f"국채수익률 조회 오류: {e}. 기본값 3.3% 사용")
         return 0.033
 @st.cache_data(ttl=3600)  # <--- [추가] 1시간 동안 데이터를 저장해서 재사용함
-def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, size_premium=0.0402, target_tax_rate=0.264):
+def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, size_premium=0.0402, target_tax_rate=0.264, user_rf_rate=None):
     """
     GPCM 데이터 수집 및 엑셀 생성을 위한 데이터 구조 반환
 
@@ -398,6 +400,7 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, size_pr
     - kd_pretax: 세전 타인자본비용 (기본값 5%)
     - size_premium: Size Premium (기본값 4.02%, 한국공인회계사회 Micro 기준)
     - target_tax_rate: Target 기업 법인세율 (기본값 26.4%, 한국 대기업 기준)
+    - user_rf_rate: 사용자 입력 무위험이자율 (None이면 자동 조회)
 
     Note: 목표 부채비율은 피어들의 평균 자본구조로 자동 계산됨
           개별 peer의 WACC이 아닌 Target 기업의 WACC을 계산함
@@ -405,7 +408,7 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, size_pr
     base_dt = pd.to_datetime(base_date_str)
 
     # 10년 국채수익률 조회 (무위험수익률)
-    rf_rate = get_korea_10y_treasury_yield(base_date_str)
+    rf_rate = get_korea_10y_treasury_yield(base_date_str, user_rf_rate)
     
     # ---------------------------------------------------------
     # [설정] 계정 맵핑 (v17: NOA Option, 투자부동산 등)
@@ -580,26 +583,26 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, size_pr
                 start_5y = (base_dt - timedelta(days=365*5+20)).strftime('%Y-%m-%d')
                 end_date = base_dt.strftime('%Y-%m-%d')
 
-                # FinanceDataReader로 데이터 수집 (재시도 로직 추가)
+                # 베타 계산: yfinance 우선, FinanceDataReader 백업
                 stock_data_5y = None
                 market_data_5y = None
 
-                if ticker.endswith('.KS') or ticker.endswith('.KQ'):
-                    # 한국 주식은 FinanceDataReader 사용 (최대 3회 재시도)
-                    for attempt in range(3):
+                # 방법 1: yfinance 우선 시도 (모든 종목)
+                try:
+                    stock_hist_5y = yf.download(ticker, start=start_5y, end=end_date, progress=False)
+                    market_hist_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)
+
+                    if not stock_hist_5y.empty and not market_hist_5y.empty:
+                        stock_data_5y = stock_hist_5y
+                        market_data_5y = market_hist_5y
+                except Exception as yf_err:
+                    # 방법 2: yfinance 실패 시 FinanceDataReader 시도 (한국 주식만)
+                    if ticker.endswith('.KS') or ticker.endswith('.KQ'):
                         try:
                             stock_data_5y = fdr.DataReader(ticker, start_5y, end_date)
                             market_data_5y = fdr.DataReader(market_idx, start_5y, end_date)
-                            break
-                        except Exception as retry_err:
-                            if attempt < 2:
-                                time.sleep(2 * (attempt + 1))  # 2초, 4초 대기
-                            else:
-                                raise retry_err
-                else:
-                    # 해외 주식은 yfinance 사용
-                    stock_data_5y = yf.download(ticker, start=start_5y, end=end_date, progress=False)['Close']
-                    market_data_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)['Close']
+                        except Exception as fdr_err:
+                            pass  # 둘 다 실패하면 베타 None
 
                 if not stock_data_5y.empty and not market_data_5y.empty:
                     # Close 컬럼 추출
@@ -622,27 +625,28 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, size_pr
                     gpcm['Beta_5Y_Monthly_Raw'] = raw_beta_5y
                     gpcm['Beta_5Y_Monthly_Adj'] = adj_beta_5y
 
-                # 2년 주간 베타 계산 (재시도 로직 추가)
+                # 2년 주간 베타 계산: yfinance 우선, FinanceDataReader 백업
                 start_2y = (base_dt - timedelta(days=365*2+20)).strftime('%Y-%m-%d')
 
                 stock_data_2y = None
                 market_data_2y = None
 
-                if ticker.endswith('.KS') or ticker.endswith('.KQ'):
-                    # 한국 주식은 FinanceDataReader 사용 (최대 3회 재시도)
-                    for attempt in range(3):
+                # 방법 1: yfinance 우선 시도
+                try:
+                    stock_hist_2y = yf.download(ticker, start=start_2y, end=end_date, progress=False)
+                    market_hist_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
+
+                    if not stock_hist_2y.empty and not market_hist_2y.empty:
+                        stock_data_2y = stock_hist_2y
+                        market_data_2y = market_hist_2y
+                except Exception as yf_err:
+                    # 방법 2: FinanceDataReader 시도 (한국 주식만)
+                    if ticker.endswith('.KS') or ticker.endswith('.KQ'):
                         try:
                             stock_data_2y = fdr.DataReader(ticker, start_2y, end_date)
                             market_data_2y = fdr.DataReader(market_idx, start_2y, end_date)
-                            break
-                        except Exception as retry_err:
-                            if attempt < 2:
-                                time.sleep(2 * (attempt + 1))  # 2초, 4초 대기
-                            else:
-                                raise retry_err
-                else:
-                    stock_data_2y = yf.download(ticker, start=start_2y, end=end_date, progress=False)['Close']
-                    market_data_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)['Close']
+                        except Exception as fdr_err:
+                            pass
 
                 if not stock_data_2y.empty and not market_data_2y.empty:
                     if isinstance(stock_data_2y, pd.DataFrame):
@@ -1022,14 +1026,18 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         '• PL Source: LTM prioritized',
         '',
         '[ Beta & Risk Analysis ]',
-        '• Beta 5Y: Calculated using 5-year monthly returns vs market index',
-        '• Beta 2Y: Calculated using 2-year weekly returns vs market index',
-        '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1.0 (Bloomberg methodology)',
+        '• Data Source: Yahoo Finance (yfinance 라이브러리, FinanceDataReader 백업)',
+        '• Beta 계산 방법:',
+        '  - 5Y Monthly Beta: 5년간 월말 종가 기준 월간 수익률 계산 → 시장지수 대비 회귀분석',
+        '  - 2Y Weekly Beta: 2년간 주말 종가 기준 주간 수익률 계산 → 시장지수 대비 회귀분석',
+        '  - Raw Beta = Covariance(Stock, Market) ÷ Variance(Market)',
+        '  - Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1.0 (Bloomberg 방법론)',
         '• Market Index: KOSPI (KS11), KOSDAQ (KQ11), Nikkei 225 (^N225), S&P/TSX (^GSPTSE), etc.',
-        '• Tax Rate: Wikipedia-sourced corporate tax rates; Korean rates include local tax (2025)',
+        '• Tax Rate: Wikipedia 기반 법인세율; 한국은 한계세율 적용 (지방세 포함, 2025)',
         '   - Korea: ≤ 200M: 9.9% | 200M-20,000M: 20.9% | 20,000M-300,000M: 23.1% | > 300,000M: 26.4%',
-        '• Debt Ratio = IBD ÷ (Market Cap + NCI)',
+        '• Debt Ratio = IBD ÷ (IBD + Market Cap + NCI)',
         '• Unlevered Beta = Levered Beta ÷ (1 + (1 - Tax Rate) × Debt Ratio) [Hamada Model]',
+        '• 베타 값은 Python에서 계산되어 엑셀에 저장됩니다 (실시간 데이터 기반)',
         '',
         '[ Target WACC Calculation ]',
         '• Target WACC은 "WACC_Calculation" 시트에서 별도 계산됩니다.',
@@ -1222,6 +1230,28 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
 
     ws_wacc.freeze_panes = 'A4'
 
+    # Named Range 정의 (다른 시트에서 참조 가능)
+    from openpyxl.workbook.defined_name import DefinedName
+
+    # WACC_Calculation 시트의 주요 값들에 Named Range 할당
+    # 셀 주소 계산: r_wacc는 계속 증가하므로, 고정된 위치 사용
+    # Input Parameters는 6행부터 시작 (r=5 헤더, r=6~10 데이터)
+    # Peer Analysis는 약 14행부터
+    # Target WACC는 마지막 행
+
+    wb.defined_names['Target_WACC'] = DefinedName('Target_WACC', attr_text=f"'WACC_Calculation'!$B${r_wacc-1}")
+    wb.defined_names['Target_Rf'] = DefinedName('Target_Rf', attr_text="'WACC_Calculation'!$B$6")
+    wb.defined_names['Target_MRP'] = DefinedName('Target_MRP', attr_text="'WACC_Calculation'!$B$7")
+    wb.defined_names['Target_Size_Premium'] = DefinedName('Target_Size_Premium', attr_text="'WACC_Calculation'!$B$8")
+    wb.defined_names['Target_Kd_Pretax'] = DefinedName('Target_Kd_Pretax', attr_text="'WACC_Calculation'!$B$9")
+    wb.defined_names['Target_Tax_Rate'] = DefinedName('Target_Tax_Rate', attr_text="'WACC_Calculation'!$B$10")
+
+    # 참고용 셀 주소 표시
+    ws_wacc['A' + str(r_wacc + 2)] = '[ Named Ranges for Reference ]'
+    sc(ws_wacc.cell(r_wacc + 2, 1), fo=Font(name='Arial', bold=True, size=9, color=C_MG, italic=True))
+    ws_wacc['A' + str(r_wacc + 3)] = '다른 시트에서 참조: =Target_WACC, =Target_Rf 등'
+    sc(ws_wacc.cell(r_wacc + 3, 1), fo=Font(name='Arial', size=8, color=C_MG))
+
     # [Sheet 5] Price_History
     if price_abs_dfs:
         ws_ph = wb.create_sheet('Price_History')
@@ -1324,10 +1354,17 @@ for note in notes:
 
 st.subheader("📊 Beta & Risk Analysis")
 beta_notes = [
-    '• Beta 5Y: Calculated using 5-year monthly returns vs market index',
-    '• Beta 2Y: Calculated using 2-year weekly returns vs market index',
-    '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1.0 (Bloomberg methodology)',
+    '📌 Data Source: Yahoo Finance (yfinance 우선, FinanceDataReader 백업)',
+    '',
+    '• Beta 계산 방법:',
+    '  - 5Y Monthly Beta: 5년간 월말 종가 기준 → 월간 수익률 계산 → 시장지수 대비 회귀분석',
+    '  - 2Y Weekly Beta: 2년간 주말 종가 기준 → 주간 수익률 계산 → 시장지수 대비 회귀분석',
+    '  - Raw Beta = Covariance(Stock, Market) / Variance(Market)',
+    '  - Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1.0 (Bloomberg 방법론)',
+    '',
     '• Market Index: KOSPI (KS11), KOSDAQ (KQ11), Nikkei 225, S&P/TSX, DAX, etc.',
+    '',
+    '• Unlevered Beta = Levered Beta / (1 + (1 - Tax Rate) × Debt Ratio) [Hamada Model]',
     '• Tax Rate: Wikipedia-sourced corporate tax rates; Korean rates include local tax (2025)',
     '• Debt Ratio = IBD ÷ (Market Cap + NCI)',
     '• Unlevered Beta = Levered Beta ÷ (1 + (1 - Tax Rate) × Debt Ratio) [Hamada Model]',
@@ -1383,17 +1420,58 @@ PYT.VI"""
 
     # 3. WACC 파라미터 설정 (Target 기업용)
     st.subheader("3. Target WACC Parameters")
-    st.markdown("**자기자본비용 (Ke) 파라미터**")
-    mrp_input = st.slider("MRP (시장위험프리미엄)", min_value=7.0, max_value=9.0, value=8.0, step=0.1, format="%.1f%%") / 100
 
-    st.markdown("**Size Premium (한국공인회계사회 기준)**")
+    st.markdown("**무위험이자율 (Rf)**")
+    rf_auto_fetch = st.checkbox("자동 조회 시도 (실패 시 기본값 3.3%)", value=True)
+    if not rf_auto_fetch:
+        rf_input = st.number_input("Rf - 무위험이자율 (%)", min_value=0.0, max_value=10.0, value=3.3, step=0.1, format="%.2f",
+                                    help="한국 10년 국채수익률 (한국은행 경제통계시스템 참고)") / 100
+    else:
+        rf_input = None  # 자동 조회
+
+    st.markdown("**자기자본비용 (Ke) 파라미터**")
+    mrp_input = st.slider("MRP (시장위험프리미엄)", min_value=7.0, max_value=9.0, value=8.0, step=0.1, format="%.1f%%",
+                         help="한국공인회계사회 권장: 7~9%") / 100
+
+    st.markdown("**Size Premium (한국공인회계사회 기준, 2023)**")
+
+    # Size Premium 표 보여주기
+    with st.expander("📊 시가총액별 Size Premium 참고표"):
+        st.markdown("**3분위수 기준**")
+        st.markdown("""
+        | 구분 | 시가총액 범위 (억원) | Size Premium |
+        |------|---------------------|--------------|
+        | **Micro** | < 2,000 | **4.02%** |
+        | **Low** | 2,000 ~ 20,000 | 1.37% |
+        | **Mid** | > 20,000 | -0.36% |
+        """)
+
+        st.markdown("**5분위수 기준**")
+        st.markdown("""
+        | 구분 | 시가총액 범위 (억원) | Size Premium |
+        |------|---------------------|--------------|
+        | **5분위 (최소)** | < 2,000 | **4.66%** |
+        | **4분위** | 2,000 ~ 5,000 | 3.02% |
+        | **3분위** | 5,000 ~ 20,000 | 1.21% |
+        | **2분위** | 20,000 ~ 50,000 | 0.06% |
+        | **1분위 (최대)** | > 50,000 | -0.58% |
+        """)
+
+        st.info("💡 Target 기업의 시가총액에 맞는 Size Premium을 선택하세요.")
+
     size_premium_options = {
-        "Micro (4.02%)": 0.0402,
-        "Small (2.56%)": 0.0256,
-        "Medium (1.24%)": 0.0124,
-        "Large (0%)": 0.0
+        "3분위 - Micro (4.02%): < 2,000억": 0.0402,
+        "3분위 - Low (1.37%): 2,000~20,000억": 0.0137,
+        "3분위 - Mid (-0.36%): > 20,000억": -0.0036,
+        "5분위 - 5분위/최소 (4.66%): < 2,000억": 0.0466,
+        "5분위 - 4분위 (3.02%): 2,000~5,000억": 0.0302,
+        "5분위 - 3분위 (1.21%): 5,000~20,000억": 0.0121,
+        "5분위 - 2분위 (0.06%): 20,000~50,000억": 0.0006,
+        "5분위 - 1분위/최대 (-0.58%): > 50,000억": -0.0058,
+        "Size Premium 없음 (0%)": 0.0
     }
-    size_premium_choice = st.selectbox("기업 규모", list(size_premium_options.keys()), index=0)
+    size_premium_choice = st.selectbox("기업 규모 선택", list(size_premium_options.keys()), index=0,
+                                       help="Target 기업의 시가총액에 맞는 Size Premium 선택")
     size_premium_input = size_premium_options[size_premium_choice]
 
     st.markdown("**타인자본비용 (Kd) 파라미터**")
@@ -1404,7 +1482,6 @@ PYT.VI"""
                                             help="한국: 26.4% (대기업 기준, 지방세 포함) | 미국: 21% | 일본: 30.6%") / 100
 
     st.info(f"💡 목표 부채비율은 피어들의 평균 자본구조로 자동 계산됩니다.")
-    st.info(f"📊 선택된 값: MRP={mrp_input*100:.1f}%, Size Premium={size_premium_input*100:.2f}%, Kd={kd_pretax_input*100:.1f}%, Tax={target_tax_rate_input*100:.1f}%")
 
     # 4. Run Button
     btn_run = st.button("Go, Go, Go 🚀", type="primary")
@@ -1421,7 +1498,8 @@ if btn_run:
             mrp=mrp_input,
             kd_pretax=kd_pretax_input,
             size_premium=size_premium_input,
-            target_tax_rate=target_tax_rate_input
+            target_tax_rate=target_tax_rate_input,
+            user_rf_rate=rf_input
         )
         
         # 1. Summary Table
