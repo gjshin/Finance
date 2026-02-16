@@ -103,32 +103,47 @@ def get_market_index(ticker):
 def calculate_beta(stock_returns, market_returns, min_periods=20):
     """
     주식 수익률과 시장 수익률로부터 베타 계산
-    Returns: raw_beta, adjusted_beta
+    Returns: raw_beta, adjusted_beta (None if invalid)
     """
-    if len(stock_returns) < min_periods or len(market_returns) < min_periods:
+    try:
+        if len(stock_returns) < min_periods or len(market_returns) < min_periods:
+            return None, None
+
+        # 공통 인덱스로 정렬
+        common_idx = stock_returns.index.intersection(market_returns.index)
+        if len(common_idx) < min_periods:
+            return None, None
+
+        stock_ret = stock_returns.loc[common_idx].dropna()
+        market_ret = market_returns.loc[common_idx].dropna()
+
+        common_idx2 = stock_ret.index.intersection(market_ret.index)
+        if len(common_idx2) < min_periods:
+            return None, None
+
+        stock_ret = stock_ret.loc[common_idx2]
+        market_ret = market_ret.loc[common_idx2]
+
+        # 선형회귀로 베타 계산
+        slope, intercept, r_value, p_value, std_err = stats.linregress(market_ret, stock_ret)
+        raw_beta = slope
+
+        # 조정 베타: 2/3 * Raw Beta + 1/3 * 1.0 (Bloomberg 방식)
+        adjusted_beta = (2/3) * raw_beta + (1/3) * 1.0
+
+        # 값 검증: NaN, inf, 비정상 값 체크
+        if not np.isfinite(raw_beta) or not np.isfinite(adjusted_beta):
+            return None, None
+
+        # 극단적 값 필터링 (베타가 -10 ~ 10 범위를 벗어나면 이상)
+        if abs(raw_beta) > 10 or abs(adjusted_beta) > 10:
+            return None, None
+
+        return float(raw_beta), float(adjusted_beta)
+
+    except Exception as e:
+        # 계산 중 에러 발생 시 None 반환
         return None, None
-
-    # 공통 인덱스로 정렬
-    common_idx = stock_returns.index.intersection(market_returns.index)
-    if len(common_idx) < min_periods:
-        return None, None
-
-    stock_ret = stock_returns.loc[common_idx].dropna()
-    market_ret = market_returns.loc[common_idx].dropna()
-
-    common_idx2 = stock_ret.index.intersection(market_ret.index)
-    if len(common_idx2) < min_periods:
-        return None, None
-
-    stock_ret = stock_ret.loc[common_idx2]
-    market_ret = market_ret.loc[common_idx2]
-
-    # 선형회귀로 베타 계산
-    slope, intercept, r_value, p_value, std_err = stats.linregress(market_ret, stock_ret)
-    raw_beta = slope
-
-    # 조정 베타: 2/3 * Raw Beta + 1/3 * 1.0 (Bloomberg 방식)
-    adjusted_beta = (2/3) * raw_beta + (1/3) * 1.0
 
     return raw_beta, adjusted_beta
 
@@ -583,26 +598,35 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, size_pr
                 start_5y = (base_dt - timedelta(days=365*5+20)).strftime('%Y-%m-%d')
                 end_date = base_dt.strftime('%Y-%m-%d')
 
-                # 베타 계산: yfinance 우선, FinanceDataReader 백업
+                # 베타 계산: 한국 주식은 FinanceDataReader 우선, 해외는 yfinance
                 stock_data_5y = None
                 market_data_5y = None
 
-                # 방법 1: yfinance 우선 시도 (모든 종목)
-                try:
-                    stock_hist_5y = yf.download(ticker, start=start_5y, end=end_date, progress=False)
-                    market_hist_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)
-
-                    if not stock_hist_5y.empty and not market_hist_5y.empty:
-                        stock_data_5y = stock_hist_5y
-                        market_data_5y = market_hist_5y
-                except Exception as yf_err:
-                    # 방법 2: yfinance 실패 시 FinanceDataReader 시도 (한국 주식만)
-                    if ticker.endswith('.KS') or ticker.endswith('.KQ'):
+                if ticker.endswith('.KS') or ticker.endswith('.KQ'):
+                    # 한국 주식: FinanceDataReader 우선 사용
+                    try:
+                        stock_data_5y = fdr.DataReader(ticker, start_5y, end_date)
+                        market_data_5y = fdr.DataReader(market_idx, start_5y, end_date)
+                    except Exception as fdr_err:
+                        # FinanceDataReader 실패 시 yfinance 시도
                         try:
-                            stock_data_5y = fdr.DataReader(ticker, start_5y, end_date)
-                            market_data_5y = fdr.DataReader(market_idx, start_5y, end_date)
-                        except Exception as fdr_err:
-                            pass  # 둘 다 실패하면 베타 None
+                            stock_hist_5y = yf.download(ticker, start=start_5y, end=end_date, progress=False)
+                            market_hist_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)
+                            if not stock_hist_5y.empty and not market_hist_5y.empty:
+                                stock_data_5y = stock_hist_5y
+                                market_data_5y = market_hist_5y
+                        except:
+                            pass  # 둘 다 실패
+                else:
+                    # 해외 주식: yfinance 사용
+                    try:
+                        stock_hist_5y = yf.download(ticker, start=start_5y, end=end_date, progress=False)
+                        market_hist_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)
+                        if not stock_hist_5y.empty and not market_hist_5y.empty:
+                            stock_data_5y = stock_hist_5y
+                            market_data_5y = market_hist_5y
+                    except:
+                        pass
 
                 if not stock_data_5y.empty and not market_data_5y.empty:
                     # Close 컬럼 추출
@@ -625,28 +649,37 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.05, size_pr
                     gpcm['Beta_5Y_Monthly_Raw'] = raw_beta_5y
                     gpcm['Beta_5Y_Monthly_Adj'] = adj_beta_5y
 
-                # 2년 주간 베타 계산: yfinance 우선, FinanceDataReader 백업
+                # 2년 주간 베타 계산: 한국 주식은 FinanceDataReader 우선
                 start_2y = (base_dt - timedelta(days=365*2+20)).strftime('%Y-%m-%d')
 
                 stock_data_2y = None
                 market_data_2y = None
 
-                # 방법 1: yfinance 우선 시도
-                try:
-                    stock_hist_2y = yf.download(ticker, start=start_2y, end=end_date, progress=False)
-                    market_hist_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
-
-                    if not stock_hist_2y.empty and not market_hist_2y.empty:
-                        stock_data_2y = stock_hist_2y
-                        market_data_2y = market_hist_2y
-                except Exception as yf_err:
-                    # 방법 2: FinanceDataReader 시도 (한국 주식만)
-                    if ticker.endswith('.KS') or ticker.endswith('.KQ'):
+                if ticker.endswith('.KS') or ticker.endswith('.KQ'):
+                    # 한국 주식: FinanceDataReader 우선
+                    try:
+                        stock_data_2y = fdr.DataReader(ticker, start_2y, end_date)
+                        market_data_2y = fdr.DataReader(market_idx, start_2y, end_date)
+                    except Exception as fdr_err:
+                        # 실패 시 yfinance 시도
                         try:
-                            stock_data_2y = fdr.DataReader(ticker, start_2y, end_date)
-                            market_data_2y = fdr.DataReader(market_idx, start_2y, end_date)
-                        except Exception as fdr_err:
+                            stock_hist_2y = yf.download(ticker, start=start_2y, end=end_date, progress=False)
+                            market_hist_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
+                            if not stock_hist_2y.empty and not market_hist_2y.empty:
+                                stock_data_2y = stock_hist_2y
+                                market_data_2y = market_hist_2y
+                        except:
                             pass
+                else:
+                    # 해외 주식: yfinance
+                    try:
+                        stock_hist_2y = yf.download(ticker, start=start_2y, end=end_date, progress=False)
+                        market_hist_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
+                        if not stock_hist_2y.empty and not market_hist_2y.empty:
+                            stock_data_2y = stock_hist_2y
+                            market_data_2y = market_hist_2y
+                    except:
+                        pass
 
                 if not stock_data_2y.empty and not market_data_2y.empty:
                     if isinstance(stock_data_2y, pd.DataFrame):
@@ -956,11 +989,24 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         ws.cell(r,25).value=f'=IF(N{r}>0,T{r}/N{r},"N/M")'; sc(ws.cell(r,25), fo=fMUL, fi=pMULT, al=aR, bd=BD, nf=NF_X)
 
         # Z-AI: Beta & Risk Analysis
-        # Beta 5Y Raw, Beta 5Y Adj, Beta 2Y Raw, Beta 2Y Adj
-        ws.cell(r,26,gpcm['Beta_5Y_Monthly_Raw']); sc(ws.cell(r,26), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
-        ws.cell(r,27,gpcm['Beta_5Y_Monthly_Adj']); sc(ws.cell(r,27), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
-        ws.cell(r,28,gpcm['Beta_2Y_Weekly_Raw']); sc(ws.cell(r,28), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
-        ws.cell(r,29,gpcm['Beta_2Y_Weekly_Adj']); sc(ws.cell(r,29), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
+        # Beta 5Y Raw, Beta 5Y Adj, Beta 2Y Raw, Beta 2Y Adj (안전하게 처리)
+        beta_5y_raw = gpcm['Beta_5Y_Monthly_Raw']
+        beta_5y_adj = gpcm['Beta_5Y_Monthly_Adj']
+        beta_2y_raw = gpcm['Beta_2Y_Weekly_Raw']
+        beta_2y_adj = gpcm['Beta_2Y_Weekly_Adj']
+
+        # None, NaN, inf 체크 후 Excel에 쓰기
+        ws.cell(r,26, beta_5y_raw if beta_5y_raw is not None and np.isfinite(beta_5y_raw) else None)
+        sc(ws.cell(r,26), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
+
+        ws.cell(r,27, beta_5y_adj if beta_5y_adj is not None and np.isfinite(beta_5y_adj) else None)
+        sc(ws.cell(r,27), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
+
+        ws.cell(r,28, beta_2y_raw if beta_2y_raw is not None and np.isfinite(beta_2y_raw) else None)
+        sc(ws.cell(r,28), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
+
+        ws.cell(r,29, beta_2y_adj if beta_2y_adj is not None and np.isfinite(beta_2y_adj) else None)
+        sc(ws.cell(r,29), fo=fA, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
 
         # Pretax Income (Formula)
         ws.cell(r,30).value=f'=SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$D:$D,"Pretax Income")'; sc(ws.cell(r,30), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_M)
@@ -1026,13 +1072,16 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         '• PL Source: LTM prioritized',
         '',
         '[ Beta & Risk Analysis ]',
-        '• Data Source: Yahoo Finance (yfinance 라이브러리, FinanceDataReader 백업)',
+        '• Data Source:',
+        '  - 한국 주식 (.KS, .KQ): FinanceDataReader 우선 → yfinance 백업',
+        '  - 해외 주식: Yahoo Finance (yfinance)',
         '• Beta 계산 방법:',
-        '  - 5Y Monthly Beta: 5년간 월말 종가 기준 월간 수익률 계산 → 시장지수 대비 회귀분석',
-        '  - 2Y Weekly Beta: 2년간 주말 종가 기준 주간 수익률 계산 → 시장지수 대비 회귀분석',
-        '  - Raw Beta = Covariance(Stock, Market) ÷ Variance(Market)',
+        '  - 5Y Monthly Beta: 5년간 월말 종가 기준 월간 수익률 계산 → 시장지수 대비 선형회귀',
+        '  - 2Y Weekly Beta: 2년간 주말 종가 기준 주간 수익률 계산 → 시장지수 대비 선형회귀',
+        '  - Raw Beta = Slope of linear regression (Market vs Stock returns)',
         '  - Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1.0 (Bloomberg 방법론)',
         '• Market Index: KOSPI (KS11), KOSDAQ (KQ11), Nikkei 225 (^N225), S&P/TSX (^GSPTSE), etc.',
+        '• 값 검증: NaN, inf, 극단값(-10 ~ 10 범위 벗어남) 필터링 → None 처리',
         '• Tax Rate: Wikipedia 기반 법인세율; 한국은 한계세율 적용 (지방세 포함, 2025)',
         '   - Korea: ≤ 200M: 9.9% | 200M-20,000M: 20.9% | 20,000M-300,000M: 23.1% | > 300,000M: 26.4%',
         '• Debt Ratio = IBD ÷ (IBD + Market Cap + NCI)',
@@ -1354,19 +1403,22 @@ for note in notes:
 
 st.subheader("📊 Beta & Risk Analysis")
 beta_notes = [
-    '📌 Data Source: Yahoo Finance (yfinance 우선, FinanceDataReader 백업)',
+    '📌 Data Source:',
+    '  - 한국 주식 (.KS, .KQ): FinanceDataReader 우선 → yfinance 백업',
+    '  - 해외 주식: Yahoo Finance (yfinance)',
     '',
     '• Beta 계산 방법:',
-    '  - 5Y Monthly Beta: 5년간 월말 종가 기준 → 월간 수익률 계산 → 시장지수 대비 회귀분석',
-    '  - 2Y Weekly Beta: 2년간 주말 종가 기준 → 주간 수익률 계산 → 시장지수 대비 회귀분석',
-    '  - Raw Beta = Covariance(Stock, Market) / Variance(Market)',
+    '  - 5Y Monthly Beta: 5년간 월말 종가 → 월간 수익률 → 시장지수 대비 선형회귀',
+    '  - 2Y Weekly Beta: 2년간 주말 종가 → 주간 수익률 → 시장지수 대비 선형회귀',
+    '  - Raw Beta = Slope of linear regression (Market vs Stock returns)',
     '  - Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1.0 (Bloomberg 방법론)',
     '',
     '• Market Index: KOSPI (KS11), KOSDAQ (KQ11), Nikkei 225, S&P/TSX, DAX, etc.',
     '',
-    '• Unlevered Beta = Levered Beta / (1 + (1 - Tax Rate) × Debt Ratio) [Hamada Model]',
+    '• 값 검증: NaN, inf, 극단값(-10 ~ 10 범위 벗어남) 필터링',
+    '',
     '• Tax Rate: Wikipedia-sourced corporate tax rates; Korean rates include local tax (2025)',
-    '• Debt Ratio = IBD ÷ (Market Cap + NCI)',
+    '• Debt Ratio = IBD ÷ (IBD + Market Cap + NCI)',
     '• Unlevered Beta = Levered Beta ÷ (1 + (1 - Tax Rate) × Debt Ratio) [Hamada Model]',
 ]
 for note in beta_notes:
