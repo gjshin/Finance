@@ -187,26 +187,38 @@ def get_korea_10y_treasury_yield(base_date_str):
     """
     try:
         base_dt = pd.to_datetime(base_date_str)
-        # KR10YT=X는 한국 10년 국채 수익률 (Yahoo Finance)
-        # 또는 FinanceDataReader로 한국은행 데이터 활용
 
-        # 방법 1: yfinance로 시도
-        try:
-            treasury_data = yf.download('^TNX', start=(base_dt - timedelta(days=30)).strftime('%Y-%m-%d'),
-                                       end=(base_dt + timedelta(days=1)).strftime('%Y-%m-%d'), progress=False)
-            if not treasury_data.empty and 'Close' in treasury_data.columns:
-                # TNX는 미국 10년물이므로, 한국 국채는 별도 조회 필요
-                # 여기서는 임시로 한국 기준금리 + 스프레드로 근사
-                pass
-        except:
-            pass
+        # FinanceDataReader로 한국 10년 국채 수익률 조회
+        # 'KR10YT=X' 또는 'KR10YT' 심볼 사용
+        start_date = (base_dt - timedelta(days=30)).strftime('%Y-%m-%d')
+        end_date = (base_dt + timedelta(days=1)).strftime('%Y-%m-%d')
 
-        # 방법 2: 기본값 사용 (한국은행 기준금리 기반 추정)
-        # 2024-2025년 기준 약 3.0~3.5% 수준
-        # 실무에서는 Bloomberg/Reuters/한국은행 API 사용 권장
+        # 재시도 로직 추가 (최대 3회)
+        for attempt in range(3):
+            try:
+                # 한국 10년 국채 수익률 조회
+                treasury_data = fdr.DataReader('KR10YT=X', start_date, end_date)
+
+                if not treasury_data.empty and 'Close' in treasury_data.columns:
+                    # 가장 최근 데이터 사용
+                    latest_yield = float(treasury_data['Close'].iloc[-1])
+
+                    # 이미 백분율(%)로 제공되므로 100으로 나눔
+                    yield_rate = latest_yield / 100
+
+                    actual_date = treasury_data.index[-1].strftime('%Y-%m-%d')
+                    st.info(f"💡 한국 10년 국채수익률: {yield_rate*100:.3f}% (조회일: {actual_date})")
+                    return yield_rate
+
+            except Exception as retry_err:
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))  # 2초, 4초 대기
+                else:
+                    st.warning(f"FinanceDataReader 조회 실패: {retry_err}")
+
+        # FinanceDataReader 실패 시 기본값 사용
         default_yield = 0.033  # 3.3% (2025년 평균 추정치)
-
-        st.info(f"💡 한국 10년 국채수익률: {default_yield*100:.2f}% (기본값 사용 - 실무에서는 한국은행 API 활용 권장)")
+        st.warning(f"⚠️ 한국 10년 국채수익률 조회 실패. 기본값 {default_yield*100:.2f}% 사용 (실무에서는 한국은행 API 활용 권장)")
         return default_yield
 
     except Exception as e:
