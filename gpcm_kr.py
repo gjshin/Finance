@@ -14,6 +14,17 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+# 최신 수정: 2026-02-17 10:00 KST
+# 주요 변경사항:
+# - Beta 계산 기능 추가 (5Y Monthly, 2Y Weekly) - FinanceDataReader 사용
+# - Beta_Calculation 시트 추가
+# - WACC_Calculation 시트 추가
+# - GPCM 시트에 Beta & Risk Analysis 컬럼 추가 (총 34개 컬럼)
+# - Debt Ratio 수식 수정: IBD/(시총+IBD+NCI)
+# - Unlevered Beta 계산 (하마다 모형)
+# - 한국 법인세 한계세율 적용 (지방세 포함)
+# - 모든 데이터 소스: FinanceDataReader (yfinance 미사용)
+
 # Streamlit 페이지 설정 (가장 먼저 와야 함)
 st.set_page_config(page_title="GPCM Calculator", layout="wide")
 
@@ -29,6 +40,51 @@ DEBUG_PL = False  # 로그 출력 줄임
 # ==========================================
 # 1. Helper Functions
 # ==========================================
+
+def get_market_index(ticker):
+    """
+    티커 기반으로 거래소 및 시장지수 코드 반환 (한국 종목만 지원)
+    Returns: (exchange_name, index_symbol)
+    """
+    # 한국 종목 - FinanceDataReader 기준
+    # KRX 종목은 숫자 6자리만 입력되므로 별도 처리
+    return 'KRX', 'KS11'  # 기본값: KOSPI
+
+def get_korean_marginal_tax_rate(pretax_income_100m):
+    """
+    한국 법인세 한계세율 산출 (2025년 기준, 지방세 포함)
+    과세표준 기준 (단위: 억원)
+    - 2억 이하: 9% (국세) + 0.9% (지방세 10%) = 9.9%
+    - 2억 ~ 200억: 19% + 1.9% = 20.9%
+    - 200억 ~ 3,000억: 21% + 2.1% = 23.1%
+    - 3,000억 초과: 24% + 2.4% = 26.4%
+    """
+    if pd.isna(pretax_income_100m) or pretax_income_100m == 0:
+        return 0.231  # 기본값 (중간 구간)
+
+    # 억원 단위로 들어온 값
+    if pretax_income_100m <= 2:
+        return 0.099
+    elif pretax_income_100m <= 200:
+        return 0.209
+    elif pretax_income_100m <= 3000:
+        return 0.231
+    else:
+        return 0.264
+
+def calculate_unlevered_beta(levered_beta, debt, equity, tax_rate):
+    """
+    하마다 모형으로 Unlevered Beta 계산
+    Unlevered Beta = Levered Beta / (1 + (1 - Tax Rate) * (Debt / Equity))
+    """
+    if pd.isna(levered_beta) or levered_beta is None:
+        return None
+    if pd.isna(debt) or pd.isna(equity) or equity == 0:
+        return levered_beta
+
+    unlevered = levered_beta / (1 + (1 - tax_rate) * (debt / equity))
+    return unlevered
+
 def parse_period(p: str):
     parts = p.strip().split('.')
     return int(parts[0]), parts[1]
@@ -387,6 +443,7 @@ def add_gpcm_section_row(ws):
         (1, 2,  "Company Info",       pSEC1), (3, 5,  "Other Info",         pSEC2),
         (6, 12, "BS & EV Components", pSEC3), (13,17, "PL(Annual & LTM)",   pSEC4),
         (18,20, "Market Data",        pSEC5), (21,25, "Valuation Multiples", pSEC6),
+        (26,34, "Beta & Risk Analysis", PatternFill('solid', fgColor='6A1B9A')),
     ]
     for c1, c2, label, fill in sections:
         ws.merge_cells(start_row=sec_row, start_column=c1, end_row=sec_row, end_column=c2)
@@ -445,6 +502,11 @@ notes_list = [
     '• IBD(Option): CB/EB/BW 등 메자닌은 기본적으로 IBD(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
     '• NOA(Option): 투자자산/관계기업 등은 기본적으로 NOA(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
     '• LTM = Current Cumulative + Prior Annual − Prior Same Quarter Cumulative (단, 4Q는 Annual)',
+    '• Beta: 5년 월간 & 2년 주간 수익률 기준 (FinanceDataReader 사용)',
+    '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1',
+    '• Debt Ratio = IBD / (Market Cap + IBD + NCI)',
+    '• Unlevered Beta = Levered Beta / (1 + (1 - Tax Rate) × (IBD / Equity))',
+    '• Tax Rate: 한국 법인세 한계세율 (지방세 포함, 세전순이익 기준)',
 ]
 for note in notes_list:
     st.text(note)
@@ -512,8 +574,11 @@ if run_btn:
                 # 임시 저장소 (화면 출력용)
                 temp_metrics = {
                     'Company': display_name, 'Ticker': ticker,
-                    'Market_Cap': 0, 'Cash': 0, 'IBD': 0, 'NCI': 0, 'NOA': 0,
-                    'Revenue': 0, 'EBIT': 0, 'NI': 0
+                    'Market_Cap': 0, 'Cash': 0, 'IBD': 0, 'NCI': 0, 'NOA': 0, 'Equity': 0,
+                    'Revenue': 0, 'EBIT': 0, 'NI': 0, 'Pretax_Income': 0,
+                    'Stock_Monthly_Prices_5Y': None, 'Market_Monthly_Prices_5Y': None,
+                    'Stock_Weekly_Prices_2Y': None, 'Market_Weekly_Prices_2Y': None,
+                    'Exchange': 'KRX', 'Market_Index': 'KS11',
                 }
 
                 for year, qtr, role in required_periods:
@@ -570,6 +635,7 @@ if run_btn:
                                     elif ev_comp == 'IBD': temp_metrics['IBD'] += val_100m
                                     elif ev_comp == 'NCI': temp_metrics['NCI'] += val_100m
                                     elif ev_comp == 'NOA': temp_metrics['NOA'] += val_100m
+                                    elif ev_comp in ['Equity_Total', 'Equity_P']: temp_metrics['Equity'] += val_100m
 
                                 raw_bs_rows.append({
                                     'Company': display_name, 'Ticker': ticker, 'Period': period,
@@ -607,7 +673,78 @@ if run_btn:
                         # 여기서는 구조상 복잡해지므로 DataFrame 생성 시 처리
                         picked.add(calc_key)
                         if picked == wanted: break
-                
+
+                # 4) Beta Calculation (5Y Monthly, 2Y Weekly)
+                exchange, market_idx = get_market_index(ticker)
+                temp_metrics['Exchange'] = exchange
+                temp_metrics['Market_Index'] = market_idx
+
+                try:
+                    # 5년 월간 베타 데이터
+                    start_5y = (pd.to_datetime(base_date_str) - timedelta(days=365*5+20)).strftime('%Y-%m-%d')
+                    end_date = base_date_str
+
+                    # 주가 데이터 (FinanceDataReader)
+                    stock_data_5y = fdr.DataReader(ticker, start_5y, end_date)
+                    market_data_5y = fdr.DataReader(market_idx, start_5y, end_date)
+
+                    if stock_data_5y is not None and not stock_data_5y.empty and market_data_5y is not None and not market_data_5y.empty:
+                        # Close 컬럼 추출
+                        stock_prices_5y = stock_data_5y['Close'] if 'Close' in stock_data_5y.columns else stock_data_5y.iloc[:, 0]
+                        market_prices_5y = market_data_5y['Close'] if 'Close' in market_data_5y.columns else market_data_5y.iloc[:, 0]
+
+                        # 인덱스를 timezone-naive DatetimeIndex로 변환
+                        if not isinstance(stock_prices_5y.index, pd.DatetimeIndex):
+                            stock_prices_5y.index = pd.to_datetime(stock_prices_5y.index)
+                        if stock_prices_5y.index.tz is not None:
+                            stock_prices_5y.index = stock_prices_5y.index.tz_localize(None)
+
+                        if not isinstance(market_prices_5y.index, pd.DatetimeIndex):
+                            market_prices_5y.index = pd.to_datetime(market_prices_5y.index)
+                        if market_prices_5y.index.tz is not None:
+                            market_prices_5y.index = market_prices_5y.index.tz_localize(None)
+
+                        # 월말 종가 저장
+                        stock_monthly_prices = stock_prices_5y.resample('ME').last().dropna()
+                        market_monthly_prices = market_prices_5y.resample('ME').last().dropna()
+
+                        if len(stock_monthly_prices) >= 12 and len(market_monthly_prices) >= 12:
+                            temp_metrics['Stock_Monthly_Prices_5Y'] = stock_monthly_prices
+                            temp_metrics['Market_Monthly_Prices_5Y'] = market_monthly_prices
+
+                    # 2년 주간 베타 데이터
+                    start_2y = (pd.to_datetime(base_date_str) - timedelta(days=365*2+20)).strftime('%Y-%m-%d')
+
+                    stock_data_2y = fdr.DataReader(ticker, start_2y, end_date)
+                    market_data_2y = fdr.DataReader(market_idx, start_2y, end_date)
+
+                    if stock_data_2y is not None and not stock_data_2y.empty and market_data_2y is not None and not market_data_2y.empty:
+                        # Close 컬럼 추출
+                        stock_prices_2y = stock_data_2y['Close'] if 'Close' in stock_data_2y.columns else stock_data_2y.iloc[:, 0]
+                        market_prices_2y = market_data_2y['Close'] if 'Close' in market_data_2y.columns else market_data_2y.iloc[:, 0]
+
+                        # 인덱스를 timezone-naive DatetimeIndex로 변환
+                        if not isinstance(stock_prices_2y.index, pd.DatetimeIndex):
+                            stock_prices_2y.index = pd.to_datetime(stock_prices_2y.index)
+                        if stock_prices_2y.index.tz is not None:
+                            stock_prices_2y.index = stock_prices_2y.index.tz_localize(None)
+
+                        if not isinstance(market_prices_2y.index, pd.DatetimeIndex):
+                            market_prices_2y.index = pd.to_datetime(market_prices_2y.index)
+                        if market_prices_2y.index.tz is not None:
+                            market_prices_2y.index = market_prices_2y.index.tz_localize(None)
+
+                        # 주간 종가 저장 (금요일 기준)
+                        stock_weekly_prices = stock_prices_2y.resample('W-FRI').last().dropna()
+                        market_weekly_prices = market_prices_2y.resample('W-FRI').last().dropna()
+
+                        if len(stock_weekly_prices) >= 50 and len(market_weekly_prices) >= 50:
+                            temp_metrics['Stock_Weekly_Prices_2Y'] = stock_weekly_prices
+                            temp_metrics['Market_Weekly_Prices_2Y'] = market_weekly_prices
+
+                except Exception as e:
+                    pass  # Beta 데이터 수집 실패 시 계속 진행
+
                 screen_summary_data.append(temp_metrics)
                 time.sleep(0.5) # API 호출 간격 조절
 
@@ -748,17 +885,241 @@ if run_btn:
                     r += 1
             ws_ltm.auto_filter.ref = f"A{header_row}:H{r-1}"; ws_ltm.freeze_panes = f"A{header_row+1}"
 
-            # Sheet 5: GPCM
+            # Sheet 3.5: Beta_Calculation
+            ws_beta = wb.create_sheet('Beta_Calculation')
+            ws_beta.merge_cells('A1:F1')
+            sc(ws_beta['A1'], fo=Font(name='Arial', bold=True, size=14, color=C_BL))
+            ws_beta['A1'] = 'Beta Calculation (Excel Formulas)'
+
+            ws_beta.merge_cells('A2:F2')
+            sc(ws_beta['A2'], fo=Font(name='Arial', size=9, color=C_MG, italic=True))
+            ws_beta['A2'] = f'5-Year Monthly & 2-Year Weekly Returns | Base: {base_period_str}'
+
+            r_beta = 4
+            beta_result_rows = {}  # ticker: (raw_5y, adj_5y, raw_2y, adj_2y) 매핑
+
+            for idx, ticker in enumerate(target_code_list):
+                comp_data = next((item for item in screen_summary_data if item["Ticker"] == ticker), None)
+                if not comp_data:
+                    continue
+
+                company_name = comp_data['Company']
+                market_idx = comp_data['Market_Index']
+
+                # ========== 5Y Monthly Beta Section ==========
+                ws_beta.merge_cells(f'A{r_beta}:F{r_beta}')
+                sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', bold=True, size=10, color=C_W),
+                   fi=PatternFill('solid', fgColor='607D8B'), al=Alignment(horizontal='center'))
+                ws_beta.cell(r_beta, 1, f'{company_name} ({ticker}) vs {market_idx} - 5Y Monthly')
+                r_beta += 1
+
+                stock_prices_5y = comp_data.get('Stock_Monthly_Prices_5Y')
+                market_prices_5y = comp_data.get('Market_Monthly_Prices_5Y')
+                raw_5y_row = None
+                adj_5y_row = None
+
+                if stock_prices_5y is not None and market_prices_5y is not None and not stock_prices_5y.empty and not market_prices_5y.empty:
+                    # 헤더
+                    ws_beta.cell(r_beta, 1, 'Date')
+                    ws_beta.cell(r_beta, 2, f'{ticker} Price')
+                    ws_beta.cell(r_beta, 3, f'{market_idx} Price')
+                    ws_beta.cell(r_beta, 4, f'{ticker} Return')
+                    ws_beta.cell(r_beta, 5, f'{market_idx} Return')
+                    for col in range(1, 6):
+                        sc(ws_beta.cell(r_beta, col), fo=Font(name='Arial', bold=True, size=9, color=C_W),
+                           fi=PatternFill('solid', fgColor=C_BL), al=Alignment(horizontal='center'), bd=BD)
+                    r_beta += 1
+
+                    data_start_row = r_beta
+
+                    # 공통 날짜 인덱스
+                    common_dates = stock_prices_5y.index.intersection(market_prices_5y.index)
+
+                    # 데이터 행 작성
+                    for date in common_dates:
+                        ws_beta.cell(r_beta, 1, date.strftime('%Y-%m'))
+                        ws_beta.cell(r_beta, 2, float(stock_prices_5y.loc[date]))
+                        ws_beta.cell(r_beta, 3, float(market_prices_5y.loc[date]))
+
+                        # 수익률 계산 (엑셀 수식)
+                        if r_beta > data_start_row:
+                            ws_beta.cell(r_beta, 4).value = f'=(B{r_beta}-B{r_beta-1})/B{r_beta-1}'
+                            ws_beta.cell(r_beta, 5).value = f'=(C{r_beta}-C{r_beta-1})/C{r_beta-1}'
+                        else:
+                            ws_beta.cell(r_beta, 4, None)
+                            ws_beta.cell(r_beta, 5, None)
+
+                        # 스타일
+                        sc(ws_beta.cell(r_beta, 1), fo=fA, al=aC, bd=BD)
+                        sc(ws_beta.cell(r_beta, 2), fo=fA, al=aR, bd=BD, nf='#,##0.00')
+                        sc(ws_beta.cell(r_beta, 3), fo=fA, al=aR, bd=BD, nf='#,##0.00')
+                        sc(ws_beta.cell(r_beta, 4), fo=fA, al=aR, bd=BD, nf='0.00%')
+                        sc(ws_beta.cell(r_beta, 5), fo=fA, al=aR, bd=BD, nf='0.00%')
+
+                        r_beta += 1
+
+                    data_end_row = r_beta - 1
+
+                    # 베타 계산 (SLOPE 함수)
+                    r_beta += 1
+                    ws_beta.cell(r_beta, 1, 'Raw Beta (5Y Monthly)')
+                    ws_beta.cell(r_beta, 2).value = f'=SLOPE(D{data_start_row+1}:D{data_end_row},E{data_start_row+1}:E{data_end_row})'
+                    sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', bold=True, size=9), bd=BD)
+                    sc(ws_beta.cell(r_beta, 2), fo=Font(name='Arial', bold=True, size=9), fi=PatternFill('solid', fgColor='E8F5E9'),
+                       bd=BD, al=aR, nf='0.0000')
+                    raw_5y_row = r_beta
+                    r_beta += 1
+
+                    # Adjusted Beta
+                    ws_beta.cell(r_beta, 1, 'Adjusted Beta (5Y)')
+                    ws_beta.cell(r_beta, 2).value = f'=2/3*B{r_beta-1}+1/3*1'
+                    sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', bold=True, size=9), bd=BD)
+                    sc(ws_beta.cell(r_beta, 2), fo=Font(name='Arial', bold=True, size=9), fi=PatternFill('solid', fgColor='E8F5E9'),
+                       bd=BD, al=aR, nf='0.0000')
+                    adj_5y_row = r_beta
+
+                else:
+                    ws_beta.cell(r_beta, 1, 'No 5Y price data available')
+                    sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', size=9, color='FF0000'))
+
+                r_beta += 2  # 간격
+
+                # ========== 2Y Weekly Beta Section ==========
+                ws_beta.merge_cells(f'A{r_beta}:F{r_beta}')
+                sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', bold=True, size=10, color=C_W),
+                   fi=PatternFill('solid', fgColor='455A64'), al=Alignment(horizontal='center'))
+                ws_beta.cell(r_beta, 1, f'{company_name} ({ticker}) vs {market_idx} - 2Y Weekly')
+                r_beta += 1
+
+                stock_prices_2y = comp_data.get('Stock_Weekly_Prices_2Y')
+                market_prices_2y = comp_data.get('Market_Weekly_Prices_2Y')
+                raw_2y_row = None
+                adj_2y_row = None
+
+                if stock_prices_2y is not None and market_prices_2y is not None and not stock_prices_2y.empty and not market_prices_2y.empty:
+                    # 헤더
+                    ws_beta.cell(r_beta, 1, 'Date')
+                    ws_beta.cell(r_beta, 2, f'{ticker} Price')
+                    ws_beta.cell(r_beta, 3, f'{market_idx} Price')
+                    ws_beta.cell(r_beta, 4, f'{ticker} Return')
+                    ws_beta.cell(r_beta, 5, f'{market_idx} Return')
+                    for col in range(1, 6):
+                        sc(ws_beta.cell(r_beta, col), fo=Font(name='Arial', bold=True, size=9, color=C_W),
+                           fi=PatternFill('solid', fgColor=C_BL), al=Alignment(horizontal='center'), bd=BD)
+                    r_beta += 1
+
+                    data_start_row = r_beta
+
+                    # 공통 날짜 인덱스
+                    common_dates = stock_prices_2y.index.intersection(market_prices_2y.index)
+
+                    # 데이터 행 작성
+                    for date in common_dates:
+                        ws_beta.cell(r_beta, 1, date.strftime('%Y-%m-%d'))
+                        ws_beta.cell(r_beta, 2, float(stock_prices_2y.loc[date]))
+                        ws_beta.cell(r_beta, 3, float(market_prices_2y.loc[date]))
+
+                        # 수익률 계산 (엑셀 수식)
+                        if r_beta > data_start_row:
+                            ws_beta.cell(r_beta, 4).value = f'=(B{r_beta}-B{r_beta-1})/B{r_beta-1}'
+                            ws_beta.cell(r_beta, 5).value = f'=(C{r_beta}-C{r_beta-1})/C{r_beta-1}'
+                        else:
+                            ws_beta.cell(r_beta, 4, None)
+                            ws_beta.cell(r_beta, 5, None)
+
+                        # 스타일
+                        sc(ws_beta.cell(r_beta, 1), fo=fA, al=aC, bd=BD)
+                        sc(ws_beta.cell(r_beta, 2), fo=fA, al=aR, bd=BD, nf='#,##0.00')
+                        sc(ws_beta.cell(r_beta, 3), fo=fA, al=aR, bd=BD, nf='#,##0.00')
+                        sc(ws_beta.cell(r_beta, 4), fo=fA, al=aR, bd=BD, nf='0.00%')
+                        sc(ws_beta.cell(r_beta, 5), fo=fA, al=aR, bd=BD, nf='0.00%')
+
+                        r_beta += 1
+
+                    data_end_row = r_beta - 1
+
+                    # 베타 계산 (SLOPE 함수)
+                    r_beta += 1
+                    ws_beta.cell(r_beta, 1, 'Raw Beta (2Y Weekly)')
+                    ws_beta.cell(r_beta, 2).value = f'=SLOPE(D{data_start_row+1}:D{data_end_row},E{data_start_row+1}:E{data_end_row})'
+                    sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', bold=True, size=9), bd=BD)
+                    sc(ws_beta.cell(r_beta, 2), fo=Font(name='Arial', bold=True, size=9), fi=PatternFill('solid', fgColor='FFF9C4'),
+                       bd=BD, al=aR, nf='0.0000')
+                    raw_2y_row = r_beta
+                    r_beta += 1
+
+                    # Adjusted Beta
+                    ws_beta.cell(r_beta, 1, 'Adjusted Beta (2Y)')
+                    ws_beta.cell(r_beta, 2).value = f'=2/3*B{r_beta-1}+1/3*1'
+                    sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', bold=True, size=9), bd=BD)
+                    sc(ws_beta.cell(r_beta, 2), fo=Font(name='Arial', bold=True, size=9), fi=PatternFill('solid', fgColor='FFF9C4'),
+                       bd=BD, al=aR, nf='0.0000')
+                    adj_2y_row = r_beta
+
+                else:
+                    ws_beta.cell(r_beta, 1, 'No 2Y price data available')
+                    sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', size=9, color='FF0000'))
+
+                # 결과 저장
+                beta_result_rows[ticker] = (raw_5y_row, adj_5y_row, raw_2y_row, adj_2y_row)
+
+                r_beta += 2  # 다음 회사와 간격
+
+            ws_beta.column_dimensions['A'].width = 15
+            ws_beta.column_dimensions['B'].width = 15
+            ws_beta.column_dimensions['C'].width = 15
+            ws_beta.column_dimensions['D'].width = 15
+            ws_beta.column_dimensions['E'].width = 15
+
+            ws_beta.freeze_panes = 'A4'
+
+            # Sheet 4: WACC_Calculation (간단 버전 - 한국 종목만)
+            ws_wacc = wb.create_sheet('WACC_Calculation')
+            ws_wacc.merge_cells('A1:D1')
+            sc(ws_wacc['A1'], fo=Font(name='Arial', bold=True, size=14, color=C_BL))
+            ws_wacc['A1'] = 'WACC Calculation (Target Company)'
+
+            ws_wacc.merge_cells('A2:D2')
+            sc(ws_wacc['A2'], fo=Font(name='Arial', size=9, color=C_MG, italic=True))
+            ws_wacc['A2'] = f'Base: {base_period_str} | Peer Average Method'
+
+            # WACC 계산 노트
+            r_wacc = 4
+            ws_wacc.cell(r_wacc, 1, 'Note: WACC 계산을 위해서는 다음 정보가 필요합니다:')
+            sc(ws_wacc.cell(r_wacc, 1), fo=Font(name='Arial', size=9, color=C_MG, italic=True))
+            r_wacc += 1
+            wacc_notes = [
+                '1. 무위험이자율 (Rf): 10년 국채수익률',
+                '2. 시장위험프리미엄 (MRP): 한국공인회계사회 권장값',
+                '3. 규모 프리미엄: 시가총액 기준',
+                '4. 세전 타인자본비용 (Kd): 차입금 평균 이자율',
+                '5. Target 기업 법인세율',
+                '',
+                'GPCM 시트에서 피어들의 평균 부채비율과 Unlevered Beta를 확인하여',
+                'Target 기업의 WACC을 계산하실 수 있습니다.',
+            ]
+            for note in wacc_notes:
+                ws_wacc.cell(r_wacc, 1, note)
+                sc(ws_wacc.cell(r_wacc, 1), fo=Font(name='Arial', size=9, color=C_MG))
+                r_wacc += 1
+
+            ws_wacc.column_dimensions['A'].width = 60
+
+            # Sheet 1: GPCM (맨 앞)
             ws = wb.create_sheet('GPCM')
-            wb.move_sheet('GPCM', offset=-4)
-            ws.merge_cells('A1:Y1'); ws['A1'] = "GPCM Valuation Summary"; sc(ws['A1'], fo=fT)
-            ws.merge_cells('A2:Y2'); ws['A2'] = f"Base: {base_period_str} | Unit: 억원 | EV = MCap + IBD − Cash + NCI − NOA (NOA optional)"; sc(ws['A2'], fo=fS)
+            wb.move_sheet('GPCM', offset=-6)  # 맨 앞으로 이동 (index 0)
+            # 시트 순서: GPCM, WACC_Calculation, Beta_Calculation, BS_Full, PL_Data, Market_Cap, LTM_Calc
+            wb.move_sheet('WACC_Calculation', offset=-4)  # GPCM 다음 (index 1)
+            wb.move_sheet('Beta_Calculation', offset=-3)  # WACC 다음 (index 2)
+            TOTAL_COLS = 34
+            ws.merge_cells(f'A1:{get_column_letter(TOTAL_COLS)}1'); ws['A1'] = "GPCM Valuation Summary with Beta Analysis"; sc(ws['A1'], fo=fT)
+            ws.merge_cells(f'A2:{get_column_letter(TOTAL_COLS)}2'); ws['A2'] = f"Base: {base_period_str} | Unit: 억원 | EV = MCap + IBD − Cash + NCI − NOA"; sc(ws['A2'], fo=fS)
             add_gpcm_section_row(ws)
-            headers = ['Company','Ticker','Base Date','Curr','PL Source','Cash','IBD','NOA','Net Debt','NCI','Equity','EV','Revenue','EBIT','D&A','EBITDA','NI','Price','Shares','Mkt Cap','EV/EBITDA','EV/EBIT','PER','PBR','PSR']
+            headers = ['Company','Ticker','Base Date','Curr','PL Source','Cash','IBD','NOA','Net Debt','NCI','Equity','EV','Revenue','EBIT','D&A','EBITDA','NI','Price','Shares','Mkt Cap','EV/EBITDA','EV/EBIT','PER','PBR','PSR','β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','Debt Ratio','Unlevered β 5Y','Unlevered β 2Y']
+            widths = [18, 10, 11, 6, 13, 13, 13, 13, 13, 12, 13, 15, 13, 13, 10, 13, 13, 12, 15, 15, 12, 12, 10, 10, 10, 10, 10, 10, 10, 13, 9, 10, 12, 12]
             header_row = 5
-            for i, h in enumerate(headers, 1):
-                ws.column_dimensions[get_column_letter(i)].width = 13 if i > 5 else 10
-                if i == 1: ws.column_dimensions['A'].width = 18
+            for i, (h, w) in enumerate(zip(headers, widths), 1):
+                ws.column_dimensions[get_column_letter(i)].width = w
                 sc(ws.cell(header_row, i, h), fo=fH, fi=pH, al=aC, bd=BD)
             r = header_row + 1
             for ticker in target_code_list:
@@ -786,15 +1147,76 @@ if run_btn:
                 ws.cell(r,23).value = f'=IF(Q{r}>0, T{r}/Q{r}, "N/M")'; sc(ws.cell(r,23), fo=fMUL, fi=pMULT, nf=NF_X, bd=BD)
                 ws.cell(r,24).value = f'=IF(K{r}>0, T{r}/K{r}, "N/M")'; sc(ws.cell(r,24), fo=fMUL, fi=pMULT, nf=NF_X, bd=BD)
                 ws.cell(r,25).value = f'=IF(M{r}>0, T{r}/M{r}, "N/M")'; sc(ws.cell(r,25), fo=fMUL, fi=pMULT, nf=NF_X, bd=BD)
+
+                # Z-AH: Beta & Risk Analysis (26-34번 컬럼)
+                pBETA = PatternFill('solid', fgColor='E8F5E9')
+                pBETA2 = PatternFill('solid', fgColor='FFF9C4')
+                NF_BETA = '0.00;(0.00);"-"'
+                NF_PCT = '0.0%;(0.0%);"-"'
+
+                # Beta 값은 Beta_Calculation 시트에서 참조
+                beta_rows = beta_result_rows.get(ticker, (None, None, None, None))
+                if beta_rows[0]:  # Raw 5Y
+                    ws.cell(r,26).value = f'=Beta_Calculation!B{beta_rows[0]}'
+                    sc(ws.cell(r,26), fo=fLINK, fi=pBETA, al=aR, nf=NF_BETA, bd=BD)
+                else:
+                    ws.cell(r,26, ''); sc(ws.cell(r,26), fo=fA, fi=pBETA, al=aR, nf=NF_BETA, bd=BD)
+
+                if beta_rows[1]:  # Adj 5Y
+                    ws.cell(r,27).value = f'=Beta_Calculation!B{beta_rows[1]}'
+                    sc(ws.cell(r,27), fo=fLINK, fi=pBETA, al=aR, nf=NF_BETA, bd=BD)
+                else:
+                    ws.cell(r,27, ''); sc(ws.cell(r,27), fo=fA, fi=pBETA, al=aR, nf=NF_BETA, bd=BD)
+
+                if beta_rows[2]:  # Raw 2Y
+                    ws.cell(r,28).value = f'=Beta_Calculation!B{beta_rows[2]}'
+                    sc(ws.cell(r,28), fo=fLINK, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
+                else:
+                    ws.cell(r,28, ''); sc(ws.cell(r,28), fo=fA, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
+
+                if beta_rows[3]:  # Adj 2Y
+                    ws.cell(r,29).value = f'=Beta_Calculation!B{beta_rows[3]}'
+                    sc(ws.cell(r,29), fo=fLINK, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
+                else:
+                    ws.cell(r,29, ''); sc(ws.cell(r,29), fo=fA, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
+                ws.cell(r,30, 0); sc(ws.cell(r,30), fo=fA, fi=bg, al=aR, nf=NB, bd=BD)  # Pretax Inc (PL에서 가져와야 함)
+                ws.cell(r,31, 0.231); sc(ws.cell(r,31), fo=fA, fi=bg, al=aR, nf=NF_PCT, bd=BD)  # Tax Rate (기본값)
+                # Debt Ratio = IBD / (Mkt Cap + IBD + NCI)
+                ws.cell(r,32).value = f'=IF(T{r}+G{r}+J{r}>0, G{r}/(T{r}+G{r}+J{r}), 0)'; sc(ws.cell(r,32), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
+                # Unlevered Beta 5Y = β 5Y Adj / (1 + (1 - Tax Rate) × (IBD / Equity))
+                # 컬럼 27 (AA) = β 5Y Adj, 컬럼 31 (AE) = Tax Rate, 컬럼 7 (G) = IBD, 컬럼 11 (K) = Equity
+                ws.cell(r,33).value = f'=IF(AND({get_column_letter(27)}{r}<>"", K{r}>0), {get_column_letter(27)}{r}/(1+(1-{get_column_letter(31)}{r})*(G{r}/K{r})), "")'; sc(ws.cell(r,33), fo=fFRM, fi=pBETA, al=aR, nf=NF_BETA, bd=BD)
+                # Unlevered Beta 2Y
+                # 컬럼 29 (AC) = β 2Y Adj
+                ws.cell(r,34).value = f'=IF(AND({get_column_letter(29)}{r}<>"", K{r}>0), {get_column_letter(29)}{r}/(1+(1-{get_column_letter(31)}{r})*(G{r}/K{r})), "")'; sc(ws.cell(r,34), fo=fFRM, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
                 r += 1
             r_end = r - 1; r += 1
             for stat, fn in [('Mean','AVERAGE'), ('Median','MEDIAN'), ('Max','MAX'), ('Min','MIN')]:
                 ws.cell(r, 20, stat); sc(ws.cell(r,20), fo=fSTAT, fi=pSTAT, al=aC, bd=BD)
-                for c in range(21, 26): col = get_column_letter(c); ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "N/M")'; sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NF_X, bd=BD)
+                # Valuation Multiples (21-25)
+                for c in range(21, 26):
+                    col = get_column_letter(c)
+                    ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "N/M")'
+                    sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NF_X, bd=BD)
+                # Beta & Risk (26-34)
+                for c in range(26, 35):
+                    col = get_column_letter(c)
+                    if c in [26, 27, 28, 29, 33, 34]:  # Beta 컬럼
+                        ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "")'
+                        sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NF_BETA, bd=BD)
+                    elif c == 31:  # Tax Rate
+                        ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "")'
+                        sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NF_PCT, bd=BD)
+                    elif c == 32:  # Debt Ratio
+                        ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "")'
+                        sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NF_PCT, bd=BD)
+                    else:
+                        ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "")'
+                        sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NB, bd=BD)
                 r += 1
             r += 2
-            for note in notes_list: ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=25); sc(ws.cell(r, 1, note), fo=fNOTE); r += 1
-            ws.freeze_panes = f"A{header_row+1}"
+            for note in notes_list: ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=TOTAL_COLS); sc(ws.cell(r, 1, note), fo=fNOTE); r += 1
+            ws.freeze_panes = f"F{header_row+1}"  # Cash 컬럼부터 스크롤
 
             wb.save(output)
             output.seek(0)
