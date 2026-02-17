@@ -1,5 +1,7 @@
-# 최신 수정: 2026-02-16 13:00 KST
+# 최신 수정: 2026-02-16 16:00 KST
 # 주요 변경사항:
+# - D/E Ratio 컬럼 추가 (IBD / (시총 + NCI))
+# - Unlevered Beta 계산에 D/E Ratio 사용 (정확한 Hamada 공식)
 # - 국내 베타 계산 수정: 시장 지수는 FDR 사용 (KS11, KQ11은 yfinance 미지원)
 # - Debt Ratio 수식 수정: IBD/(시총+IBD+NCI) [총부채/총자산]
 # - 노트 업데이트: 주가 데이터 소스 명시
@@ -1162,12 +1164,12 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
     # [Sheet 4] GPCM
     ws = wb.create_sheet('GPCM')
     wb.move_sheet('GPCM', offset=-5)  # 맨 앞으로 (Sheet 위치: 0)
-    TOTAL_COLS = 34  # WACC 컬럼 제거 (별도 시트로 분리)
+    TOTAL_COLS = 35  # D/E Ratio 컬럼 추가 (34 → 35)
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=TOTAL_COLS); sc(ws.cell(1,1,'GPCM Valuation Summary with Beta Analysis'), fo=fT)
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=TOTAL_COLS); sc(ws.cell(2,1,f'Base: {base_date_str} | Unit: Millions (local currency) | EV = MCap + IBD − Cash + NCI | Target WACC: See WACC_Calculation Sheet'), fo=fS)
 
     r=4
-    sections = [(1,3,'Company Info'),(4,4,'Other Information'),(8,6,'BS → EV Components'),(14,4,'PL (LTM / Annual)'),(18,3,'Market Data'),(21,5,'Valuation Multiples'),(26,9,'Beta & Risk Analysis')]
+    sections = [(1,3,'Company Info'),(4,4,'Other Information'),(8,6,'BS → EV Components'),(14,4,'PL (LTM / Annual)'),(18,3,'Market Data'),(21,5,'Valuation Multiples'),(26,10,'Beta & Risk Analysis')]
     for start,span,txt in sections:
         ws.merge_cells(start_row=r, start_column=start, end_row=r, end_column=start+span-1)
         sc(ws.cell(r,start,txt), fo=fSEC, fi=pSEC, al=aC, bd=BD)
@@ -1179,13 +1181,13 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
                'Revenue','EBIT','EBITDA','NI (Parent)',
                'Price','Shares','Mkt Cap',
                'EV/EBITDA','EV/EBIT','PER','PBR','PSR',
-               'β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','Debt Ratio','Unlevered β 5Y','Unlevered β 2Y']
+               'β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','D/E Ratio','Debt Ratio','Unlevered β 5Y','Unlevered β 2Y']
     widths = [18,10,11,6,16,10,10,
               14,14,14,12,14,16,
               14,14,14,14,
               12,16,16,
               12,12,10,10,10,
-              10,10,10,10,14,9,10,12,12]
+              10,10,10,10,14,9,10,10,12,12]
     for i,(h,w) in enumerate(zip(headers,widths)): ws.column_dimensions[get_column_letter(i+1)].width=w; sc(ws.cell(r,i+1,h), fo=fH, fi=pH, al=aC, bd=BD)
     
     DATA_START=6; n_companies=len(gpcm_data); DATA_END=DATA_START+n_companies-1
@@ -1263,24 +1265,27 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         # Tax Rate
         ws.cell(r,31,gpcm['Tax_Rate']); sc(ws.cell(r,31), fo=fA, fi=base_fi, al=aR, bd=BD, nf=NF_PCT)
 
+        # D/E Ratio = IBD / (Market Cap + NCI)
+        ws.cell(r,32).value=f'=IF((T{r}+K{r})>0,I{r}/(T{r}+K{r}),0)'; sc(ws.cell(r,32), fo=fFRM_B, fi=base_fi, al=aR, bd=BD, nf=NF_RATIO)
+
         # Debt Ratio = IBD / (Market Cap + IBD + NCI) [총부채/총자산]
-        ws.cell(r,32).value=f'=IF((T{r}+I{r}+K{r})>0,I{r}/(T{r}+I{r}+K{r}),0)'; sc(ws.cell(r,32), fo=fFRM_B, fi=base_fi, al=aR, bd=BD, nf=NF_RATIO)
+        ws.cell(r,33).value=f'=IF((T{r}+I{r}+K{r})>0,I{r}/(T{r}+I{r}+K{r}),0)'; sc(ws.cell(r,33), fo=fFRM_B, fi=base_fi, al=aR, bd=BD, nf=NF_RATIO)
 
-        # Unlevered Beta 5Y = Beta 5Y Adj / (1 + (1 - Tax Rate) * Debt Ratio)
-        ws.cell(r,33).value=f'=IF(AA{r}>0,AA{r}/(1+(1-AE{r})*AF{r}),AA{r})'; sc(ws.cell(r,33), fo=fFRM_B, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
+        # Unlevered Beta 5Y = Beta 5Y Adj / (1 + (1 - Tax Rate) * D/E Ratio)
+        ws.cell(r,34).value=f'=IF(AA{r}>0,AA{r}/(1+(1-AE{r})*AF{r}),AA{r})'; sc(ws.cell(r,34), fo=fFRM_B, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
 
-        # Unlevered Beta 2Y = Beta 2Y Adj / (1 + (1 - Tax Rate) * Debt Ratio)
-        ws.cell(r,34).value=f'=IF(AC{r}>0,AC{r}/(1+(1-AE{r})*AF{r}),AC{r})'; sc(ws.cell(r,34), fo=fFRM_B, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
+        # Unlevered Beta 2Y = Beta 2Y Adj / (1 + (1 - Tax Rate) * D/E Ratio)
+        ws.cell(r,35).value=f'=IF(AC{r}>0,AC{r}/(1+(1-AE{r})*AF{r}),AC{r})'; sc(ws.cell(r,35), fo=fFRM_B, fi=pBETA, al=aR, bd=BD, nf=NF_BETA)
 
     # Stats
     r=DATA_END+2
     stat_labels=['Mean','Median','Max','Min']; func_map={'Mean':'AVERAGE','Median':'MEDIAN','Max':'MAX','Min':'MIN'}
     # Multiples: 21-25 (EV/EBITDA, EV/EBIT, PER, PBR, PSR)
-    # Betas: 26-29, 33-34 (Beta 5Y Raw, Beta 5Y Adj, Beta 2Y Raw, Beta 2Y Adj, Unlevered Beta 5Y, Unlevered Beta 2Y)
-    # Ratios: 32 (Debt Ratio)
+    # Betas: 26-29, 34-35 (Beta 5Y Raw, Beta 5Y Adj, Beta 2Y Raw, Beta 2Y Adj, Unlevered Beta 5Y, Unlevered Beta 2Y)
+    # Ratios: 32-33 (D/E Ratio, Debt Ratio)
     mult_cols=[21,22,23,24,25]
-    beta_cols=[26,27,28,29,33,34]
-    ratio_cols=[32]  # Debt Ratio만
+    beta_cols=[26,27,28,29,34,35]
+    ratio_cols=[32,33]  # D/E Ratio, Debt Ratio
 
     for sn in stat_labels:
         sc(ws.cell(r,20,sn), fo=fSTAT, fi=pSTAT, al=aC, bd=BD)
@@ -1333,8 +1338,9 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         '• 값 검증: NaN, inf, 극단값(-10 ~ 10 범위 벗어남) 필터링 → None 처리',
         '• Tax Rate: Wikipedia 기반 법인세율; 한국은 한계세율 적용 (지방세 포함, 2025)',
         '   - Korea: ≤ 200M: 9.9% | 200M-20,000M: 20.9% | 20,000M-300,000M: 23.1% | > 300,000M: 26.4%',
-        '• Debt Ratio = IBD ÷ (Market Cap + IBD + NCI) [총부채/총자산]',
-        '• Unlevered Beta = Levered Beta ÷ (1 + (1 - Tax Rate) × Debt Ratio) [Hamada Model]',
+        '• D/E Ratio = IBD ÷ (Market Cap + NCI)',
+        '• Debt Ratio (D/V) = IBD ÷ (Market Cap + IBD + NCI) [총부채/총자산]',
+        '• Unlevered Beta = Levered Beta ÷ (1 + (1 - Tax Rate) × D/E Ratio) [Hamada Model]',
         '• 베타 값은 Python에서 계산되어 엑셀에 저장됩니다 (실시간 데이터 기반)',
         '',
         '[ Target WACC Calculation ]',
@@ -1441,7 +1447,7 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
     # Avg Unlevered Beta - 엑셀 수식으로 GPCM 시트 참조 (선택된 beta_type에 따라)
     row_unlevered_beta = r_wacc
     beta_label = "5Y Monthly" if beta_type == "5Y" else "2Y Weekly"
-    beta_col = 'AG' if beta_type == "5Y" else 'AH'  # AG = 컬럼 33 (Unlevered Beta 5Y), AH = 컬럼 34 (Unlevered Beta 2Y)
+    beta_col = 'AH' if beta_type == "5Y" else 'AI'  # AH = 컬럼 34 (Unlevered Beta 5Y), AI = 컬럼 35 (Unlevered Beta 2Y)
     ws_wacc.cell(r_wacc, 1, f'Avg Unlevered Beta ({beta_label})')
     ws_wacc.cell(r_wacc, 2).value = f'=GPCM!{beta_col}{mean_row}'
     ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Avg_Unlevered_Beta']:.4f}")
@@ -1455,7 +1461,7 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
     # Avg Debt Ratio - 엑셀 수식으로 GPCM 시트 참조
     row_debt_ratio = r_wacc
     ws_wacc.cell(r_wacc, 1, 'Avg Debt Ratio (D/V)')
-    ws_wacc.cell(r_wacc, 2).value = f'=GPCM!AF{mean_row}'  # 컬럼 32 (AF) = Debt Ratio
+    ws_wacc.cell(r_wacc, 2).value = f'=GPCM!AG{mean_row}'  # 컬럼 33 (AG) = Debt Ratio
     ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Avg_Debt_Ratio']*100:.1f}%")
     ws_wacc.cell(r_wacc, 4, '피어 평균 자본구조 (GPCM Mean)')
     sc(ws_wacc.cell(r_wacc, 1), fo=fA, bd=BD)
