@@ -14,15 +14,17 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# 최신 수정: 2026-02-17 10:00 KST
+# 최신 수정: 2026-02-17 15:00 KST
 # 주요 변경사항:
 # - Beta 계산 기능 추가 (5Y Monthly, 2Y Weekly) - FinanceDataReader 사용
 # - Beta_Calculation 시트 추가
-# - WACC_Calculation 시트 추가
-# - GPCM 시트에 Beta & Risk Analysis 컬럼 추가 (총 34개 컬럼)
-# - Debt Ratio 수식 수정: IBD/(시총+IBD+NCI)
-# - Unlevered Beta 계산 (하마다 모형)
+# - WACC_Calculation 시트 완전 구현 (GPCM.py와 동일)
+# - GPCM 시트에 Beta & Risk Analysis 컬럼 추가 (총 35개 컬럼)
+# - D/E Ratio 컬럼 추가 (컬럼 32): IBD/(시총+NCI)
+# - Debt Ratio 컬럼 이동 (컬럼 33): IBD/(시총+IBD+NCI)
+# - Unlevered Beta 수식 수정: D/E 사용 (하마다 모형)
 # - 한국 법인세 한계세율 적용 (지방세 포함)
+# - Streamlit 사용자 입력 추가: Rf, MRP, Size Premium, Beta Type, Kd, Target Tax Rate
 # - 모든 데이터 소스: FinanceDataReader (yfinance 미사용)
 
 # Streamlit 페이지 설정 (가장 먼저 와야 함)
@@ -443,7 +445,7 @@ def add_gpcm_section_row(ws):
         (1, 2,  "Company Info",       pSEC1), (3, 5,  "Other Info",         pSEC2),
         (6, 12, "BS & EV Components", pSEC3), (13,17, "PL(Annual & LTM)",   pSEC4),
         (18,20, "Market Data",        pSEC5), (21,25, "Valuation Multiples", pSEC6),
-        (26,34, "Beta & Risk Analysis", PatternFill('solid', fgColor='6A1B9A')),
+        (26,35, "Beta & Risk Analysis", PatternFill('solid', fgColor='6A1B9A')),
     ]
     for c1, c2, label, fill in sections:
         ws.merge_cells(start_row=sec_row, start_column=c1, end_row=sec_row, end_column=c2)
@@ -474,8 +476,78 @@ with st.sidebar:
     # 좌측 3 : 종목코드 입력
     st.subheader("Target Companies")
     tickers_input = st.text_area("대상회사의 종목코드를 한줄씩 입력하세요", value="000250\n039030\n005290", height=150)
-    
-    # 좌측 4 : 실행 버튼
+
+    # 좌측 4 : WACC 파라미터 설정
+    st.subheader("Target WACC Parameters")
+
+    st.markdown("**무위험이자율 (Rf)**")
+    rf_input = st.number_input("Rf - 무위험이자율 (%)", min_value=0.0, max_value=10.0, value=3.3, step=0.1, format="%.2f",
+                                help="한국 10년 국채수익률") / 100
+
+    st.markdown("**자기자본비용 (Ke) 파라미터**")
+    mrp_input = st.slider("MRP (시장위험프리미엄)", min_value=7.0, max_value=9.0, value=8.0, step=0.1, format="%.1f%%",
+                         help="한국공인회계사회 권장: 7~9%") / 100
+
+    st.markdown("**Size Premium (한국공인회계사회 기준, 2023)**")
+
+    # Size Premium 표 보여주기
+    with st.expander("📊 시가총액별 Size Premium 참고표"):
+        st.markdown("**3분위수 기준**")
+        st.markdown("""
+        | 구분 | 시가총액 범위 (억원) | Size Premium |
+        |------|---------------------|--------------|
+        | **Micro** | < 2,000 | **4.02%** |
+        | **Low** | 2,000 ~ 20,000 | 1.37% |
+        | **Mid** | > 20,000 | -0.36% |
+        """)
+
+        st.markdown("**5분위수 기준**")
+        st.markdown("""
+        | 구분 | 시가총액 범위 (억원) | Size Premium |
+        |------|---------------------|--------------|
+        | **5분위 (최소)** | < 2,000 | **4.66%** |
+        | **4분위** | 2,000 ~ 5,000 | 3.02% |
+        | **3분위** | 5,000 ~ 20,000 | 1.21% |
+        | **2분위** | 20,000 ~ 50,000 | 0.06% |
+        | **1분위 (최대)** | > 50,000 | -0.58% |
+        """)
+
+        st.info("💡 Target 기업의 시가총액에 맞는 Size Premium을 선택하세요.")
+
+    size_premium_options = {
+        "3분위 - Micro (4.02%): < 2,000억": 0.0402,
+        "3분위 - Low (1.37%): 2,000~20,000억": 0.0137,
+        "3분위 - Mid (-0.36%): > 20,000억": -0.0036,
+        "5분위 - 5분위/최소 (4.66%): < 2,000억": 0.0466,
+        "5분위 - 4분위 (3.02%): 2,000~5,000억": 0.0302,
+        "5분위 - 3분위 (1.21%): 5,000~20,000억": 0.0121,
+        "5분위 - 2분위 (0.06%): 20,000~50,000억": 0.0006,
+        "5분위 - 1분위/최대 (-0.58%): > 50,000억": -0.0058,
+        "Size Premium 없음 (0%)": 0.0
+    }
+    size_premium_choice = st.selectbox("기업 규모 선택", list(size_premium_options.keys()), index=0,
+                                       help="Target 기업의 시가총액에 맞는 Size Premium 선택")
+    size_premium_input = size_premium_options[size_premium_choice]
+
+    st.markdown("**Beta 계산 기준 선택**")
+    beta_type_options = {
+        "5년 월간 베타 (5Y Monthly)": "5Y",
+        "2년 주간 베타 (2Y Weekly)": "2Y"
+    }
+    beta_type_choice = st.selectbox("WACC 계산에 사용할 Beta", list(beta_type_options.keys()), index=0,
+                                    help="Target WACC 계산 시 사용할 베타 유형을 선택하세요. 두 베타 모두 엑셀에 표시됩니다.")
+    beta_type_input = beta_type_options[beta_type_choice]
+
+    st.markdown("**타인자본비용 (Kd) 파라미터**")
+    kd_pretax_input = st.number_input("Kd (Pretax) - 세전 이자율 (%)", min_value=0.0, max_value=15.0, value=3.5, step=0.1, format="%.1f") / 100
+
+    st.markdown("**Target 기업 법인세율**")
+    target_tax_rate_input = st.number_input("Target 법인세율 (%)", min_value=0.0, max_value=50.0, value=26.4, step=0.1, format="%.1f",
+                                            help="한국: 26.4% (대기업 기준, 지방세 포함)") / 100
+
+    st.info(f"💡 목표 부채비율은 피어들의 평균 자본구조로 자동 계산됩니다.")
+
+    # 좌측 5 : 실행 버튼
     run_btn = st.button("Go,Go,Go 🚀", type="primary")
 
 # 메인 UI
@@ -504,8 +576,9 @@ notes_list = [
     '• LTM = Current Cumulative + Prior Annual − Prior Same Quarter Cumulative (단, 4Q는 Annual)',
     '• Beta: 5년 월간 & 2년 주간 수익률 기준 (FinanceDataReader 사용)',
     '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1',
-    '• Debt Ratio = IBD / (Market Cap + IBD + NCI)',
-    '• Unlevered Beta = Levered Beta / (1 + (1 - Tax Rate) × (IBD / Equity))',
+    '• D/E Ratio = IBD / (Market Cap + NCI)',
+    '• Debt Ratio (D/V) = IBD / (Market Cap + IBD + NCI)',
+    '• Unlevered Beta = Levered Beta / (1 + (1 - Tax Rate) × D/E Ratio)',
     '• Tax Rate: 한국 법인세 한계세율 (지방세 포함, 세전순이익 기준)',
 ]
 for note in notes_list:
@@ -801,6 +874,132 @@ if run_btn:
                     stats = df_screen[['EV/EBIT', 'PER', 'PSR']].agg(['mean', 'median', 'max', 'min'])
                     st.dataframe(stats.style.format("{:.1f}x"))
 
+            # 1.5. WACC Calculation (Target 기업용)
+            # Beta 시트에서 계산될 Unlevered Beta를 엑셀에서 참조할 것이므로,
+            # 여기서는 대략적인 값만 계산 (정확한 값은 엑셀 수식 기반)
+
+            # 피어들의 평균 계산을 위한 준비
+            avg_debt_ratios = []
+            avg_unlevered_betas_5y = []
+            avg_unlevered_betas_2y = []
+
+            for ticker in target_code_list:
+                comp_data = next((item for item in screen_summary_data if item["Ticker"] == ticker), None)
+                if not comp_data:
+                    continue
+
+                mkt_cap = comp_data.get('Market_Cap', 0)
+                ibd = comp_data.get('IBD', 0)
+                nci = comp_data.get('NCI', 0)
+                equity = comp_data.get('Equity', 0)
+
+                # Debt Ratio (D/V) = IBD / (Mkt Cap + IBD + NCI)
+                total_value = mkt_cap + ibd + nci
+                if total_value > 0:
+                    debt_ratio = ibd / total_value
+                    avg_debt_ratios.append(debt_ratio)
+
+                # D/E Ratio = IBD / (Mkt Cap + NCI)
+                equity_value = mkt_cap + nci
+                de_ratio = ibd / equity_value if equity_value > 0 else 0
+
+                # Beta 계산 (간단히 수익률 기반)
+                stock_monthly_5y = comp_data.get('Stock_Monthly_Prices_5Y')
+                market_monthly_5y = comp_data.get('Market_Monthly_Prices_5Y')
+                stock_weekly_2y = comp_data.get('Stock_Weekly_Prices_2Y')
+                market_weekly_2y = comp_data.get('Market_Weekly_Prices_2Y')
+
+                # 5Y Monthly Beta
+                if stock_monthly_5y is not None and market_monthly_5y is not None and not stock_monthly_5y.empty and not market_monthly_5y.empty:
+                    try:
+                        common_dates = stock_monthly_5y.index.intersection(market_monthly_5y.index)
+                        if len(common_dates) > 12:
+                            stock_ret = stock_monthly_5y.loc[common_dates].pct_change().dropna()
+                            market_ret = market_monthly_5y.loc[common_dates].pct_change().dropna()
+                            common_idx = stock_ret.index.intersection(market_ret.index)
+                            if len(common_idx) > 10:
+                                stock_ret_aligned = stock_ret.loc[common_idx]
+                                market_ret_aligned = market_ret.loc[common_idx]
+                                cov_matrix = np.cov(stock_ret_aligned, market_ret_aligned)
+                                beta_raw = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else np.nan
+                                beta_adj = (2/3) * beta_raw + (1/3) * 1
+
+                                # Unlevered Beta = Adj Beta / (1 + (1 - Tax Rate) × D/E)
+                                tax_rate = 0.231  # 기본 세율
+                                if not np.isnan(beta_adj) and equity > 0:
+                                    unlevered_beta_5y = beta_adj / (1 + (1 - tax_rate) * de_ratio)
+                                    avg_unlevered_betas_5y.append(unlevered_beta_5y)
+                    except:
+                        pass
+
+                # 2Y Weekly Beta
+                if stock_weekly_2y is not None and market_weekly_2y is not None and not stock_weekly_2y.empty and not market_weekly_2y.empty:
+                    try:
+                        common_dates = stock_weekly_2y.index.intersection(market_weekly_2y.index)
+                        if len(common_dates) > 50:
+                            stock_ret = stock_weekly_2y.loc[common_dates].pct_change().dropna()
+                            market_ret = market_weekly_2y.loc[common_dates].pct_change().dropna()
+                            common_idx = stock_ret.index.intersection(market_ret.index)
+                            if len(common_idx) > 20:
+                                stock_ret_aligned = stock_ret.loc[common_idx]
+                                market_ret_aligned = market_ret.loc[common_idx]
+                                cov_matrix = np.cov(stock_ret_aligned, market_ret_aligned)
+                                beta_raw = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else np.nan
+                                beta_adj = (2/3) * beta_raw + (1/3) * 1
+
+                                # Unlevered Beta
+                                tax_rate = 0.231
+                                if not np.isnan(beta_adj) and equity > 0:
+                                    unlevered_beta_2y = beta_adj / (1 + (1 - tax_rate) * de_ratio)
+                                    avg_unlevered_betas_2y.append(unlevered_beta_2y)
+                    except:
+                        pass
+
+            # 평균값 계산
+            avg_debt_ratio = np.mean(avg_debt_ratios) if avg_debt_ratios else 0.3
+
+            # Beta Type에 따라 선택
+            if beta_type_input == "5Y":
+                avg_unlevered_beta = np.mean(avg_unlevered_betas_5y) if avg_unlevered_betas_5y else 0.8
+            else:
+                avg_unlevered_beta = np.mean(avg_unlevered_betas_2y) if avg_unlevered_betas_2y else 0.8
+
+            # Target D/E Ratio 계산
+            target_de_ratio = avg_debt_ratio / (1 - avg_debt_ratio) if avg_debt_ratio < 1 else 0
+
+            # Relevered Beta 계산
+            target_relevered_beta = avg_unlevered_beta * (1 + (1 - target_tax_rate_input) * target_de_ratio)
+
+            # Ke (자기자본비용) 계산
+            target_ke = rf_input + mrp_input * target_relevered_beta + size_premium_input
+
+            # Kd (타인자본비용, 세후)
+            kd_aftertax = kd_pretax_input * (1 - target_tax_rate_input)
+
+            # E/V, D/V
+            equity_weight = 1 - avg_debt_ratio
+            debt_weight = avg_debt_ratio
+
+            # Target WACC
+            target_wacc = equity_weight * target_ke + debt_weight * kd_aftertax
+
+            # WACC 데이터 저장
+            target_wacc_data = {
+                'Rf': rf_input,
+                'MRP': mrp_input,
+                'Size_Premium': size_premium_input,
+                'Avg_Unlevered_Beta': avg_unlevered_beta,
+                'Target_Tax_Rate': target_tax_rate_input,
+                'Avg_Debt_Ratio': avg_debt_ratio,
+                'Target_DE_Ratio': target_de_ratio,
+                'Target_Relevered_Beta': target_relevered_beta,
+                'Target_Ke': target_ke,
+                'Kd_Pretax': kd_pretax_input,
+                'Kd_Aftertax': kd_aftertax,
+                'Equity_Weight': equity_weight,
+                'Debt_Weight': debt_weight,
+                'Target_WACC': target_wacc
+            }
 
             # 2. 엑셀 생성 (메모리)
             output = io.BytesIO()
@@ -1073,37 +1272,257 @@ if run_btn:
 
             ws_beta.freeze_panes = 'A4'
 
-            # Sheet 4: WACC_Calculation (간단 버전 - 한국 종목만)
+            # Sheet 4: WACC_Calculation (완전 구현 - GPCM.py와 동일)
             ws_wacc = wb.create_sheet('WACC_Calculation')
             ws_wacc.merge_cells('A1:D1')
             sc(ws_wacc['A1'], fo=Font(name='Arial', bold=True, size=14, color=C_BL))
-            ws_wacc['A1'] = 'WACC Calculation (Target Company)'
+            ws_wacc['A1'] = 'Target WACC Calculation'
 
             ws_wacc.merge_cells('A2:D2')
             sc(ws_wacc['A2'], fo=Font(name='Arial', size=9, color=C_MG, italic=True))
             ws_wacc['A2'] = f'Base: {base_period_str} | Peer Average Method'
 
-            # WACC 계산 노트
+            # 스타일 정의
+            C_MB = '005EB8'
+            pWACC_PARAM = PatternFill('solid', fgColor='E3F2FD')
+            pWACC_CALC = PatternFill('solid', fgColor='FFF9C4')
+            pWACC_RESULT = PatternFill('solid', fgColor='FFE082')
+
             r_wacc = 4
-            ws_wacc.cell(r_wacc, 1, 'Note: WACC 계산을 위해서는 다음 정보가 필요합니다:')
-            sc(ws_wacc.cell(r_wacc, 1), fo=Font(name='Arial', size=9, color=C_MG, italic=True))
+
+            # Section 1: Input Parameters
+            ws_wacc.merge_cells(f'A{r_wacc}:D{r_wacc}')
+            sc(ws_wacc.cell(r_wacc, 1), fo=Font(name='Arial', bold=True, size=10, color=C_W),
+               fi=PatternFill('solid', fgColor=C_MB), al=Alignment(horizontal='center'))
+            ws_wacc.cell(r_wacc, 1, '[ 1 ] Input Parameters')
             r_wacc += 1
-            wacc_notes = [
-                '1. 무위험이자율 (Rf): 10년 국채수익률',
-                '2. 시장위험프리미엄 (MRP): 한국공인회계사회 권장값',
-                '3. 규모 프리미엄: 시가총액 기준',
-                '4. 세전 타인자본비용 (Kd): 차입금 평균 이자율',
-                '5. Target 기업 법인세율',
-                '',
-                'GPCM 시트에서 피어들의 평균 부채비율과 Unlevered Beta를 확인하여',
-                'Target 기업의 WACC을 계산하실 수 있습니다.',
+
+            # 헤더
+            ws_wacc['A' + str(r_wacc)] = 'Parameter'
+            ws_wacc['B' + str(r_wacc)] = 'Value'
+            ws_wacc['C' + str(r_wacc)] = 'Format'
+            ws_wacc['D' + str(r_wacc)] = 'Note'
+            for col in ['A', 'B', 'C', 'D']:
+                sc(ws_wacc[col + str(r_wacc)], fo=Font(name='Arial', bold=True, size=9, color=C_W),
+                   fi=PatternFill('solid', fgColor=C_BL), al=Alignment(horizontal='center'), bd=BD)
+            r_wacc += 1
+
+            # Calculate GPCM stats row position for formulas
+            # DATA_START = 6 (header_row + 1), DATA_END depends on number of companies
+            # Mean row = DATA_END + 2
+            n_companies = len(target_code_list)
+            DATA_START = 6
+            DATA_END = 6 + n_companies - 1
+            mean_row = DATA_END + 2
+
+            # 데이터 행 - Input Parameters
+            wacc_params = [
+                ('Risk-Free Rate (Rf)', target_wacc_data['Rf'], f"{target_wacc_data['Rf']*100:.2f}%", '10-year Korea Treasury Yield'),
+                ('Market Risk Premium (MRP)', target_wacc_data['MRP'], f"{target_wacc_data['MRP']*100:.1f}%", '한국공인회계사회 기준'),
+                ('Size Premium', target_wacc_data['Size_Premium'], f"{target_wacc_data['Size_Premium']*100:.2f}%", '한국공인회계사회 (시가총액 기준)'),
+                ('Kd (Pretax)', target_wacc_data['Kd_Pretax'], f"{target_wacc_data['Kd_Pretax']*100:.1f}%", '세전 타인자본비용 (사용자 입력)'),
+                ('Target Tax Rate', target_wacc_data['Target_Tax_Rate'], f"{target_wacc_data['Target_Tax_Rate']*100:.1f}%", '한국 대기업 기준 (지방세 포함)'),
             ]
-            for note in wacc_notes:
-                ws_wacc.cell(r_wacc, 1, note)
-                sc(ws_wacc.cell(r_wacc, 1), fo=Font(name='Arial', size=9, color=C_MG))
+
+            for param, value, formatted, note in wacc_params:
+                ws_wacc.cell(r_wacc, 1, param)
+                ws_wacc.cell(r_wacc, 2, value)
+                ws_wacc.cell(r_wacc, 3, formatted)
+                ws_wacc.cell(r_wacc, 4, note)
+                sc(ws_wacc.cell(r_wacc, 1), fo=fA, bd=BD, al=Alignment(horizontal='left'))
+                sc(ws_wacc.cell(r_wacc, 2), fo=fA, fi=pWACC_PARAM, bd=BD, al=Alignment(horizontal='right'), nf='0.00%')
+                sc(ws_wacc.cell(r_wacc, 3), fo=fA, bd=BD, al=Alignment(horizontal='center'))
+                sc(ws_wacc.cell(r_wacc, 4), fo=Font(name='Arial', size=8, color=C_MG), bd=BD)
                 r_wacc += 1
 
-            ws_wacc.column_dimensions['A'].width = 60
+            r_wacc += 1
+
+            # Section 2: Peer Analysis
+            ws_wacc.merge_cells(f'A{r_wacc}:D{r_wacc}')
+            sc(ws_wacc.cell(r_wacc, 1), fo=Font(name='Arial', bold=True, size=10, color=C_W),
+               fi=PatternFill('solid', fgColor=C_MB), al=Alignment(horizontal='center'))
+            ws_wacc.cell(r_wacc, 1, '[ 2 ] Peer Analysis')
+            r_wacc += 1
+
+            # 헤더
+            ws_wacc['A' + str(r_wacc)] = 'Metric'
+            ws_wacc['B' + str(r_wacc)] = 'Value'
+            ws_wacc['C' + str(r_wacc)] = 'Format'
+            ws_wacc['D' + str(r_wacc)] = 'Note'
+            for col in ['A', 'B', 'C', 'D']:
+                sc(ws_wacc[col + str(r_wacc)], fo=Font(name='Arial', bold=True, size=9, color=C_W),
+                   fi=PatternFill('solid', fgColor=C_BL), al=Alignment(horizontal='center'), bd=BD)
+            r_wacc += 1
+
+            # Avg Unlevered Beta - 엑셀 수식으로 GPCM 시트 참조
+            row_unlevered_beta = r_wacc
+            beta_label = "5Y Monthly" if beta_type_input == "5Y" else "2Y Weekly"
+            beta_col = 'AH' if beta_type_input == "5Y" else 'AI'  # AH = 컬럼 34 (Unlevered Beta 5Y), AI = 컬럼 35 (Unlevered Beta 2Y)
+            ws_wacc.cell(r_wacc, 1, f'Avg Unlevered Beta ({beta_label})')
+            ws_wacc.cell(r_wacc, 2).value = f'=GPCM!{beta_col}{mean_row}'
+            ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Avg_Unlevered_Beta']:.4f}")
+            ws_wacc.cell(r_wacc, 4, '피어 평균 (GPCM Mean)')
+            sc(ws_wacc.cell(r_wacc, 1), fo=fA, bd=BD)
+            sc(ws_wacc.cell(r_wacc, 2), fo=fA, fi=pWACC_CALC, bd=BD, al=Alignment(horizontal='right'), nf='0.0000')
+            sc(ws_wacc.cell(r_wacc, 3), fo=fA, bd=BD, al=Alignment(horizontal='center'))
+            sc(ws_wacc.cell(r_wacc, 4), fo=Font(name='Arial', size=8, color=C_MG), bd=BD)
+            r_wacc += 1
+
+            # Avg Debt Ratio - 엑셀 수식으로 GPCM 시트 참조
+            row_debt_ratio = r_wacc
+            ws_wacc.cell(r_wacc, 1, 'Avg Debt Ratio (D/V)')
+            ws_wacc.cell(r_wacc, 2).value = f'=GPCM!AG{mean_row}'  # 컬럼 33 (AG) = Debt Ratio (D/V)
+            ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Avg_Debt_Ratio']*100:.1f}%")
+            ws_wacc.cell(r_wacc, 4, '피어 평균 자본구조 (GPCM Mean)')
+            sc(ws_wacc.cell(r_wacc, 1), fo=fA, bd=BD)
+            sc(ws_wacc.cell(r_wacc, 2), fo=fA, fi=pWACC_CALC, bd=BD, al=Alignment(horizontal='right'), nf='0.00%')
+            sc(ws_wacc.cell(r_wacc, 3), fo=fA, bd=BD, al=Alignment(horizontal='center'))
+            sc(ws_wacc.cell(r_wacc, 4), fo=Font(name='Arial', size=8, color=C_MG), bd=BD)
+            r_wacc += 1
+
+            # Target D/E Ratio - 엑셀 수식으로 계산
+            row_de_ratio = r_wacc
+            ws_wacc.cell(r_wacc, 1, 'Target D/E Ratio')
+            ws_wacc.cell(r_wacc, 2).value = f'=B{row_debt_ratio}/(1-B{row_debt_ratio})'
+            ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Target_DE_Ratio']:.4f}")
+            ws_wacc.cell(r_wacc, 4, '= D/V ÷ (1 - D/V)')
+            sc(ws_wacc.cell(r_wacc, 1), fo=fA, bd=BD)
+            sc(ws_wacc.cell(r_wacc, 2), fo=fA, fi=pWACC_CALC, bd=BD, al=Alignment(horizontal='right'), nf='0.0000')
+            sc(ws_wacc.cell(r_wacc, 3), fo=fA, bd=BD, al=Alignment(horizontal='center'))
+            sc(ws_wacc.cell(r_wacc, 4), fo=Font(name='Arial', size=8, color=C_MG), bd=BD)
+            r_wacc += 1
+
+            r_wacc += 1
+
+            # Section 3: Target WACC Calculation
+            ws_wacc.merge_cells(f'A{r_wacc}:D{r_wacc}')
+            sc(ws_wacc.cell(r_wacc, 1), fo=Font(name='Arial', bold=True, size=10, color=C_W),
+               fi=PatternFill('solid', fgColor=C_MB), al=Alignment(horizontal='center'))
+            ws_wacc.cell(r_wacc, 1, '[ 3 ] Target WACC Calculation')
+            r_wacc += 1
+
+            # 헤더
+            ws_wacc['A' + str(r_wacc)] = 'Component'
+            ws_wacc['B' + str(r_wacc)] = 'Value'
+            ws_wacc['C' + str(r_wacc)] = 'Format'
+            ws_wacc['D' + str(r_wacc)] = 'Formula'
+            for col in ['A', 'B', 'C', 'D']:
+                sc(ws_wacc[col + str(r_wacc)], fo=Font(name='Arial', bold=True, size=9, color=C_W),
+                   fi=PatternFill('solid', fgColor=C_BL), al=Alignment(horizontal='center'), bd=BD)
+            r_wacc += 1
+
+            # Row references for formulas
+            row_rf = 6
+            row_mrp = 7
+            row_size_premium = 8
+            row_kd_pretax = 9
+            row_tax = 10
+
+            # Relevered Beta
+            row_relevered_beta = r_wacc
+            ws_wacc.cell(r_wacc, 1, 'Relevered Beta')
+            ws_wacc.cell(r_wacc, 2).value = f'=B{row_unlevered_beta}*(1+(1-B{row_tax})*B{row_de_ratio})'
+            ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Target_Relevered_Beta']:.4f}")
+            ws_wacc.cell(r_wacc, 4, 'Unlevered β × (1 + (1 - Tax) × D/E)')
+            sc(ws_wacc.cell(r_wacc, 1), fo=fA, bd=BD)
+            sc(ws_wacc.cell(r_wacc, 2), fo=fA, fi=pWACC_CALC, bd=BD, al=Alignment(horizontal='right'), nf='0.0000')
+            sc(ws_wacc.cell(r_wacc, 3), fo=fA, bd=BD, al=Alignment(horizontal='center'))
+            sc(ws_wacc.cell(r_wacc, 4), fo=Font(name='Arial', size=8, color=C_MG), bd=BD)
+            r_wacc += 1
+
+            # Ke (Cost of Equity)
+            row_ke = r_wacc
+            ws_wacc.cell(r_wacc, 1, 'Ke (Cost of Equity)')
+            ws_wacc.cell(r_wacc, 2).value = f'=B{row_rf}+B{row_mrp}*B{row_relevered_beta}+B{row_size_premium}'
+            ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Target_Ke']*100:.2f}%")
+            ws_wacc.cell(r_wacc, 4, 'Rf + MRP × Relevered β + Size Premium')
+            sc(ws_wacc.cell(r_wacc, 1), fo=fA, bd=BD)
+            sc(ws_wacc.cell(r_wacc, 2), fo=fA, fi=pWACC_CALC, bd=BD, al=Alignment(horizontal='right'), nf='0.00%')
+            sc(ws_wacc.cell(r_wacc, 3), fo=fA, bd=BD, al=Alignment(horizontal='center'))
+            sc(ws_wacc.cell(r_wacc, 4), fo=Font(name='Arial', size=8, color=C_MG), bd=BD)
+            r_wacc += 1
+
+            # Kd (Aftertax)
+            row_kd_aftertax = r_wacc
+            ws_wacc.cell(r_wacc, 1, 'Kd (Aftertax)')
+            ws_wacc.cell(r_wacc, 2).value = f'=B{row_kd_pretax}*(1-B{row_tax})'
+            ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Kd_Aftertax']*100:.2f}%")
+            ws_wacc.cell(r_wacc, 4, 'Kd (Pretax) × (1 - Tax Rate)')
+            sc(ws_wacc.cell(r_wacc, 1), fo=fA, bd=BD)
+            sc(ws_wacc.cell(r_wacc, 2), fo=fA, fi=pWACC_CALC, bd=BD, al=Alignment(horizontal='right'), nf='0.00%')
+            sc(ws_wacc.cell(r_wacc, 3), fo=fA, bd=BD, al=Alignment(horizontal='center'))
+            sc(ws_wacc.cell(r_wacc, 4), fo=Font(name='Arial', size=8, color=C_MG), bd=BD)
+            r_wacc += 1
+
+            # Equity Weight (E/V)
+            row_equity_weight = r_wacc
+            ws_wacc.cell(r_wacc, 1, 'Equity Weight (E/V)')
+            ws_wacc.cell(r_wacc, 2).value = f'=1-B{row_debt_ratio}'
+            ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Equity_Weight']*100:.1f}%")
+            ws_wacc.cell(r_wacc, 4, '1 - Debt Ratio')
+            sc(ws_wacc.cell(r_wacc, 1), fo=fA, bd=BD)
+            sc(ws_wacc.cell(r_wacc, 2), fo=fA, fi=pWACC_CALC, bd=BD, al=Alignment(horizontal='right'), nf='0.00%')
+            sc(ws_wacc.cell(r_wacc, 3), fo=fA, bd=BD, al=Alignment(horizontal='center'))
+            sc(ws_wacc.cell(r_wacc, 4), fo=Font(name='Arial', size=8, color=C_MG), bd=BD)
+            r_wacc += 1
+
+            # Debt Weight (D/V)
+            row_debt_weight = r_wacc
+            ws_wacc.cell(r_wacc, 1, 'Debt Weight (D/V)')
+            ws_wacc.cell(r_wacc, 2).value = f'=B{row_debt_ratio}'
+            ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Debt_Weight']*100:.1f}%")
+            ws_wacc.cell(r_wacc, 4, 'Debt Ratio')
+            sc(ws_wacc.cell(r_wacc, 1), fo=fA, bd=BD)
+            sc(ws_wacc.cell(r_wacc, 2), fo=fA, fi=pWACC_CALC, bd=BD, al=Alignment(horizontal='right'), nf='0.00%')
+            sc(ws_wacc.cell(r_wacc, 3), fo=fA, bd=BD, al=Alignment(horizontal='center'))
+            sc(ws_wacc.cell(r_wacc, 4), fo=Font(name='Arial', size=8, color=C_MG), bd=BD)
+            r_wacc += 1
+
+            # 구분선
+            ws_wacc.cell(r_wacc, 1, '━━━━━━━━━━━━')
+            ws_wacc.cell(r_wacc, 2, None)
+            ws_wacc.cell(r_wacc, 3, '━━━━━━━━━━━━')
+            ws_wacc.cell(r_wacc, 4, '━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+            for col_idx in range(1, 5):
+                sc(ws_wacc.cell(r_wacc, col_idx), bd=BD)
+            r_wacc += 1
+
+            # WACC (최종 결과)
+            row_wacc_final = r_wacc
+            ws_wacc.cell(r_wacc, 1, 'WACC')
+            ws_wacc.cell(r_wacc, 2).value = f'=B{row_equity_weight}*B{row_ke}+B{row_debt_weight}*B{row_kd_aftertax}'
+            ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Target_WACC']*100:.2f}%")
+            ws_wacc.cell(r_wacc, 4, '(E/V) × Ke + (D/V) × Kd (Aftertax)')
+            sc(ws_wacc.cell(r_wacc, 1), fo=Font(name='Arial', bold=True, size=10), bd=BD)
+            sc(ws_wacc.cell(r_wacc, 2), fo=Font(name='Arial', bold=True, size=10), fi=pWACC_RESULT,
+               bd=BD, al=Alignment(horizontal='right'), nf='0.00%')
+            sc(ws_wacc.cell(r_wacc, 3), fo=Font(name='Arial', bold=True, size=10), bd=BD, al=Alignment(horizontal='center'))
+            sc(ws_wacc.cell(r_wacc, 4), fo=Font(name='Arial', size=8, color=C_MG, italic=True), bd=BD)
+            r_wacc += 1
+
+            # 열 너비 조정
+            ws_wacc.column_dimensions['A'].width = 25
+            ws_wacc.column_dimensions['B'].width = 12
+            ws_wacc.column_dimensions['C'].width = 15
+            ws_wacc.column_dimensions['D'].width = 40
+
+            ws_wacc.freeze_panes = 'A4'
+
+            # Named Range 정의 (다른 시트에서 참조 가능)
+            from openpyxl.workbook.defined_name import DefinedName
+
+            wb.defined_names['Target_WACC'] = DefinedName('Target_WACC', attr_text=f"'WACC_Calculation'!$B${row_wacc_final}")
+            wb.defined_names['Target_Rf'] = DefinedName('Target_Rf', attr_text="'WACC_Calculation'!$B$6")
+            wb.defined_names['Target_MRP'] = DefinedName('Target_MRP', attr_text="'WACC_Calculation'!$B$7")
+            wb.defined_names['Target_Size_Premium'] = DefinedName('Target_Size_Premium', attr_text="'WACC_Calculation'!$B$8")
+            wb.defined_names['Target_Kd_Pretax'] = DefinedName('Target_Kd_Pretax', attr_text="'WACC_Calculation'!$B$9")
+            wb.defined_names['Target_Tax_Rate'] = DefinedName('Target_Tax_Rate', attr_text="'WACC_Calculation'!$B$10")
+
+            # 참고용 셀 주소 표시
+            ws_wacc['A' + str(r_wacc + 2)] = '[ Named Ranges for Reference ]'
+            sc(ws_wacc.cell(r_wacc + 2, 1), fo=Font(name='Arial', bold=True, size=9, color=C_MG, italic=True))
+            ws_wacc['A' + str(r_wacc + 3)] = '다른 시트에서 참조: =Target_WACC, =Target_Rf 등'
+            sc(ws_wacc.cell(r_wacc + 3, 1), fo=Font(name='Arial', size=8, color=C_MG))
 
             # Sheet 1: GPCM (맨 앞)
             ws = wb.create_sheet('GPCM')
@@ -1111,12 +1530,12 @@ if run_btn:
             # 시트 순서: GPCM, WACC_Calculation, Beta_Calculation, BS_Full, PL_Data, Market_Cap, LTM_Calc
             wb.move_sheet('WACC_Calculation', offset=-4)  # GPCM 다음 (index 1)
             wb.move_sheet('Beta_Calculation', offset=-3)  # WACC 다음 (index 2)
-            TOTAL_COLS = 34
+            TOTAL_COLS = 35
             ws.merge_cells(f'A1:{get_column_letter(TOTAL_COLS)}1'); ws['A1'] = "GPCM Valuation Summary with Beta Analysis"; sc(ws['A1'], fo=fT)
             ws.merge_cells(f'A2:{get_column_letter(TOTAL_COLS)}2'); ws['A2'] = f"Base: {base_period_str} | Unit: 억원 | EV = MCap + IBD − Cash + NCI − NOA"; sc(ws['A2'], fo=fS)
             add_gpcm_section_row(ws)
-            headers = ['Company','Ticker','Base Date','Curr','PL Source','Cash','IBD','NOA','Net Debt','NCI','Equity','EV','Revenue','EBIT','D&A','EBITDA','NI','Price','Shares','Mkt Cap','EV/EBITDA','EV/EBIT','PER','PBR','PSR','β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','Debt Ratio','Unlevered β 5Y','Unlevered β 2Y']
-            widths = [18, 10, 11, 6, 13, 13, 13, 13, 13, 12, 13, 15, 13, 13, 10, 13, 13, 12, 15, 15, 12, 12, 10, 10, 10, 10, 10, 10, 10, 13, 9, 10, 12, 12]
+            headers = ['Company','Ticker','Base Date','Curr','PL Source','Cash','IBD','NOA','Net Debt','NCI','Equity','EV','Revenue','EBIT','D&A','EBITDA','NI','Price','Shares','Mkt Cap','EV/EBITDA','EV/EBIT','PER','PBR','PSR','β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','D/E Ratio','Debt Ratio (D/V)','Unlevered β 5Y','Unlevered β 2Y']
+            widths = [18, 10, 11, 6, 13, 13, 13, 13, 13, 12, 13, 15, 13, 13, 10, 13, 13, 12, 15, 15, 12, 12, 10, 10, 10, 10, 10, 10, 10, 13, 9, 10, 10, 12, 12]
             header_row = 5
             for i, (h, w) in enumerate(zip(headers, widths), 1):
                 ws.column_dimensions[get_column_letter(i)].width = w
@@ -1179,16 +1598,26 @@ if run_btn:
                     sc(ws.cell(r,29), fo=fLINK, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
                 else:
                     ws.cell(r,29, ''); sc(ws.cell(r,29), fo=fA, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
-                ws.cell(r,30, 0); sc(ws.cell(r,30), fo=fA, fi=bg, al=aR, nf=NB, bd=BD)  # Pretax Inc (PL에서 가져와야 함)
-                ws.cell(r,31, 0.231); sc(ws.cell(r,31), fo=fA, fi=bg, al=aR, nf=NF_PCT, bd=BD)  # Tax Rate (기본값)
-                # Debt Ratio = IBD / (Mkt Cap + IBD + NCI)
-                ws.cell(r,32).value = f'=IF(T{r}+G{r}+J{r}>0, G{r}/(T{r}+G{r}+J{r}), 0)'; sc(ws.cell(r,32), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
-                # Unlevered Beta 5Y = β 5Y Adj / (1 + (1 - Tax Rate) × (IBD / Equity))
-                # 컬럼 27 (AA) = β 5Y Adj, 컬럼 31 (AE) = Tax Rate, 컬럼 7 (G) = IBD, 컬럼 11 (K) = Equity
-                ws.cell(r,33).value = f'=IF(AND({get_column_letter(27)}{r}<>"", K{r}>0), {get_column_letter(27)}{r}/(1+(1-{get_column_letter(31)}{r})*(G{r}/K{r})), "")'; sc(ws.cell(r,33), fo=fFRM, fi=pBETA, al=aR, nf=NF_BETA, bd=BD)
-                # Unlevered Beta 2Y
-                # 컬럼 29 (AC) = β 2Y Adj
-                ws.cell(r,34).value = f'=IF(AND({get_column_letter(29)}{r}<>"", K{r}>0), {get_column_letter(29)}{r}/(1+(1-{get_column_letter(31)}{r})*(G{r}/K{r})), "")'; sc(ws.cell(r,34), fo=fFRM, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
+
+                # 컬럼 30: Pretax Inc (PL에서 가져와야 함)
+                ws.cell(r,30, 0); sc(ws.cell(r,30), fo=fA, fi=bg, al=aR, nf=NB, bd=BD)
+
+                # 컬럼 31: Tax Rate (기본값)
+                ws.cell(r,31, 0.231); sc(ws.cell(r,31), fo=fA, fi=bg, al=aR, nf=NF_PCT, bd=BD)
+
+                # 컬럼 32: D/E Ratio = IBD / (Mkt Cap + NCI)
+                ws.cell(r,32).value = f'=IF(T{r}+J{r}>0, G{r}/(T{r}+J{r}), 0)'; sc(ws.cell(r,32), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
+
+                # 컬럼 33: Debt Ratio (D/V) = IBD / (Mkt Cap + IBD + NCI)
+                ws.cell(r,33).value = f'=IF(T{r}+G{r}+J{r}>0, G{r}/(T{r}+G{r}+J{r}), 0)'; sc(ws.cell(r,33), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
+
+                # 컬럼 34: Unlevered Beta 5Y = β 5Y Adj / (1 + (1 - Tax Rate) × D/E Ratio)
+                # 컬럼 27 (AA) = β 5Y Adj, 컬럼 31 (AE) = Tax Rate, 컬럼 32 (AF) = D/E Ratio
+                ws.cell(r,34).value = f'=IF(AA{r}>0, AA{r}/(1+(1-AE{r})*AF{r}), "")'; sc(ws.cell(r,34), fo=fFRM, fi=pBETA, al=aR, nf=NF_BETA, bd=BD)
+
+                # 컬럼 35: Unlevered Beta 2Y = β 2Y Adj / (1 + (1 - Tax Rate) × D/E Ratio)
+                # 컬럼 29 (AC) = β 2Y Adj, 컬럼 31 (AE) = Tax Rate, 컬럼 32 (AF) = D/E Ratio
+                ws.cell(r,35).value = f'=IF(AC{r}>0, AC{r}/(1+(1-AE{r})*AF{r}), "")'; sc(ws.cell(r,35), fo=fFRM, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
                 r += 1
             r_end = r - 1; r += 1
             for stat, fn in [('Mean','AVERAGE'), ('Median','MEDIAN'), ('Max','MAX'), ('Min','MIN')]:
@@ -1198,19 +1627,19 @@ if run_btn:
                     col = get_column_letter(c)
                     ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "N/M")'
                     sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NF_X, bd=BD)
-                # Beta & Risk (26-34)
-                for c in range(26, 35):
+                # Beta & Risk (26-35)
+                for c in range(26, 36):
                     col = get_column_letter(c)
-                    if c in [26, 27, 28, 29, 33, 34]:  # Beta 컬럼
+                    if c in [26, 27, 28, 29, 34, 35]:  # Beta 컬럼 (34=Unlevered β 5Y, 35=Unlevered β 2Y)
                         ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "")'
                         sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NF_BETA, bd=BD)
                     elif c == 31:  # Tax Rate
                         ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "")'
                         sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NF_PCT, bd=BD)
-                    elif c == 32:  # Debt Ratio
+                    elif c in [32, 33]:  # D/E Ratio, Debt Ratio (D/V)
                         ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "")'
                         sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NF_PCT, bd=BD)
-                    else:
+                    else:  # Pretax Inc (30)
                         ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "")'
                         sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NB, bd=BD)
                 r += 1
