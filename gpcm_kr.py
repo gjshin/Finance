@@ -291,9 +291,18 @@ def match_bs_ev_component(account_nm, account_id):
     return None, None
 
 # --- PL Logic ---
-PL_REVENUE = {'매출액', '수익(매출액)', '수익(매출)', '영업수익'}
+PL_REVENUE = {
+    '매출액', '수익(매출액)', '수익(매출)', '영업수익',
+    '수익', '매출', '총매출액', '총수익', '영업수익',
+    '매출액합계', '수익합계', '총영업수익'
+}
 PL_EBIT    = {'영업이익', '영업이익(손실)', '영업손실', '영업손익'}
 PL_NI      = {'당기순이익', '당기순이익(손실)', '당기순손실', '분기순이익', '분기순이익(손실)', '분기순손실', '반기순이익', '반기순이익(손실)', '반기순손실', '연결당기순이익', '연결당기순이익(손실)', '연결당기순손실'}
+PL_PRETAX_INCOME = {
+    '법인세비용차감전순이익', '법인세비용차감전순이익(손실)', '법인세차감전순이익',
+    '법인세비용차감전계속사업이익', '법인세비용차감전이익', '세전순이익',
+    '법인세비용차감전순손실', '세전이익', '법인세차감전이익'
+}
 
 def _norm_pl(s):
     s = "" if s is None else str(s).strip()
@@ -304,6 +313,7 @@ def match_pl_core_only(account_nm):
     if a in PL_REVENUE: return 'Revenue'
     if a in PL_EBIT:    return 'EBIT'
     if a in PL_NI:      return 'NI'
+    if a in PL_PRETAX_INCOME: return 'Pretax_Income'
     return None
 
 def _parse_amount(x):
@@ -723,9 +733,9 @@ if run_btn:
                     df_is = filter_income_statement(df_pl_raw)
                     if df_is is None or df_is.empty: continue
 
-                    wanted = {'Revenue', 'EBIT', 'NI'}
+                    wanted = {'Revenue', 'EBIT', 'NI', 'Pretax_Income'}
                     picked = set()
-                    
+
                     for _, row in df_is.iterrows():
                         acct = str(row.get('account_nm', '')).strip()
                         calc_key = match_pl_core_only(acct)
@@ -741,7 +751,7 @@ if run_btn:
                             'Role': role, 'PL_Source': pl_src, 'account_nm': acct,
                             'calc_key': calc_key, 'Amount_100M': amt_100m,
                         })
-                        
+
                         # 화면 출력용 LTM 계산 (단순 합산 로직이 필요하므로 여기서는 각 Role별 값을 저장하고 나중에 합산해야 함)
                         # 여기서는 구조상 복잡해지므로 DataFrame 생성 시 처리
                         picked.add(calc_key)
@@ -833,13 +843,13 @@ if run_btn:
                 ltm_res = []
                 for ticker in target_code_list:
                     d_sub = df_pl_all[df_pl_all['Ticker'] == ticker]
-                    metrics = {'Revenue':0, 'EBIT':0, 'NI':0}
+                    metrics = {'Revenue':0, 'EBIT':0, 'NI':0, 'Pretax_Income':0}
                     for k in metrics.keys():
                         curr_cum = d_sub[(d_sub['calc_key']==k) & (d_sub['Role']=='current_cum')]['Amount_100M'].sum()
                         prior_ann = d_sub[(d_sub['calc_key']==k) & (d_sub['Role']=='prior_annual')]['Amount_100M'].sum()
                         prior_same = d_sub[(d_sub['calc_key']==k) & (d_sub['Role']=='prior_same_q')]['Amount_100M'].sum()
                         annual_only = d_sub[(d_sub['calc_key']==k) & (d_sub['Role']=='annual')]['Amount_100M'].sum()
-                        
+
                         if base_qtr == '4Q':
                             metrics[k] = annual_only
                         else:
@@ -848,6 +858,9 @@ if run_btn:
                     # 기본 정보 병합
                     base_info = next((item for item in screen_summary_data if item["Ticker"] == ticker), None)
                     if base_info:
+                        # Pretax_Income을 temp_metrics에 저장 (Beta 계산에서 사용)
+                        base_info['Pretax_Income'] = metrics['Pretax_Income']
+
                         ev = base_info['Market_Cap'] + base_info['IBD'] - base_info['Cash'] + base_info['NCI'] - base_info['NOA']
                         ltm_res.append({
                             'Company': base_info['Company'],
@@ -892,6 +905,7 @@ if run_btn:
                 ibd = comp_data.get('IBD', 0)
                 nci = comp_data.get('NCI', 0)
                 equity = comp_data.get('Equity', 0)
+                pretax_income = comp_data.get('Pretax_Income', 0)
 
                 # Debt Ratio (D/V) = IBD / (Mkt Cap + IBD + NCI)
                 total_value = mkt_cap + ibd + nci
@@ -902,6 +916,10 @@ if run_btn:
                 # D/E Ratio = IBD / (Mkt Cap + NCI)
                 equity_value = mkt_cap + nci
                 de_ratio = ibd / equity_value if equity_value > 0 else 0
+
+                # 한계세율 계산 (2025년 한국 법인세, 지방세 포함)
+                tax_rate = get_korean_marginal_tax_rate(pretax_income)
+                comp_data['Tax_Rate'] = tax_rate  # 저장 (나중에 Excel 출력용)
 
                 # Beta 계산 (간단히 수익률 기반)
                 stock_monthly_5y = comp_data.get('Stock_Monthly_Prices_5Y')
@@ -925,7 +943,7 @@ if run_btn:
                                 beta_adj = (2/3) * beta_raw + (1/3) * 1
 
                                 # Unlevered Beta = Adj Beta / (1 + (1 - Tax Rate) × D/E)
-                                tax_rate = 0.231  # 기본 세율
+                                # tax_rate는 이미 위에서 get_korean_marginal_tax_rate()로 계산됨
                                 if not np.isnan(beta_adj) and equity > 0:
                                     unlevered_beta_5y = beta_adj / (1 + (1 - tax_rate) * de_ratio)
                                     avg_unlevered_betas_5y.append(unlevered_beta_5y)
@@ -948,7 +966,7 @@ if run_btn:
                                 beta_adj = (2/3) * beta_raw + (1/3) * 1
 
                                 # Unlevered Beta
-                                tax_rate = 0.231
+                                # tax_rate는 이미 위에서 get_korean_marginal_tax_rate()로 계산됨
                                 if not np.isnan(beta_adj) and equity > 0:
                                     unlevered_beta_2y = beta_adj / (1 + (1 - tax_rate) * de_ratio)
                                     avg_unlevered_betas_2y.append(unlevered_beta_2y)
@@ -1060,13 +1078,13 @@ if run_btn:
 
             # Sheet 4: LTM_Calc
             ws_ltm = wb.create_sheet('LTM_Calc')
-            add_sheet_title_block(ws_ltm,"LTM_Calc (Revenue/EBIT/NI)",f"Base: {base_period_str} | Unit: 억원",8)
+            add_sheet_title_block(ws_ltm,"LTM_Calc (Revenue/EBIT/NI/Pretax Inc)",f"Base: {base_period_str} | Unit: 억원",8)
             cols = [('Company',15), ('Ticker',10), ('Calc_Key',12),('Current_Cum(A)',15), ('Prior_Annual(B)',15), ('Prior_SameQ(C)',15), ('LTM_Value',15), ('Note',10)]
             header_row = 4
             ws_ltm.append([]); ws_ltm.append([c[0] for c in cols])
             for i, (_, w) in enumerate(cols): ws_ltm.column_dimensions[get_column_letter(i+1)].width = w; sc(ws_ltm.cell(header_row, i+1), fo=fH, fi=pH, al=aC, bd=BD)
             r = header_row + 1
-            ltm_keys = ['Revenue', 'EBIT', 'NI']
+            ltm_keys = ['Revenue', 'EBIT', 'NI', 'Pretax_Income']
             for ticker in target_code_list:
                 comp_name = ticker_to_name.get(ticker, ticker)
                 for k in ltm_keys:
@@ -1599,11 +1617,13 @@ if run_btn:
                 else:
                     ws.cell(r,29, ''); sc(ws.cell(r,29), fo=fA, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
 
-                # 컬럼 30: Pretax Inc (PL에서 가져와야 함)
-                ws.cell(r,30, 0); sc(ws.cell(r,30), fo=fA, fi=bg, al=aR, nf=NB, bd=BD)
+                # 컬럼 30: Pretax Inc (LTM_Calc에서 참조)
+                ws.cell(r,30).value = f'=SUMIFS(LTM_Calc!G:G, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, "Pretax_Income")'; sc(ws.cell(r,30), fo=fLINK, fi=bg, al=aR, nf=NB, bd=BD)
 
-                # 컬럼 31: Tax Rate (기본값)
-                ws.cell(r,31, 0.231); sc(ws.cell(r,31), fo=fA, fi=bg, al=aR, nf=NF_PCT, bd=BD)
+                # 컬럼 31: Tax Rate (한국 법인세 한계세율, 2025년 기준, 지방세 포함)
+                # 2억 이하: 9.9%, 2~200억: 20.9%, 200~3000억: 23.1%, 3000억 초과: 26.4%
+                ws.cell(r,31).value = f'=IF(AD{r}<=2, 0.099, IF(AD{r}<=200, 0.209, IF(AD{r}<=3000, 0.231, 0.264)))'
+                sc(ws.cell(r,31), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
 
                 # 컬럼 32: D/E Ratio = IBD / (Mkt Cap + NCI)
                 ws.cell(r,32).value = f'=IF(T{r}+J{r}>0, G{r}/(T{r}+J{r}), 0)'; sc(ws.cell(r,32), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
