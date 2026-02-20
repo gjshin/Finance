@@ -473,9 +473,9 @@ def generate_excel_report(df, all_years_list):
 
         ws.cell(summary_start + 1, 1, "Metric").fill = header_fill
         ws.cell(summary_start + 1, 1).font = header_font
-        ws.cell(summary_start + 1, 2, "Formula").fill = header_fill
+        ws.cell(summary_start + 1, 2, "Formula (Display)").fill = header_fill
         ws.cell(summary_start + 1, 2).font = header_font
-        ws.cell(summary_start + 1, 3, "Value").fill = header_fill
+        ws.cell(summary_start + 1, 3, "Calculated Value").fill = header_fill
         ws.cell(summary_start + 1, 3).font = header_font
         ws.cell(summary_start + 1, 4, "Description").fill = header_fill
         ws.cell(summary_start + 1, 4).font = header_font
@@ -483,21 +483,32 @@ def generate_excel_report(df, all_years_list):
         first_data_row = sample_start + 2
         last_data_row = sample_start + 1 + len(sample_df)
 
+        # Note: dr for each row will be:
+        # i=0 (Total Qty): dr = summary_start + 2
+        # i=1 (Total Rev): dr = summary_start + 3
+        # i=2 (Avg ASP): dr = summary_start + 4
+        # i=3 (Weighted ASP): dr = summary_start + 5
+
         agg_examples = [
             ("Total Quantity", f"=SUM(D{first_data_row}:D{last_data_row})", "수량 합계"),
             ("Total Revenue", f"=SUM(E{first_data_row}:E{last_data_row})", "매출 합계"),
-            ("Average ASP", f"=AVERAGE(F{first_data_row}:F{last_data_row})", "평균 단가"),
-            ("Weighted ASP", f"=E{summary_start+2}/D{summary_start+2}", "매출÷수량 방식의 가중평균 단가"),
+            ("Average ASP", f"=AVERAGE(F{first_data_row}:F{last_data_row})", "단순 평균 단가"),
+            ("Weighted ASP", f"=C{summary_start+3}/C{summary_start+2}", "가중 평균 단가 (Total Revenue ÷ Total Quantity)"),
         ]
 
         for i, (metric, formula, desc) in enumerate(agg_examples):
             dr = summary_start + 2 + i
             ws.cell(dr, 1, metric).font = bold_font
-            formula_cell = ws.cell(dr, 2, formula)
-            formula_cell.font = formula_font
+
+            # Column 2: Display formula as TEXT (not executable)
+            formula_text_cell = ws.cell(dr, 2, formula)
+            formula_text_cell.font = formula_font
+
+            # Column 3: Actually EXECUTE the formula to show result
             value_cell = ws.cell(dr, 3)
-            value_cell.value = formula
+            value_cell.value = formula  # This will be executed as a formula
             value_cell.number_format = '#,##0'
+
             ws.cell(dr, 4, desc).font = explain_font
 
         # Section 3: Data Source Mapping
@@ -538,8 +549,14 @@ def generate_excel_report(df, all_years_list):
         auto_width(ws)
     
     # ============ Sheet Creation ============
-    
-    # Sheet 1: Overview (Company-Wide)
+
+    # Prepare filtered data
+    df_all = df[df['Year'].isin(all_years_list)]
+
+    # Sheet 1: Validation_Guide (First sheet for user reference)
+    create_validation_sheet(df_all)
+
+    # Sheet 2: Overview (Company-Wide)
     ws_ov = wb.create_sheet("Overview")
     df_overview = df[df['Year'].isin(all_years_list)]
     ov_grp = df_overview.groupby('Category').agg({'Revenue': 'sum', 'Quantity': 'sum'}).reset_index()
@@ -592,9 +609,8 @@ def generate_excel_report(df, all_years_list):
         c = ws_ov.cell(dr, 5, row['ASP']); c.number_format = '#,##0'
     
     auto_width(ws_ov)
-    
-    # Sheets 2-3: All Categories
-    df_all = df[df['Year'].isin(all_years_list)]
+
+    # Sheets 3-4: All Categories
     create_growth_share_sheet("All_Growth_Share", df_all, "All Categories")
     create_timeseries_sheet("All_TimeSeries", df_all, "All Categories")
     
@@ -655,9 +671,6 @@ def generate_excel_report(df, all_years_list):
         cat_df = cat_df[cat_df['Year'].isin(all_years_list)]
         sheet_prefix = cat.replace(' ', '')
         create_outlier_sheet(f"Outlier_{sheet_prefix}", cat_df, cat)
-
-    # Validation Guide Sheet
-    create_validation_sheet(df_all)
 
     # Raw Data Sheet
     ws_raw = wb.create_sheet("Raw_Data")
