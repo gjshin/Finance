@@ -545,7 +545,11 @@ def main():
         return 
     df = load_all_data(uploaded_file)
     if df.empty: return
-    
+
+    # [엑셀 리포트 생성 - 전체 데이터 기준, 1회만 실행]
+    all_years_list = sorted(df['Year'].unique())
+    excel_data_full = generate_excel_report(df, df, all_years_list, "All Categories", "All Products")
+
     # [사이드바 필터]
     st.sidebar.header("🔍 Global Filters")
     
@@ -586,20 +590,17 @@ def main():
     if sel_prod != "All Products":
         filtered_df = filtered_df[filtered_df['Product_Group'] == sel_prod]
     
-    # Excel Export Button
+    # Excel Export Button (전체 데이터 리포트, 필터 무관)
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 📥 Excel Export")
-    if not filtered_df.empty:
-        filename = f"Sales_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        excel_data = generate_excel_report(filtered_df, df, selected_years, sel_cat, sel_prod)
-        st.sidebar.download_button(
-            label="📥 Download Excel Report",
-            data=excel_data,
-            file_name=filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    else:
-        st.sidebar.info("필터된 데이터가 없어 리포트를 생성할 수 없습니다.")
+    st.sidebar.info("💡 리포트는 필터와 무관하게 **전체 데이터**를 포함합니다.")
+    filename = f"Sales_Report_Full_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    st.sidebar.download_button(
+        label="📥 Download Full Excel Report",
+        data=excel_data_full,
+        file_name=filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
     
     # KPI Summary
     st.markdown("### 📊 Executive Summary (Filtered Scope)")
