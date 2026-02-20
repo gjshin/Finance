@@ -360,27 +360,27 @@ def generate_excel_report(df, all_years_list):
     
     def create_outlier_sheet(ws_name, data_df, category_name):
         ws = wb.create_sheet(ws_name)
-        
+
         stats = data_df.groupby('Product_Group')['ASP'].agg(['count', 'mean', 'min', 'max']).reset_index()
         stats.columns = ['Product_Group', 'Count', 'Mean ASP', 'Min ASP', 'Max ASP']
-        
+
         add_section_title(ws, f"1. [{category_name}] ASP Statistics by Product Group", 1, 5)
         for col, h in enumerate(stats.columns.tolist(), 1):
             cell = ws.cell(2, col, h)
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = center_align
-        
+
         for i, (_, row) in enumerate(stats.iterrows()):
             dr = 3 + i
             ws.cell(dr, 1, row['Product_Group'])
             ws.cell(dr, 2, int(row['Count']))
             for col, key in [(3, 'Mean ASP'), (4, 'Min ASP'), (5, 'Max ASP')]:
                 c = ws.cell(dr, col, row[key]); c.number_format = '#,##0'
-        
+
         outliers = data_df.groupby('Product_Group', group_keys=False).apply(lambda x: detect_outliers_iqr(x))
         outlier_view = outliers[['Date', 'Category', 'Product_Group', 'Sub_Product', 'Quantity', 'Revenue', 'ASP']].sort_values('ASP', ascending=False).head(50) if not outliers.empty else pd.DataFrame()
-        
+
         out_start = len(stats) + 4
         add_section_title(ws, f"2. [{category_name}] Top 50 ASP Outliers (IQR Factor=1.5)", out_start, 7)
         if not outlier_view.empty:
@@ -390,7 +390,7 @@ def generate_excel_report(df, all_years_list):
                 cell.fill = header_fill
                 cell.font = header_font
                 cell.alignment = center_align
-            
+
             for i, (_, row) in enumerate(outlier_view.iterrows()):
                 dr = out_start + 2 + i
                 ws.cell(dr, 1, row['Date'].strftime('%Y-%m-%d') if hasattr(row['Date'], 'strftime') else str(row['Date']))
@@ -402,7 +402,139 @@ def generate_excel_report(df, all_years_list):
                 c = ws.cell(dr, 7, row['ASP']); c.number_format = '#,##0'
         else:
             ws.cell(out_start+1, 1, "이상치 없음")
-        
+
+        auto_width(ws)
+
+    def create_validation_sheet(data_df):
+        """Create validation guide sheet with calculation methodology and sample validations"""
+        ws = wb.create_sheet("Validation_Guide")
+
+        # Styling for explanation text
+        explain_font = Font(name="Calibri", size=10, italic=True)
+        formula_font = Font(name="Calibri", size=10, color="0066CC")
+
+        # Section 1: Calculation Methodology
+        add_section_title(ws, "📋 1. 계산 방법론 (Calculation Methodology)", 1, 5)
+
+        methodologies = [
+            ("ASP (Average Selling Price)", "Revenue ÷ Quantity", "개별 거래의 단가"),
+            ("Revenue Share", "개별 Revenue ÷ Total Revenue × 100%", "매출 점유율"),
+            ("Quantity Share", "개별 Quantity ÷ Total Quantity × 100%", "수량 점유율"),
+            ("YoY Growth", "(현재년도 - 전년도) ÷ 전년도 × 100%", "전년 대비 성장률"),
+            ("Volume Effect", "(현재 Qty - 이전 Qty) × 이전 ASP", "수량 변화 영향"),
+            ("Price Effect", "(현재 ASP - 이전 ASP) × 현재 Qty", "가격 변화 영향"),
+            ("Mix Effect", "Total Change - Volume Effect - Price Effect", "믹스 변화 영향"),
+        ]
+
+        headers = ["Metric", "Formula", "Description"]
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(2, col, h)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+
+        for i, (metric, formula, desc) in enumerate(methodologies):
+            dr = 3 + i
+            ws.cell(dr, 1, metric).font = bold_font
+            cell = ws.cell(dr, 2, formula)
+            cell.font = formula_font
+            ws.cell(dr, 3, desc).font = explain_font
+
+        # Section 2: Sample Validation with Formulas
+        sample_start = len(methodologies) + 5
+        add_section_title(ws, "✅ 2. 샘플 검증 예시 (Sample Validation)", sample_start, 6)
+
+        # Get sample data for validation
+        sample_df = data_df.head(10).copy()
+
+        val_headers = ["Date", "Category", "Product_Group", "Quantity", "Revenue", "ASP (Formula)"]
+        for col, h in enumerate(val_headers, 1):
+            cell = ws.cell(sample_start + 1, col, h)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+
+        for i, (_, row) in enumerate(sample_df.iterrows()):
+            dr = sample_start + 2 + i
+            ws.cell(dr, 1, row['Date'].strftime('%Y-%m-%d') if hasattr(row['Date'], 'strftime') else str(row['Date']))
+            ws.cell(dr, 2, row['Category'])
+            ws.cell(dr, 3, row['Product_Group'])
+            c = ws.cell(dr, 4, row['Quantity']); c.number_format = '#,##0'
+            c = ws.cell(dr, 5, row['Revenue']); c.number_format = '#,##0'
+            # ASP with formula
+            asp_cell = ws.cell(dr, 6)
+            asp_cell.value = f"=E{dr}/D{dr}"
+            asp_cell.number_format = '#,##0'
+            asp_cell.font = formula_font
+
+        # Add a summary calculation example
+        summary_start = sample_start + len(sample_df) + 4
+        add_section_title(ws, "📊 3. 집계 계산 예시 (Aggregation Example)", summary_start, 4)
+
+        ws.cell(summary_start + 1, 1, "Metric").fill = header_fill
+        ws.cell(summary_start + 1, 1).font = header_font
+        ws.cell(summary_start + 1, 2, "Formula").fill = header_fill
+        ws.cell(summary_start + 1, 2).font = header_font
+        ws.cell(summary_start + 1, 3, "Value").fill = header_fill
+        ws.cell(summary_start + 1, 3).font = header_font
+        ws.cell(summary_start + 1, 4, "Description").fill = header_fill
+        ws.cell(summary_start + 1, 4).font = header_font
+
+        first_data_row = sample_start + 2
+        last_data_row = sample_start + 1 + len(sample_df)
+
+        agg_examples = [
+            ("Total Quantity", f"=SUM(D{first_data_row}:D{last_data_row})", "수량 합계"),
+            ("Total Revenue", f"=SUM(E{first_data_row}:E{last_data_row})", "매출 합계"),
+            ("Average ASP", f"=AVERAGE(F{first_data_row}:F{last_data_row})", "평균 단가"),
+            ("Weighted ASP", f"=E{summary_start+2}/D{summary_start+2}", "매출÷수량 방식의 가중평균 단가"),
+        ]
+
+        for i, (metric, formula, desc) in enumerate(agg_examples):
+            dr = summary_start + 2 + i
+            ws.cell(dr, 1, metric).font = bold_font
+            formula_cell = ws.cell(dr, 2, formula)
+            formula_cell.font = formula_font
+            value_cell = ws.cell(dr, 3)
+            value_cell.value = formula
+            value_cell.number_format = '#,##0'
+            ws.cell(dr, 4, desc).font = explain_font
+
+        # Section 3: Data Source Mapping
+        mapping_start = summary_start + len(agg_examples) + 4
+        add_section_title(ws, "🗂️ 4. 데이터 소스 매핑 (Data Source Mapping)", mapping_start, 3)
+
+        map_headers = ["Sheet Name", "Data Source", "Aggregation Level"]
+        for col, h in enumerate(map_headers, 1):
+            cell = ws.cell(mapping_start + 1, col, h)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+
+        mappings = [
+            ("Overview", "Raw_Data (전체)", "Category"),
+            ("All_Growth_Share", "Raw_Data (전체)", "Year, Product_Group"),
+            ("All_TimeSeries", "Raw_Data (전체)", "Month/Quarter, Product_Group"),
+            ("Bumper_Growth", "Raw_Data (Category=Bumper)", "Year, Product_Group"),
+            ("SillSide_Growth", "Raw_Data (Category=Sill side)", "Year, Product_Group"),
+            ("Carrier_Growth", "Raw_Data (Category=Carrier)", "Year, Product_Group"),
+            ("PQ_Bridge", "Raw_Data (연도별)", "Bridge 분석 (Volume/Price/Mix)"),
+            ("Outlier_*", "Raw_Data (카테고리별)", "IQR Method (Factor=1.5)"),
+        ]
+
+        for i, (sheet, source, agg) in enumerate(mappings):
+            dr = mapping_start + 2 + i
+            ws.cell(dr, 1, sheet).font = bold_font
+            ws.cell(dr, 2, source)
+            ws.cell(dr, 3, agg).font = explain_font
+
+        # Add note
+        note_start = mapping_start + len(mappings) + 3
+        note_cell = ws.cell(note_start, 1)
+        note_cell.value = "💡 참고: 모든 집계는 Python pandas를 통해 계산되어 값으로 저장됩니다. 이 시트의 샘플 수식은 검증 목적으로만 제공됩니다."
+        note_cell.font = Font(name="Calibri", size=9, italic=True, color="666666")
+        ws.merge_cells(start_row=note_start, start_column=1, end_row=note_start, end_column=6)
+
         auto_width(ws)
     
     # ============ Sheet Creation ============
@@ -523,7 +655,10 @@ def generate_excel_report(df, all_years_list):
         cat_df = cat_df[cat_df['Year'].isin(all_years_list)]
         sheet_prefix = cat.replace(' ', '')
         create_outlier_sheet(f"Outlier_{sheet_prefix}", cat_df, cat)
-    
+
+    # Validation Guide Sheet
+    create_validation_sheet(df_all)
+
     # Raw Data Sheet
     ws_raw = wb.create_sheet("Raw_Data")
     raw_cols = ['Date', 'Year', 'Category', 'Product_Group', 'Sub_Product', 'Customer', 'Quantity', 'Revenue', 'ASP']
