@@ -162,7 +162,10 @@ def detect_outliers_iqr(df, col='ASP', factor=1.5):
 # --- 5. Excel 리포트 생성 함수 ---
 @st.cache_data(ttl=3600, show_spinner="📊 전체 엑셀 리포트 생성 중...")
 def generate_excel_report(df_normal, df_exception, all_years_list):
-    """Generate comprehensive KPMG-styled Excel report for MSK data"""
+    """
+    Generate comprehensive KPMG-styled Excel report for MSK data
+    Includes: Company-Wide / Category-level / Car Type-level / Customer-level analysis
+    """
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -193,6 +196,146 @@ def generate_excel_report(df_normal, df_exception, all_years_list):
         cell.font = title_font
         cell.alignment = Alignment(horizontal='left')
         ws.row_dimensions[row].height = 20
+
+    def create_growth_sheet(ws, data_df, title_prefix, group_by_col):
+        """성장 분석 시트 생성 (연도별 Revenue, YoY, Share 분석)"""
+        # Section 1: Yearly Revenue + YoY
+        y_df = data_df.groupby('Year')['Revenue'].sum().reset_index()
+        y_df['YoY'] = y_df['Revenue'].pct_change()
+
+        add_section_title(ws, f"{title_prefix} - Yearly Revenue & YoY Growth", 1, 3)
+        for col, h in enumerate(['Year', 'Revenue', 'YoY %'], 1):
+            cell = ws.cell(2, col, h)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+
+        for i, (_, row) in enumerate(y_df.iterrows()):
+            dr = 3 + i
+            ws.cell(dr, 1, int(row['Year']))
+            c = ws.cell(dr, 2, row['Revenue']); c.number_format = '#,##0'
+            yoy_val = row['YoY']
+            if pd.notnull(yoy_val):
+                c = ws.cell(dr, 3, yoy_val); c.number_format = '0.0%'
+            else:
+                ws.cell(dr, 3, '-')
+
+        # Section 2: Revenue Share by group
+        s2_start = len(y_df) + 4
+        comp_df = data_df.groupby(['Year', group_by_col])['Revenue'].sum().reset_index()
+        comp_df['Total'] = comp_df.groupby('Year')['Revenue'].transform('sum')
+        comp_df['Share'] = comp_df['Revenue'] / comp_df['Total']
+
+        add_section_title(ws, f"{title_prefix} - Revenue Share by {group_by_col}", s2_start, 4)
+        for col, h in enumerate(['Year', group_by_col, 'Revenue', 'Share'], 1):
+            cell = ws.cell(s2_start+1, col, h)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+
+        for i, (_, row) in enumerate(comp_df.iterrows()):
+            dr = s2_start + 2 + i
+            ws.cell(dr, 1, int(row['Year']))
+            ws.cell(dr, 2, str(row[group_by_col]))
+            c = ws.cell(dr, 3, row['Revenue']); c.number_format = '#,##0'
+            c = ws.cell(dr, 4, row['Share']); c.number_format = '0.0%'
+
+        # Section 3: Volume & ASP by group
+        s3_start = s2_start + len(comp_df) + 3
+        trend_df = data_df.groupby(['Year', group_by_col]).agg({'Quantity':'sum', 'Revenue':'sum'}).reset_index()
+        trend_df['ASP'] = trend_df['Revenue'] / trend_df['Quantity']
+
+        add_section_title(ws, f"{title_prefix} - Volume & ASP by {group_by_col}", s3_start, 4)
+        for col, h in enumerate(['Year', group_by_col, 'Quantity', 'ASP'], 1):
+            cell = ws.cell(s3_start+1, col, h)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+
+        for i, (_, row) in enumerate(trend_df.iterrows()):
+            dr = s3_start + 2 + i
+            ws.cell(dr, 1, int(row['Year']))
+            ws.cell(dr, 2, str(row[group_by_col]))
+            c = ws.cell(dr, 3, row['Quantity']); c.number_format = '#,##0'
+            c = ws.cell(dr, 4, row['ASP']); c.number_format = '#,##0'
+
+        auto_width(ws)
+
+    def create_timeseries_sheet(ws, data_df, title_prefix, group_by_col):
+        """시계열 분석 시트 생성 (월별 Revenue Mix)"""
+        # Monthly Revenue
+        t_df_m = data_df.groupby(['Month_Dt', group_by_col])['Revenue'].sum().reset_index()
+        t_df_m['Total'] = t_df_m.groupby('Month_Dt')['Revenue'].transform('sum')
+        t_df_m['Share'] = t_df_m['Revenue'] / t_df_m['Total']
+        t_df_m['Period'] = t_df_m['Month_Dt'].dt.strftime('%Y-%m')
+
+        add_section_title(ws, f"{title_prefix} - Monthly Revenue Mix by {group_by_col}", 1, 4)
+        for col, h in enumerate(['Period', group_by_col, 'Revenue', 'Share'], 1):
+            cell = ws.cell(2, col, h)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+
+        for i, (_, row) in enumerate(t_df_m.iterrows()):
+            dr = 3 + i
+            ws.cell(dr, 1, row['Period'])
+            ws.cell(dr, 2, str(row[group_by_col]))
+            c = ws.cell(dr, 3, row['Revenue']); c.number_format = '#,##0'
+            c = ws.cell(dr, 4, row['Share']); c.number_format = '0.0%'
+
+        # Monthly Quantity & ASP aggregated
+        m_start = len(t_df_m) + 4
+        agg_m = data_df.groupby('Month_Dt').agg({'Revenue':'sum', 'Quantity':'sum'}).reset_index()
+        agg_m['ASP'] = np.where(agg_m['Quantity'] > 0, agg_m['Revenue'] / agg_m['Quantity'], 0)
+        agg_m['Period'] = agg_m['Month_Dt'].dt.strftime('%Y-%m')
+
+        add_section_title(ws, f"{title_prefix} - Monthly Quantity & ASP Trend", m_start, 3)
+        for col, h in enumerate(['Period', 'Quantity', 'ASP'], 1):
+            cell = ws.cell(m_start+1, col, h)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+
+        for i, (_, row) in enumerate(agg_m.iterrows()):
+            dr = m_start + 2 + i
+            ws.cell(dr, 1, row['Period'])
+            c = ws.cell(dr, 2, row['Quantity']); c.number_format = '#,##0'
+            c = ws.cell(dr, 3, row['ASP']); c.number_format = '#,##0'
+
+        auto_width(ws)
+
+    def create_bridge_sheet(ws, data_df, title_prefix, group_by_col, target_years):
+        """Bridge 분석 시트 생성"""
+        if len(target_years) < 2:
+            ws.cell(1, 1, "최소 2개 연도를 선택해야 Bridge 분석이 가능합니다.")
+            return
+
+        steps = calculate_bridge_mix_steps(data_df, target_years, group_by_col)
+
+        if not steps:
+            ws.cell(1, 1, "분석할 데이터가 부족합니다.")
+            return
+
+        add_section_title(ws, f"{title_prefix} - P/V/M Bridge (by {group_by_col})", 1, 7)
+        headers = ['Period', 'Start Revenue', 'Volume Effect', 'Price Effect', 'Mix Effect', 'End Revenue', 'Total Change']
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(2, col, h)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+
+        for i, step in enumerate(steps):
+            dr = 3 + i
+            ws.cell(dr, 1, step['label'])
+            for col, key in [(2, 'start_val'), (3, 'volume'), (4, 'price'), (5, 'mix'), (6, 'end_val')]:
+                c = ws.cell(dr, col, step[key]); c.number_format = '#,##0'
+            c = ws.cell(dr, 7, step['end_val'] - step['start_val']); c.number_format = '+#,##0;-#,##0;0'
+
+        auto_width(ws)
+
+    # Prepare filtered data
+    df_overview = df_normal[df_normal['Year'].isin(all_years_list)]
+    target_years = sorted(all_years_list)
 
     # === Sheet 1: Validation Guide ===
     ws_val = wb.create_sheet("Validation_Guide")
@@ -227,18 +370,17 @@ def generate_excel_report(df_normal, df_exception, all_years_list):
 
     auto_width(ws_val)
 
-    # === Sheet 2: Overview ===
-    ws_ov = wb.create_sheet("Overview")
-    df_overview = df_normal[df_normal['Year'].isin(all_years_list)]
-
-    # Section 1: Category Overview
+    # ============ LEVEL 1: Company-Wide Analysis ============
+    ws_ov = wb.create_sheet("01_Overview")
+    
+    # Category Overview
     ov_cat = df_overview.groupby('Category').agg({'Revenue': 'sum', 'Quantity': 'sum'}).reset_index()
     ov_cat['ASP'] = ov_cat['Revenue'] / ov_cat['Quantity']
     total_rev = ov_cat['Revenue'].sum()
     total_qty = ov_cat['Quantity'].sum()
     ov_cat['Rev_Share'] = ov_cat['Revenue'] / total_rev
     ov_cat['Qty_Share'] = ov_cat['Quantity'] / total_qty
-
+    
     add_section_title(ws_ov, "1. Category Overview Summary", 1, 6)
     headers = ['Category', 'Revenue', 'Rev Share', 'Quantity', 'Qty Share', 'ASP']
     for col, h in enumerate(headers, 1):
@@ -246,7 +388,7 @@ def generate_excel_report(df_normal, df_exception, all_years_list):
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = center_align
-
+    
     for r_idx, row in ov_cat.iterrows():
         data_row = r_idx + 3
         ws_ov.cell(data_row, 1, row['Category'])
@@ -255,172 +397,92 @@ def generate_excel_report(df_normal, df_exception, all_years_list):
         c = ws_ov.cell(data_row, 4, row['Quantity']); c.number_format = '#,##0'
         c = ws_ov.cell(data_row, 5, row['Qty_Share']); c.number_format = '0.0%'
         c = ws_ov.cell(data_row, 6, row['ASP']); c.number_format = '#,##0'
-
+    
     total_row = len(ov_cat) + 3
     ws_ov.cell(total_row, 1, 'Total').font = bold_font
     c = ws_ov.cell(total_row, 2, total_rev); c.number_format = '#,##0'; c.font = bold_font
     c = ws_ov.cell(total_row, 4, total_qty); c.number_format = '#,##0'; c.font = bold_font
-
-    # Section 2: Customer Revenue (Top 10)
-    section2_start = total_row + 2
-    ov_cust = df_overview.groupby('Customer')['Revenue'].sum().reset_index().sort_values('Revenue', ascending=False).head(10)
-    ov_cust['Share'] = ov_cust['Revenue'] / total_rev
-
-    add_section_title(ws_ov, "2. Top 10 Customers by Revenue", section2_start, 3)
-    for col, h in enumerate(['Customer', 'Revenue', 'Share'], 1):
-        cell = ws_ov.cell(section2_start+1, col, h)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = center_align
-
-    for i, (_, row) in enumerate(ov_cust.iterrows()):
-        dr = section2_start + 2 + i
-        ws_ov.cell(dr, 1, row['Customer'])
-        c = ws_ov.cell(dr, 2, row['Revenue']); c.number_format = '#,##0'
-        c = ws_ov.cell(dr, 3, row['Share']); c.number_format = '0.0%'
-
+    
     auto_width(ws_ov)
-
-    # === Sheet 3: Growth & Share Analysis ===
-    ws_growth = wb.create_sheet("Growth_Share")
-
-    # Yearly Revenue + YoY
-    y_df = df_overview.groupby('Year')['Revenue'].sum().reset_index()
-    y_df['YoY'] = y_df['Revenue'].pct_change()
-
-    add_section_title(ws_growth, "1. Yearly Revenue & YoY Growth", 1, 3)
-    for col, h in enumerate(['Year', 'Revenue', 'YoY %'], 1):
-        cell = ws_growth.cell(2, col, h)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = center_align
-
-    for i, (_, row) in enumerate(y_df.iterrows()):
-        dr = 3 + i
-        ws_growth.cell(dr, 1, int(row['Year']))
-        c = ws_growth.cell(dr, 2, row['Revenue']); c.number_format = '#,##0'
-        yoy_val = row['YoY']
-        if pd.notnull(yoy_val):
-            c = ws_growth.cell(dr, 3, yoy_val); c.number_format = '0.0%'
-        else:
-            ws_growth.cell(dr, 3, '-')
-
-    # Revenue Share by Category
-    s2_start = len(y_df) + 4
-    comp_df = df_overview.groupby(['Year', 'Category'])['Revenue'].sum().reset_index()
-    comp_df['Total'] = comp_df.groupby('Year')['Revenue'].transform('sum')
-    comp_df['Share'] = comp_df['Revenue'] / comp_df['Total']
-
-    add_section_title(ws_growth, "2. Revenue Share by Category", s2_start, 4)
-    for col, h in enumerate(['Year', 'Category', 'Revenue', 'Share'], 1):
-        cell = ws_growth.cell(s2_start+1, col, h)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = center_align
-
-    for i, (_, row) in enumerate(comp_df.iterrows()):
-        dr = s2_start + 2 + i
-        ws_growth.cell(dr, 1, int(row['Year']))
-        ws_growth.cell(dr, 2, row['Category'])
-        c = ws_growth.cell(dr, 3, row['Revenue']); c.number_format = '#,##0'
-        c = ws_growth.cell(dr, 4, row['Share']); c.number_format = '0.0%'
-
-    auto_width(ws_growth)
-
-    # === Sheet 4: Time Series ===
-    ws_ts = wb.create_sheet("TimeSeries")
-
-    # Monthly Revenue by Category
-    t_df_m = df_overview.groupby(['Month_Dt', 'Category'])['Revenue'].sum().reset_index()
-    t_df_m['Total'] = t_df_m.groupby('Month_Dt')['Revenue'].transform('sum')
-    t_df_m['Share'] = t_df_m['Revenue'] / t_df_m['Total']
-    t_df_m['Period'] = t_df_m['Month_Dt'].dt.strftime('%Y-%m')
-
-    add_section_title(ws_ts, "1. Monthly Revenue Mix by Category", 1, 4)
-    for col, h in enumerate(['Period', 'Category', 'Revenue', 'Share'], 1):
-        cell = ws_ts.cell(2, col, h)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = center_align
-
-    for i, (_, row) in enumerate(t_df_m.iterrows()):
-        dr = 3 + i
-        ws_ts.cell(dr, 1, row['Period'])
-        ws_ts.cell(dr, 2, row['Category'])
-        c = ws_ts.cell(dr, 3, row['Revenue']); c.number_format = '#,##0'
-        c = ws_ts.cell(dr, 4, row['Share']); c.number_format = '0.0%'
-
-    auto_width(ws_ts)
-
-    # === Sheet 5: PQ_Bridge ===
-    ws_br = wb.create_sheet("PQ_Bridge")
-    target_years = sorted(all_years_list)
-
-    def write_bridge_section(ws, title, steps, start_row):
-        add_section_title(ws, title, start_row, 7)
-        headers = ['Period', 'Start Revenue', 'Volume Effect', 'Price Effect', 'Mix Effect', 'End Revenue', 'Total Change']
-        for col, h in enumerate(headers, 1):
-            cell = ws.cell(start_row+1, col, h)
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = center_align
-
-        for i, step in enumerate(steps):
-            dr = start_row + 2 + i
-            ws.cell(dr, 1, step['label'])
-            for col, key in [(2, 'start_val'), (3, 'volume'), (4, 'price'), (5, 'mix'), (6, 'end_val')]:
-                c = ws.cell(dr, col, step[key]); c.number_format = '#,##0'
-            c = ws.cell(dr, 7, step['end_val'] - step['start_val']); c.number_format = '+#,##0;-#,##0;0'
-
-        return start_row + len(steps) + 3
-
-    if len(target_years) >= 2:
-        df_bridge = df_normal[df_normal['Year'].isin(target_years)]
-
-        # Company-wide bridge (by Category)
-        res1 = calculate_bridge_mix_steps(df_bridge, target_years, 'Category')
-        next_row = write_bridge_section(ws_br, "1. Company-Wide Bridge (by Category)", res1, 1)
-
-        # All Categories bridge (by Car Type)
-        res2 = calculate_bridge_mix_steps(df_bridge, target_years, 'Car_Type')
-        next_row = write_bridge_section(ws_br, "2. All Categories Bridge (by Car Type)", res2, next_row)
-
-        # Category-specific bridges
-        categories = sorted(df_normal['Category'].unique())
-        for cat in categories:
-            df_cat = df_bridge[df_bridge['Category'] == cat]
-            res_cat = calculate_bridge_mix_steps(df_cat, target_years, 'Car_Type')
-            if res_cat:
-                next_row = write_bridge_section(ws_br, f"3. {cat} Bridge (by Car Type)", res_cat, next_row)
-    else:
-        ws_br.cell(1, 1, "최소 2개 연도를 선택해야 Bridge 분석이 가능합니다.")
-
-    auto_width(ws_br)
-
-    # === Sheet 6: Outlier Analysis ===
-    ws_out = wb.create_sheet("Outlier_Analysis")
-
+    
+    # Company-Wide Growth/TimeSeries/Bridge
+    ws_growth = wb.create_sheet("02_Growth_CompanyWide")
+    create_growth_sheet(ws_growth, df_overview, "Company-Wide", "Category")
+    
+    ws_ts = wb.create_sheet("03_TimeSeries_CompanyWide")
+    create_timeseries_sheet(ws_ts, df_overview, "Company-Wide", "Category")
+    
+    ws_bridge = wb.create_sheet("04_Bridge_CompanyWide")
+    create_bridge_sheet(ws_bridge, df_overview, "Company-Wide", "Category", target_years)
+    
+    # ============ LEVEL 2: Category-Level Analysis ============
+    categories = sorted(df_normal['Category'].unique())
+    for idx, cat in enumerate(categories, 1):
+        df_cat = df_overview[df_overview['Category'] == cat]
+        if df_cat.empty:
+            continue
+        
+        safe_name = str(cat).replace('/', '_').replace(' ', '_').replace('&', 'and')[:20]
+        ws_cat_growth = wb.create_sheet(f"10{idx}_Cat_{safe_name}_Grw")
+        create_growth_sheet(ws_cat_growth, df_cat, f"Category: {cat}", "Car_Type")
+        
+        ws_cat_ts = wb.create_sheet(f"11{idx}_Cat_{safe_name}_TS")
+        create_timeseries_sheet(ws_cat_ts, df_cat, f"Category: {cat}", "Car_Type")
+        
+        ws_cat_bridge = wb.create_sheet(f"12{idx}_Cat_{safe_name}_Br")
+        create_bridge_sheet(ws_cat_bridge, df_cat, f"Category: {cat}", "Car_Type", target_years)
+    
+    # ============ LEVEL 3: Car Type-Level Analysis (Top 10) ============
+    top_car_types = df_overview.groupby('Car_Type')['Revenue'].sum().sort_values(ascending=False).head(10).index.tolist()
+    for idx, car in enumerate(top_car_types, 1):
+        df_car = df_overview[df_overview['Car_Type'] == car]
+        if df_car.empty:
+            continue
+        
+        safe_name = str(car).replace('/', '_').replace(' ', '_').replace('&', 'and')[:15]
+        ws_car_growth = wb.create_sheet(f"20{idx}_Car_{safe_name}_Grw")
+        create_growth_sheet(ws_car_growth, df_car, f"Car Type: {car}", "Customer")
+        
+        ws_car_ts = wb.create_sheet(f"21{idx}_Car_{safe_name}_TS")
+        create_timeseries_sheet(ws_car_ts, df_car, f"Car Type: {car}", "Customer")
+    
+    # ============ LEVEL 4: Customer-Level Analysis (Top 10) ============
+    top_customers = df_overview.groupby('Customer')['Revenue'].sum().sort_values(ascending=False).head(10).index.tolist()
+    for idx, cust in enumerate(top_customers, 1):
+        df_cust = df_overview[df_overview['Customer'] == cust]
+        if df_cust.empty:
+            continue
+        
+        safe_name = str(cust).replace('/', '_').replace(' ', '_').replace('&', 'and')[:15]
+        ws_cust_growth = wb.create_sheet(f"30{idx}_Cust_{safe_name}_Grw")
+        create_growth_sheet(ws_cust_growth, df_cust, f"Customer: {cust}", "Category")
+        
+        ws_cust_ts = wb.create_sheet(f"31{idx}_Cust_{safe_name}_TS")
+        create_timeseries_sheet(ws_cust_ts, df_cust, f"Customer: {cust}", "Category")
+    
+    # ============ COMMON SHEETS ============
+    # Outlier Analysis
+    ws_out = wb.create_sheet("90_Outlier_Analysis")
     stats = df_overview.groupby('Category')['ASP'].agg(['count', 'mean', 'min', 'max']).reset_index()
     stats.columns = ['Category', 'Count', 'Mean ASP', 'Min ASP', 'Max ASP']
-
+    
     add_section_title(ws_out, "1. ASP Statistics by Category", 1, 5)
     for col, h in enumerate(stats.columns.tolist(), 1):
         cell = ws_out.cell(2, col, h)
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = center_align
-
+    
     for i, (_, row) in enumerate(stats.iterrows()):
         dr = 3 + i
         ws_out.cell(dr, 1, row['Category'])
         ws_out.cell(dr, 2, int(row['Count']))
         for col, key in [(3, 'Mean ASP'), (4, 'Min ASP'), (5, 'Max ASP')]:
             c = ws_out.cell(dr, col, row[key]); c.number_format = '#,##0'
-
-    # Top 50 Outliers
+    
     outliers = df_overview.groupby('Category', group_keys=False).apply(lambda x: detect_outliers_iqr(x))
     outlier_view = outliers[['Date', 'Category', 'Car_Type', 'Customer', 'Quantity', 'Revenue', 'ASP']].sort_values('ASP', ascending=False).head(50) if not outliers.empty else pd.DataFrame()
-
+    
     out_start = len(stats) + 4
     add_section_title(ws_out, "2. Top 50 ASP Outliers (IQR Factor=1.5)", out_start, 7)
     if not outlier_view.empty:
@@ -430,7 +492,7 @@ def generate_excel_report(df_normal, df_exception, all_years_list):
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = center_align
-
+        
         for i, (_, row) in enumerate(outlier_view.iterrows()):
             dr = out_start + 2 + i
             ws_out.cell(dr, 1, row['Date'].strftime('%Y-%m-%d') if hasattr(row['Date'], 'strftime') else str(row['Date']))
@@ -442,22 +504,20 @@ def generate_excel_report(df_normal, df_exception, all_years_list):
             c = ws_out.cell(dr, 7, row['ASP']); c.number_format = '#,##0'
     else:
         ws_out.cell(out_start+1, 1, "이상치 없음")
-
+    
     auto_width(ws_out)
-
-    # === Sheet 7: Exception Data ===
-    ws_exc = wb.create_sheet("Exception_Data")
-
+    
+    # Exception Data
+    ws_exc = wb.create_sheet("91_Exception_Data")
     if not df_exception.empty:
         exc_summary = df_exception.groupby(['Year', 'Category', 'Customer'])['Revenue'].sum().reset_index()
-
         add_section_title(ws_exc, "Exception Sales (Quantity=0) Summary", 1, 4)
         for col, h in enumerate(['Year', 'Category', 'Customer', 'Revenue'], 1):
             cell = ws_exc.cell(2, col, h)
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = center_align
-
+        
         for i, (_, row) in enumerate(exc_summary.iterrows()):
             dr = 3 + i
             ws_exc.cell(dr, 1, int(row['Year']))
@@ -466,22 +526,21 @@ def generate_excel_report(df_normal, df_exception, all_years_list):
             c = ws_exc.cell(dr, 4, row['Revenue']); c.number_format = '#,##0'
     else:
         ws_exc.cell(1, 1, "예외 데이터 없음")
-
     auto_width(ws_exc)
-
-    # === Sheet 8: Raw Data ===
-    ws_raw = wb.create_sheet("Raw_Data")
+    
+    # Raw Data
+    ws_raw = wb.create_sheet("99_Raw_Data")
     raw_cols = ['Date', 'Year', 'Category', 'Car_Type', 'Customer', 'Region', 'Quantity', 'Revenue', 'ASP']
     raw_export = df_normal[raw_cols].copy()
-
+    
     add_section_title(ws_raw, "Raw Transaction Data (Normal Sales)", 1, len(raw_cols))
     for col, h in enumerate(raw_cols, 1):
         cell = ws_raw.cell(2, col, h)
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = center_align
-
-    for i, (_, row) in enumerate(raw_export.head(10000).iterrows()):  # Limit to 10k rows for performance
+    
+    for i, (_, row) in enumerate(raw_export.head(10000).iterrows()):
         dr = 3 + i
         ws_raw.cell(dr, 1, row['Date'].strftime('%Y-%m-%d') if hasattr(row['Date'], 'strftime') else str(row['Date']))
         ws_raw.cell(dr, 2, int(row['Year']))
@@ -492,7 +551,6 @@ def generate_excel_report(df_normal, df_exception, all_years_list):
         c = ws_raw.cell(dr, 7, row['Quantity']); c.number_format = '#,##0'
         c = ws_raw.cell(dr, 8, row['Revenue']); c.number_format = '#,##0'
         c = ws_raw.cell(dr, 9, row['ASP']); c.number_format = '#,##0'
-
     auto_width(ws_raw)
 
     # Save to BytesIO
