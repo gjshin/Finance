@@ -45,3 +45,6 @@ Thumbs.db
 
 # Cache
 .cache/
+
+# Secret files
+secret/
