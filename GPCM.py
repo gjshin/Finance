@@ -2,9 +2,9 @@
 # 주요 변경사항:
 # - D/E Ratio 컬럼 추가 (IBD / (시총 + NCI))
 # - Unlevered Beta 계산에 D/E Ratio 사용 (정확한 Hamada 공식)
-# - 국내 베타 계산 수정: 시장 지수는 FDR 사용 (KS11, KQ11은 yfinance 미지원)
+# - 국내 베타 계산 수정: 시장 지수는 yfinance 사용 (^KS11, ^KQ11)
 # - Debt Ratio 수식 수정: IBD/(시총+IBD+NCI) [총부채/총자산]
-# - 노트 업데이트: 주가 데이터 소스 명시
+# - 노트 업데이트: 주가 데이터 소스 명시 (yfinance 통합)
 
 import streamlit as st
 import yfinance as yf
@@ -18,7 +18,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.chart import LineChart, Reference, Series
 from openpyxl.chart.axis import ChartLines
-import FinanceDataReader as fdr
+# import FinanceDataReader as fdr (Removed as per user request to use yfinance only)
 from scipy import stats
 import requests
 from bs4 import BeautifulSoup
@@ -36,9 +36,9 @@ def get_market_index(ticker):
 
     # 아시아
     if ticker_upper.endswith('.KS'):
-        return 'KOSPI', 'KS11'
+        return 'KOSPI', '^KS11'
     elif ticker_upper.endswith('.KQ'):
-        return 'KOSDAQ', 'KQ11'
+        return 'KOSDAQ', '^KQ11'
     elif ticker_upper.endswith('.T'):
         return 'TSE', '^N225'  # Nikkei 225
     elif ticker_upper.endswith('.SS'):
@@ -382,7 +382,7 @@ def get_korea_10y_treasury_yield(base_date_str, user_rf_rate=0.033):
     st.info(f"💡 무위험이자율 (사용자 입력): {user_rf_rate*100:.2f}%")
     return user_rf_rate
 @st.cache_data(ttl=3600)  # <--- [추가] 1시간 동안 데이터를 저장해서 재사용함
-def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_premium=0.0402, target_tax_rate=0.264, user_rf_rate=None, beta_type="5Y"):
+def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_premium=0.0402, target_tax_rate=0.264, user_rf_rate=None, beta_type="5Y", force_annual=False):
     """
     GPCM 데이터 수집 및 엑셀 생성을 위한 데이터 구조 반환
 
@@ -397,10 +397,11 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
     Note: 목표 부채비율은 피어들의 평균 자본구조로 자동 계산됨
           개별 peer의 WACC이 아닌 Target 기업의 WACC을 계산함
     """
-    base_dt = pd.to_datetime(base_date_str)
+    base_period_str = target_periods[-1]
+    base_dt = pd.to_datetime(base_period_str)
 
     # 10년 국채수익률 조회 (무위험수익률)
-    rf_rate = get_korea_10y_treasury_yield(base_date_str, user_rf_rate)
+    rf_rate = get_korea_10y_treasury_yield(base_period_str, user_rf_rate)
     
     # ---------------------------------------------------------
     # [설정] 계정 맵핑 (v17: NOA Option, 투자부동산 등)
@@ -428,8 +429,17 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
     PL_CALC_KEY = {'Total Revenue': 'Revenue', 'Operating Income': 'OpIncome', 'EBIT': 'EBIT_yf', 'EBITDA': 'EBITDA_yf', 'Normalized EBITDA': 'NormEBITDA_yf', 'Net Income Common Stockholders': 'NI_Parent'}
     PL_SORT = {'Total Revenue': 10, 'Operating Revenue': 11, 'Cost Of Revenue': 20, 'Gross Profit': 30, 'Operating Expense': 35, 'Selling General And Administration': 36, 'Research And Development': 37, 'Operating Income': 50, 'EBIT': 55, 'EBITDA': 56, 'Normalized EBITDA': 57, 'Interest Expense': 60, 'Pretax Income': 70, 'Tax Provision': 75, 'Net Income': 90, 'Net Income Common Stockholders': 91, 'Basic EPS': 95, 'Diluted EPS': 96}
 
-    # Data Containers
-    gpcm_data = {}
+    # Labels for indexing (Y, Y-1, Y-2...)
+    lookback = len(target_periods)
+    rel_labels = []
+    for i in range(lookback):
+        label = "Y" if i == 0 else f"Y-{i}"
+        rel_labels.append(label)
+    
+    # We will return data keyed by rel_labels
+    all_period_data = {lbl: {} for lbl in rel_labels}
+    all_period_data['Recent'] = {}
+    base_label = "Y"
     raw_bs_rows = []
     raw_pl_rows = []
     market_rows = []
@@ -452,38 +462,69 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
             company_name = info.get('longName') or info.get('shortName') or ticker
             ticker_to_name[ticker] = company_name
             currency = info.get('currency', 'USD')
+            exchange, market_idx = get_market_index(ticker)
 
-            gpcm = {
-                'Company': company_name, 'Ticker': ticker, 'Currency': currency,
-                'Base_Date': base_date_str,
-                'Cash': 0, 'IBD': 0, 'NCI': 0, 'NOA(Option)': 0, 'Equity': 0,
-                'Revenue': 0, 'EBIT': 0, 'EBITDA': 0, 'NI_Parent': 0,
-                'Close': 0, 'Shares': 0, 'Market_Cap_M': 0, 'PL_Source': '',
-                'Exchange': '', 'Market_Index': '',
-                'Beta_5Y_Monthly_Raw': None, 'Beta_5Y_Monthly_Adj': None,
-                'Beta_2Y_Weekly_Raw': None, 'Beta_2Y_Weekly_Adj': None,
-                'Pretax_Income': 0, 'Tax_Rate': 0.22,
-                'Debt_Ratio': 0, 'Unlevered_Beta_5Y': None, 'Unlevered_Beta_2Y': None,
-            }
+            # [핵심] 실제 연간 결산일 목록 가져오기
+            a_is = stock.income_stmt
+            if a_is is None or a_is.empty:
+                st.warning(f"⚠️ {ticker}: 연간 재무제표를 찾을 수 없습니다. 건너뜁니다.")
+                continue
+            
+            # 기준일(base_dt) 이전의 모든 가용 결산일 (내림차순 정렬)
+            all_fiscal_dates = sorted([d for d in a_is.columns if d <= base_dt + timedelta(days=7)], reverse=True)
+            if not all_fiscal_dates:
+                st.warning(f"⚠️ {ticker}: 기준일({base_period_str}) 이전의 실적 데이터가 없습니다.")
+                continue
+            
+            # 사용자가 요청한 분석 개년수만큼 매칭 (Y, Y-1, Y-2...)
+            # i_p=0 (최신), i_p=1 (Y-1)...
+            for i_p in range(lookback):
+                label = "Y" if i_p == 0 else f"Y-{i_p}"
+                
+                if i_p >= len(all_fiscal_dates):
+                    # 데이터 부족 시 건너뜀
+                    continue
+                
+                f_dt_obj = all_fiscal_dates[i_p]
+                f_dt_str = f_dt_obj.strftime('%Y-%m-%d')
+                
+                gpcm = {
+                    'Company': company_name, 'Ticker': ticker, 'Currency': currency,
+                    'Base_Date': f_dt_str, # 실제 결산일 표시
+                    'Cash': 0, 'IBD': 0, 'NCI': 0, 'NOA(Option)': 0, 'Equity': 0,
+                    'Revenue': 0, 'EBIT': 0, 'EBITDA': 0, 'NI_Parent': 0,
+                    'Close': 0, 'Shares': 0, 'Market_Cap_M': 0, 'PL_Source': 'Annual',
+                    'Exchange': exchange, 'Market_Index': market_idx,
+                    'Beta_5Y_Monthly_Raw': None, 'Beta_5Y_Monthly_Adj': None,
+                    'Beta_2Y_Weekly_Raw': None, 'Beta_2Y_Weekly_Adj': None,
+                    'Pretax_Income': 0, 'Tax_Rate': 0.22,
+                    'Debt_Ratio': 0, 'Unlevered_Beta_5Y': None, 'Unlevered_Beta_2Y': None,
+                }
 
-            # [0] Price History (10Y)
-            try:
-                hist_10y_raw = stock.history(start=(base_dt - timedelta(days=365*10+20)).strftime('%Y-%m-%d'), end=base_dt.strftime('%Y-%m-%d'), auto_adjust=False)
-                hist_10y = hist_10y_raw['Close'] if 'Close' in hist_10y_raw.columns else hist_10y_raw.iloc[:,0]
-                if not hist_10y.empty:
-                    abs_s = hist_10y.copy(); abs_s.name = ticker; price_abs_dfs.append(abs_s)
-                    rel_s = (hist_10y / hist_10y.iloc[0]) * 100; rel_s.name = ticker; price_rel_dfs.append(rel_s)
-            except: pass
+                # [1] BS (해당 결산일의 연간 BS 우선, 없을 경우 분기 BS 검색)
+                a_bs = stock.balance_sheet
+                q_bs = stock.quarterly_balance_sheet
+                bs_shares = None
+                
+                target_bs = None
+                actual_bs_date = None
+                
+                # 1. 연간 BS에서 정확한 결산일 매칭 시도
+                if a_bs is not None and not a_bs.empty:
+                    if f_dt_obj in a_bs.columns:
+                        target_bs = a_bs[f_dt_obj]
+                        actual_bs_date = f_dt_obj
+                
+                # 2. 연간 BS에 없을 경우 분기 BS에서 가장 가까운 날짜 찾기
+                if target_bs is None and q_bs is not None and not q_bs.empty:
+                    valid_bs = sorted([d for d in q_bs.columns if abs((d - f_dt_obj).days) <= 20], key=lambda x: abs((x - f_dt_obj).days))
+                    if valid_bs:
+                        actual_bs_date = valid_bs[0]
+                        target_bs = q_bs[actual_bs_date]
 
-            # [1] BS
-            q_bs = stock.quarterly_balance_sheet
-            bs_shares = None
-            if q_bs is not None and not q_bs.empty:
-                valid = sorted([d for d in q_bs.columns if d <= base_dt + timedelta(days=7)], reverse=True)
-                if valid:
-                    latest = valid[0]
-                    for acct_name in q_bs.index:
-                        val = q_bs.loc[acct_name, latest]
+                if target_bs is not None:
+                    for acct_name in target_bs.index:
+                        val = target_bs.loc[acct_name]
                         if pd.isna(val): continue
                         val_f = float(val)
                         if str(acct_name) == 'Ordinary Shares Number': bs_shares = val_f
@@ -491,71 +532,49 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
                         if str(acct_name) in BS_SUBTOTAL_EXCLUDE: ev_tag = ''
                         
                         raw_bs_rows.append({
-                            'Company': company_name, 'Ticker': ticker, 'Period': latest.strftime('%Y-%m-%d'),
+                            'Company': company_name, 'Ticker': ticker, 'Period': actual_bs_date.strftime('%Y-%m-%d'), 'Label': label,
                             'Currency': currency, 'Account': str(acct_name), 'EV_Tag': ev_tag, 'Amount_M': val_f/1e6
                         })
                         if ev_tag: gpcm[ev_tag] += val_f/1e6
-            
-            gpcm['Shares'] = bs_shares if bs_shares else float(info.get('sharesOutstanding', 0))
+                
+                gpcm['Shares'] = bs_shares if bs_shares else float(info.get('sharesOutstanding', 0))
 
-            # [2] Market Cap
-            try:
-                hist = stock.history(start=(base_dt - timedelta(days=10)).strftime('%Y-%m-%d'), end=(base_dt + timedelta(days=1)).strftime('%Y-%m-%d'), auto_adjust=False)
-                close = float(hist['Close'].iloc[-1]) if (not hist.empty and 'Close' in hist.columns) else 0.0
-                p_date = hist.index[-1].strftime('%Y-%m-%d') if not hist.empty else '-'
-            except: close=0.0; p_date='-'
-            gpcm['Close'] = close
-            gpcm['Market_Cap_M'] = (close * gpcm['Shares'] / 1e6) if gpcm['Shares'] else 0.0
-            market_rows.append({
-                'Company': company_name, 'Ticker': ticker, 'Base_Date': base_date_str, 'Price_Date': p_date,
-                'Currency': currency, 'Close': close, 'Shares': gpcm['Shares'], 'Market_Cap_M': round(gpcm['Market_Cap_M'], 1)
-            })
+                # [2] Market Cap (실제 결산일 시점의 주가 사용)
+                try:
+                    hist = stock.history(start=(f_dt_obj - timedelta(days=10)).strftime('%Y-%m-%d'), end=(f_dt_obj + timedelta(days=1)).strftime('%Y-%m-%d'), auto_adjust=False)
+                    close = float(hist['Close'].iloc[-1]) if (not hist.empty and 'Close' in hist.columns) else 0.0
+                    p_date = hist.index[-1].strftime('%Y-%m-%d') if not hist.empty else '-'
+                except: close=0.0; p_date='-'
+                gpcm['Close'] = close
+                gpcm['Market_Cap_M'] = (close * gpcm['Shares'] / 1e6) if gpcm['Shares'] else 0.0
+                market_rows.append({
+                    'Company': company_name, 'Ticker': ticker, 'Base_Date': f_dt_str, 'Price_Date': p_date, 'Label': label,
+                    'Currency': currency, 'Close': close, 'Shares': gpcm['Shares'], 'Market_Cap_M': round(gpcm['Market_Cap_M'], 1)
+                })
 
-            # [3] PL
-            q_is = stock.quarterly_income_stmt
-            q_valid = []
-            if q_is is not None and not q_is.empty:
-                q_valid = sorted([d for d in q_is.columns if d <= base_dt + timedelta(days=7)], reverse=True)[:4]
-            
-            is_complete = False
-            if len(q_valid) == 4:
-                if 'Total Revenue' in q_is.index:
-                    vals = q_is.loc['Total Revenue', q_valid]
-                    if vals.notna().all() and (vals != 0).all(): is_complete = True
-            
-            pl_source = 'Quarterly (4Q Sum)' if is_complete else 'Annual'
-            pl_data = None; pl_dates = []
-            if is_complete: pl_data = q_is; pl_dates = q_valid
-            else:
-                a_is = stock.income_stmt
-                if a_is is not None and not a_is.empty:
-                    valid_a = sorted([d for d in a_is.columns if d <= base_dt + timedelta(days=7)], reverse=True)
-                    if valid_a: pl_dates = [valid_a[0]]; pl_data = a_is
-            
-            gpcm['PL_Source'] = pl_source
-            calc_sums = {'Revenue': 0, 'OpIncome': 0, 'EBIT_yf': 0, 'EBITDA_yf': 0, 'NormEBITDA_yf': 0, 'NI_Parent': 0}
-
-            if pl_data is not None:
-                for acct in pl_data.index:
+                # [3] PL (해당 결산일의 연간 데이터 사용)
+                calc_sums = {'Revenue': 0, 'OpIncome': 0, 'EBIT_yf': 0, 'EBITDA_yf': 0, 'NormEBITDA_yf': 0, 'NI_Parent': 0}
+                for acct in a_is.index:
                     acct_str = str(acct)
                     hl_tag = PL_HIGHLIGHT_MAP.get(acct_str, '')
                     calc_key = PL_CALC_KEY.get(acct_str, '')
                     is_eps = 'EPS' in acct_str or 'Per Share' in acct_str
                     is_shares = 'Average Shares' in acct_str
-                    for i, d in enumerate(pl_dates):
-                        val = pl_data.loc[acct, d]
-                        if pd.isna(val): continue
-                        val_f = float(val)
-                        if is_eps: unit = 'per share'; amt = val_f
-                        elif is_shares: unit = 'M shares'; amt = val_f/1e6
-                        else: unit = 'M'; amt = val_f/1e6
-                        raw_pl_rows.append({
-                            'Company': company_name, 'Ticker': ticker, 'Currency': currency,
-                            'Account': acct_str, 'GPCM_Tag': hl_tag, 'PL_Source': pl_source,
-                            'Q_Label': f"D-{i}Q" if pl_source.startswith('Quarterly') else 'Annual', 
-                            'Period': d.strftime('%Y-%m-%d'), 'Amount_M': amt, 'Unit': unit, '_sort': PL_SORT.get(acct_str, 500)
-                        })
-                        if calc_key and not is_eps and not is_shares: calc_sums[calc_key] += val_f/1e6
+                    
+                    val = a_is.loc[acct, f_dt_obj]
+                    if pd.isna(val): continue
+                    val_f = float(val)
+                    if is_eps: unit = 'per share'; amt = val_f
+                    elif is_shares: unit = 'M shares'; amt = val_f/1e6
+                    else: unit = 'M'; amt = val_f/1e6
+                    
+                    raw_pl_rows.append({
+                        'Company': company_name, 'Ticker': ticker, 'Currency': currency,
+                        'Account': acct_str, 'GPCM_Tag': hl_tag, 'PL_Source': 'Annual',
+                        'Q_Label': 'Annual', 'Period': f_dt_str, 'Label': label, 
+                        'Amount_M': amt, 'Unit': unit, '_sort': PL_SORT.get(acct_str, 500)
+                    })
+                    if calc_key and not is_eps and not is_shares: calc_sums[calc_key] += val_f/1e6
                 
                 gpcm['Revenue'] = calc_sums['Revenue']
                 gpcm['EBIT'] = calc_sums['OpIncome']
@@ -565,232 +584,257 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
                 gpcm['EBITDA'] = calc_sums['OpIncome'] + da_amount
                 gpcm['NI_Parent'] = calc_sums['NI_Parent']
 
-            # [4] Beta Calculation with Retry Logic
-            exchange, market_idx = get_market_index(ticker)
-            gpcm['Exchange'] = exchange
-            gpcm['Market_Index'] = market_idx
+                # [4] Tax Rate
+                tax_rates_wiki = get_corporate_tax_rates_from_wikipedia()
+                country_code = get_country_from_ticker(ticker)
+                if 'Pretax Income' in a_is.index:
+                    pt_val = a_is.loc['Pretax Income', f_dt_obj]
+                    if pd.notna(pt_val): gpcm['Pretax_Income'] = float(pt_val) / 1e6
+                
+                if country_code == 'KR': gpcm['Tax_Rate'] = get_korean_marginal_tax_rate(gpcm['Pretax_Income'])
+                else: gpcm['Tax_Rate'] = tax_rates_wiki.get(country_code, 0.25)
 
+                # [5] Debt Ratio Calculation
+                total_val = gpcm['Market_Cap_M'] + gpcm['IBD'] + gpcm['NCI']
+                if total_val > 0:
+                    gpcm['Debt_Ratio'] = gpcm['IBD'] / total_val
+
+                # Save to all_period_data
+                all_period_data[label][ticker] = gpcm
+
+            # [핵심] 최신 분기 데이터(Recent) 별도 수집
             try:
-                # [4-1] 5년 주가 데이터 수집 (월말 종가)
-                start_5y = (base_dt - timedelta(days=365*5+20)).strftime('%Y-%m-%d')
-                end_date = base_dt.strftime('%Y-%m-%d')
-
-                # ⭐ 주가 데이터는 stock.history() 재사용 (이미 yfinance 객체 생성됨)
-                stock_data_5y = None
-                market_data_5y = None
-
-                try:
-                    # 주가 데이터: 이미 생성된 stock 객체 사용
-                    stock_hist_5y = stock.history(start=start_5y, end=end_date, auto_adjust=False)
-                    if not stock_hist_5y.empty:
-                        stock_data_5y = stock_hist_5y
-
-                    # 시장 지수 데이터: 한국 지수는 FDR 사용 (yfinance 미지원)
-                    if ticker.endswith('.KS') or ticker.endswith('.KQ'):
-                        # 한국 시장 지수: FinanceDataReader 사용
-                        try:
-                            market_data_5y = fdr.DataReader(market_idx, start_5y, end_date)
-                            # FDR 데이터 인덱스를 timezone-naive DatetimeIndex로 변환
-                            if market_data_5y is not None and not market_data_5y.empty:
-                                if not isinstance(market_data_5y.index, pd.DatetimeIndex):
-                                    market_data_5y.index = pd.to_datetime(market_data_5y.index)
-                                if market_data_5y.index.tz is not None:
-                                    market_data_5y.index = market_data_5y.index.tz_localize(None)
-                        except Exception as fdr_err:
-                            st.warning(f"{ticker} 시장 지수 수집 실패 (FDR): {fdr_err}")
-                    else:
-                        # 해외 시장 지수: yfinance 사용
-                        market_hist_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)
-                        if not market_hist_5y.empty:
-                            market_data_5y = market_hist_5y
-
-                except Exception as e:
-                    st.warning(f"{ticker} 5Y 데이터 수집 실패: {e}")
-                    pass
-
-                # 월말 종가 저장 (엑셀에서 베타 계산에 사용)
-                if stock_data_5y is not None and market_data_5y is not None:
-                    if not stock_data_5y.empty and not market_data_5y.empty:
-                        # Close 컬럼 추출
-                        if isinstance(stock_data_5y, pd.DataFrame):
-                            stock_prices_5y = stock_data_5y['Close'] if 'Close' in stock_data_5y.columns else stock_data_5y.iloc[:, 0]
-                        else:
-                            stock_prices_5y = stock_data_5y
-
-                        if isinstance(market_data_5y, pd.DataFrame):
-                            market_prices_5y = market_data_5y['Close'] if 'Close' in market_data_5y.columns else market_data_5y.iloc[:, 0]
-                        else:
-                            market_prices_5y = market_data_5y
-
-                        # 인덱스 확인 및 변환 (timezone-naive DatetimeIndex)
-                        if not isinstance(stock_prices_5y.index, pd.DatetimeIndex):
-                            stock_prices_5y.index = pd.to_datetime(stock_prices_5y.index)
-                        if stock_prices_5y.index.tz is not None:
-                            stock_prices_5y.index = stock_prices_5y.index.tz_localize(None)
-
-                        if not isinstance(market_prices_5y.index, pd.DatetimeIndex):
-                            market_prices_5y.index = pd.to_datetime(market_prices_5y.index)
-                        if market_prices_5y.index.tz is not None:
-                            market_prices_5y.index = market_prices_5y.index.tz_localize(None)
-
-                        # 월말 종가 저장
-                        stock_monthly_prices = stock_prices_5y.resample('ME').last().dropna()
-                        market_monthly_prices = market_prices_5y.resample('ME').last().dropna()
-
-                        # 데이터 저장 (엑셀에서 사용)
-                        if len(stock_monthly_prices) >= 12 and len(market_monthly_prices) >= 12:  # 최소 12개월 데이터 필요
-                            gpcm['Stock_Monthly_Prices_5Y'] = stock_monthly_prices
-                            gpcm['Market_Monthly_Prices_5Y'] = market_monthly_prices
-                        else:
-                            st.warning(f"{ticker}: 월별 데이터가 부족합니다 (Stock: {len(stock_monthly_prices)}, Market: {len(market_monthly_prices)})")
-                            gpcm['Stock_Monthly_Prices_5Y'] = None
-                            gpcm['Market_Monthly_Prices_5Y'] = None
-
-                        # 베타는 엑셀에서 계산하므로 None으로 설정
-                        gpcm['Beta_5Y_Monthly_Raw'] = None
-                        gpcm['Beta_5Y_Monthly_Adj'] = None
-                    else:
-                        gpcm['Stock_Monthly_Prices_5Y'] = None
-                        gpcm['Market_Monthly_Prices_5Y'] = None
-                        gpcm['Beta_5Y_Monthly_Raw'] = None
-                        gpcm['Beta_5Y_Monthly_Adj'] = None
-                else:
-                    gpcm['Stock_Monthly_Prices_5Y'] = None
-                    gpcm['Market_Monthly_Prices_5Y'] = None
-                    gpcm['Beta_5Y_Monthly_Raw'] = None
-                    gpcm['Beta_5Y_Monthly_Adj'] = None
-
-                # [4-2] 2년 주간 베타 데이터 수집
-                start_2y = (base_dt - timedelta(days=365*2+20)).strftime('%Y-%m-%d')
-                stock_data_2y = None
-                market_data_2y = None
-
-                try:
-                    # 주가 데이터: 이미 생성된 stock 객체 사용
-                    stock_hist_2y = stock.history(start=start_2y, end=end_date, auto_adjust=False)
-                    if not stock_hist_2y.empty:
-                        stock_data_2y = stock_hist_2y
-
-                    # 시장 지수 데이터: 한국 지수는 FDR 사용
-                    if ticker.endswith('.KS') or ticker.endswith('.KQ'):
-                        # 한국 시장 지수: FinanceDataReader 사용
-                        try:
-                            market_data_2y = fdr.DataReader(market_idx, start_2y, end_date)
-                            # FDR 데이터 인덱스를 timezone-naive DatetimeIndex로 변환
-                            if market_data_2y is not None and not market_data_2y.empty:
-                                if not isinstance(market_data_2y.index, pd.DatetimeIndex):
-                                    market_data_2y.index = pd.to_datetime(market_data_2y.index)
-                                if market_data_2y.index.tz is not None:
-                                    market_data_2y.index = market_data_2y.index.tz_localize(None)
-                        except Exception as fdr_err:
-                            st.warning(f"{ticker} 시장 지수 수집 실패 (FDR): {fdr_err}")
-                    else:
-                        # 해외 시장 지수: yfinance 사용
-                        market_hist_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
-                        if not market_hist_2y.empty:
-                            market_data_2y = market_hist_2y
-
-                except Exception as e:
-                    st.warning(f"{ticker} 2Y 데이터 수집 실패: {e}")
-                    pass
-
-                # 주간 종가 저장
-                if stock_data_2y is not None and market_data_2y is not None:
-                    if not stock_data_2y.empty and not market_data_2y.empty:
-                        # Close 컬럼 추출
-                        if isinstance(stock_data_2y, pd.DataFrame):
-                            stock_prices_2y = stock_data_2y['Close'] if 'Close' in stock_data_2y.columns else stock_data_2y.iloc[:, 0]
-                        else:
-                            stock_prices_2y = stock_data_2y
-
-                        if isinstance(market_data_2y, pd.DataFrame):
-                            market_prices_2y = market_data_2y['Close'] if 'Close' in market_data_2y.columns else market_data_2y.iloc[:, 0]
-                        else:
-                            market_prices_2y = market_data_2y
-
-                        # 인덱스 확인 및 변환
-                        if not isinstance(stock_prices_2y.index, pd.DatetimeIndex):
-                            stock_prices_2y.index = pd.to_datetime(stock_prices_2y.index)
-                        if stock_prices_2y.index.tz is not None:
-                            stock_prices_2y.index = stock_prices_2y.index.tz_localize(None)
-
-                        if not isinstance(market_prices_2y.index, pd.DatetimeIndex):
-                            market_prices_2y.index = pd.to_datetime(market_prices_2y.index)
-                        if market_prices_2y.index.tz is not None:
-                            market_prices_2y.index = market_prices_2y.index.tz_localize(None)
-
-                        # 주말 종가 저장 (W-FRI: 금요일 기준)
-                        stock_weekly_prices = stock_prices_2y.resample('W-FRI').last().dropna()
-                        market_weekly_prices = market_prices_2y.resample('W-FRI').last().dropna()
-
-                        if len(stock_weekly_prices) >= 50 and len(market_weekly_prices) >= 50:  # 최소 50주 데이터 필요
-                            gpcm['Stock_Weekly_Prices_2Y'] = stock_weekly_prices
-                            gpcm['Market_Weekly_Prices_2Y'] = market_weekly_prices
-                        else:
-                            gpcm['Stock_Weekly_Prices_2Y'] = None
-                            gpcm['Market_Weekly_Prices_2Y'] = None
-                    else:
-                        gpcm['Stock_Weekly_Prices_2Y'] = None
-                        gpcm['Market_Weekly_Prices_2Y'] = None
-                else:
-                    gpcm['Stock_Weekly_Prices_2Y'] = None
-                    gpcm['Market_Weekly_Prices_2Y'] = None
-
-                gpcm['Beta_2Y_Weekly_Raw'] = None
-                gpcm['Beta_2Y_Weekly_Adj'] = None
-
+                q_is_recent = stock.quarterly_income_stmt
+                q_bs_recent = stock.quarterly_balance_sheet
+                
+                if q_is_recent is not None and not q_is_recent.empty and q_bs_recent is not None and not q_bs_recent.empty:
+                    recent_f_dt = q_is_recent.columns[0] # 최신 분기 날짜
+                    recent_f_str = recent_f_dt.strftime('%Y-%m-%d')
+                    
+                    # 이미 'Y' 등에서 처리된 날짜라 하더라도 별도의 'Recent' 레이블로 중복 저장 (사용자 요청)
+                    gpcm_recent = {
+                        'Company': company_name, 'Ticker': ticker, 'Currency': currency,
+                        'Base_Date': recent_f_str,
+                        'Cash': 0, 'IBD': 0, 'NCI': 0, 'NOA(Option)': 0, 'Equity': 0,
+                        'Revenue': 0, 'EBIT': 0, 'EBITDA': 0, 'NI_Parent': 0,
+                        'Close': 0, 'Shares': 0, 'Market_Cap_M': 0, 'PL_Source': 'Quarterly (Recent)',
+                        'Exchange': exchange, 'Market_Index': market_idx,
+                        'Beta_5Y_Monthly_Raw': None, 'Beta_5Y_Monthly_Adj': None,
+                        'Beta_2Y_Weekly_Raw': None, 'Beta_2Y_Weekly_Adj': None,
+                        'Pretax_Income': 0, 'Tax_Rate': 0.22,
+                        'Debt_Ratio': 0, 'Unlevered_Beta_5Y': None, 'Unlevered_Beta_2Y': None,
+                    }
+                    
+                    # Recent BS
+                    recent_bs_data = q_bs_recent.iloc[:, 0]
+                    recent_bs_date_str = q_bs_recent.columns[0].strftime('%Y-%m-%d')
+                    bs_shares_r = None
+                    for acct_name in recent_bs_data.index:
+                        val = recent_bs_data.loc[acct_name]
+                        if pd.isna(val): continue
+                        val_f = float(val)
+                        if str(acct_name) == 'Ordinary Shares Number': bs_shares_r = val_f
+                        ev_tag = BS_HIGHLIGHT_MAP.get(str(acct_name), '')
+                        if str(acct_name) in BS_SUBTOTAL_EXCLUDE: ev_tag = ''
+                        
+                        raw_bs_rows.append({
+                            'Company': company_name, 'Ticker': ticker, 'Period': recent_bs_date_str, 'Label': 'Recent',
+                            'Currency': currency, 'Account': str(acct_name), 'EV_Tag': ev_tag, 'Amount_M': val_f/1e6
+                        })
+                        if ev_tag: gpcm_recent[ev_tag] += val_f/1e6
+                    
+                    gpcm_recent['Shares'] = bs_shares_r if bs_shares_r else float(info.get('sharesOutstanding', 0))
+                    
+                    # Recent Market Cap
+                    try:
+                        hist_r = stock.history(period='1d', auto_adjust=False)
+                        close_r = float(hist_r['Close'].iloc[-1]) if not hist_r.empty else info.get('previousClose', 0)
+                        p_date_r = hist_r.index[-1].strftime('%Y-%m-%d') if not hist_r.empty else '-'
+                    except: close_r=0.0; p_date_r='-'
+                    gpcm_recent['Close'] = close_r
+                    gpcm_recent['Market_Cap_M'] = (close_r * gpcm_recent['Shares'] / 1e6) if gpcm_recent['Shares'] else 0.0
+                    market_rows.append({
+                        'Company': company_name, 'Ticker': ticker, 'Base_Date': recent_f_str, 'Price_Date': p_date_r, 'Label': 'Recent',
+                        'Currency': currency, 'Close': close_r, 'Shares': gpcm_recent['Shares'], 'Market_Cap_M': round(gpcm_recent['Market_Cap_M'], 1)
+                    })
+                    
+                    # Recent PL
+                    recent_pl_data = q_is_recent.iloc[:, 0]
+                    calc_sums_r = {'Revenue': 0, 'OpIncome': 0, 'EBIT_yf': 0, 'EBITDA_yf': 0, 'NormEBITDA_yf': 0, 'NI_Parent': 0}
+                    for acct in recent_pl_data.index:
+                        acct_str = str(acct)
+                        hl_tag = PL_HIGHLIGHT_MAP.get(acct_str, '')
+                        calc_key = PL_CALC_KEY.get(acct_str, '')
+                        is_eps = 'EPS' in acct_str or 'Per Share' in acct_str
+                        is_shares = 'Average Shares' in acct_str
+                        
+                        val = recent_pl_data.loc[acct]
+                        if pd.isna(val): continue
+                        val_f = float(val)
+                        amt = val_f if is_eps else val_f/1e6
+                        unit = 'per share' if is_eps else ('M shares' if is_shares else 'M')
+                        
+                        raw_pl_rows.append({
+                            'Company': company_name, 'Ticker': ticker, 'Currency': currency,
+                            'Account': acct_str, 'GPCM_Tag': hl_tag, 'PL_Source': 'Quarterly',
+                            'Q_Label': 'Recent', 'Period': recent_f_str, 'Label': 'Recent', 
+                            'Amount_M': amt, 'Unit': unit, '_sort': PL_SORT.get(acct_str, 500)
+                        })
+                        if calc_key and not is_eps and not is_shares: calc_sums_r[calc_key] += val_f/1e6
+                        
+                    gpcm_recent['Revenue'] = calc_sums_r['Revenue']
+                    gpcm_recent['EBIT'] = calc_sums_r['OpIncome']
+                    ebitda_yf_r = calc_sums_r['EBITDA_yf'] if calc_sums_r['EBITDA_yf'] != 0 else calc_sums_r['NormEBITDA_yf']
+                    ebit_yf_r = calc_sums_r['EBIT_yf']
+                    da_amount_r = (ebitda_yf_r - ebit_yf_r) if (ebitda_yf_r != 0 and ebit_yf_r != 0) else 0
+                    gpcm_recent['EBITDA'] = calc_sums_r['OpIncome'] + da_amount_r
+                    gpcm_recent['NI_Parent'] = calc_sums_r['NI_Parent']
+                    
+                    # Tax Rate for Recent
+                    if 'Pretax Income' in recent_pl_data.index:
+                        pt_val = recent_pl_data.loc['Pretax Income']
+                        if pd.notna(pt_val): gpcm_recent['Pretax_Income'] = float(pt_val) / 1e6
+                    if country_code == 'KR': gpcm_recent['Tax_Rate'] = get_korean_marginal_tax_rate(gpcm_recent['Pretax_Income'])
+                    else: gpcm_recent['Tax_Rate'] = tax_rates_wiki.get(country_code, 0.25)
+                    
+                    all_period_data['Recent'][ticker] = gpcm_recent
             except Exception as e:
-                st.warning(f"Price data collection failed for {ticker}: {e}")
-                gpcm['Stock_Monthly_Prices_5Y'] = None
-                gpcm['Market_Monthly_Prices_5Y'] = None
-                gpcm['Beta_5Y_Monthly_Raw'] = None
-                gpcm['Beta_5Y_Monthly_Adj'] = None
-                gpcm['Beta_2Y_Weekly_Raw'] = None
-                gpcm['Beta_2Y_Weekly_Adj'] = None
+                st.warning(f"⚠️ {ticker}: 최신 분기 데이터(Recent) 수집 중 오류: {e}")
 
-            # [5] Tax Rate Calculation
-            # Wikipedia에서 법인세율 가져오기
-            tax_rates_wiki = get_corporate_tax_rates_from_wikipedia()
-            country_code = get_country_from_ticker(ticker)
+            # [Beta Calculation] Only for the Base Period (Label 'Y')
+            base_gpcm = all_period_data.get('Y', {}).get(ticker)
+            if base_gpcm:
+                # Price History
+                try:
+                    hist_10y_raw = stock.history(start=(base_dt - timedelta(days=365*10+20)).strftime('%Y-%m-%d'), end=base_dt.strftime('%Y-%m-%d'), auto_adjust=False)
+                    hist_10y = hist_10y_raw['Close'] if 'Close' in hist_10y_raw.columns else hist_10y_raw.iloc[:,0]
+                    if not hist_10y.empty:
+                        abs_s = hist_10y.copy(); abs_s.name = ticker; price_abs_dfs.append(abs_s)
+                        rel_s = (hist_10y / hist_10y.iloc[0]) * 100; rel_s.name = ticker; price_rel_dfs.append(rel_s)
+                except: pass
 
-            if pl_data is not None and 'Pretax Income' in pl_data.index:
-                pretax_vals = []
-                for d in pl_dates:
-                    val = pl_data.loc['Pretax Income', d]
-                    if pd.notna(val):
-                        pretax_vals.append(float(val) / 1e6)
-                if pretax_vals:
-                    gpcm['Pretax_Income'] = sum(pretax_vals)
+                try:
+                    start_5y = (base_dt - timedelta(days=365*5+20)).strftime('%Y-%m-%d')
+                    end_date = base_dt.strftime('%Y-%m-%d')
 
-            # 세율 결정
-            if country_code == 'KR':
-                # 한국: 세전순이익 기반 한계세율 (지방세 포함)
-                gpcm['Tax_Rate'] = get_korean_marginal_tax_rate(gpcm['Pretax_Income'])
-            else:
-                # 기타 국가: Wikipedia에서 크롤링한 세율
-                gpcm['Tax_Rate'] = tax_rates_wiki.get(country_code, 0.25)
+                    stock_data_5y = None; market_data_5y = None
+                    try:
+                        stock_hist_5y = stock.history(start=start_5y, end=end_date, auto_adjust=False)
+                        if not stock_hist_5y.empty: stock_data_5y = stock_hist_5y
 
-            # [6] 부채비율 계산 (개별 peer용)
-            # 실제 부채비율 계산: IBD / (IBD + Market Cap + NCI)
-            total_value = gpcm['IBD'] + gpcm['Market_Cap_M'] + gpcm['NCI']
-            if total_value > 0:
-                gpcm['Debt_Ratio'] = gpcm['IBD'] / total_value
-            else:
-                gpcm['Debt_Ratio'] = 0
+                        # Always use yfinance for market data as per user request
+                        market_data_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)
+                        
+                        if market_data_5y is not None and not market_data_5y.empty:
+                            if not isinstance(market_data_5y.index, pd.DatetimeIndex): market_data_5y.index = pd.to_datetime(market_data_5y.index)
+                            if market_data_5y.index.tz is not None: market_data_5y.index = market_data_5y.index.tz_localize(None)
+                    except Exception as e: st.warning(f"{ticker} 5Y 데이터 수집 실패: {e}")
 
-            gpcm_data[ticker] = gpcm
+                    if stock_data_5y is not None and market_data_5y is not None:
+                        if not stock_data_5y.empty and not market_data_5y.empty:
+                            stock_prices_5y = stock_data_5y['Close'] if isinstance(stock_data_5y, pd.DataFrame) and 'Close' in stock_data_5y.columns else (stock_data_5y.iloc[:, 0] if isinstance(stock_data_5y, pd.DataFrame) else stock_data_5y)
+                            market_prices_5y = market_data_5y['Close'] if isinstance(market_data_5y, pd.DataFrame) and 'Close' in market_data_5y.columns else (market_data_5y.iloc[:, 0] if isinstance(market_data_5y, pd.DataFrame) else market_data_5y)
+                            
+                            if not isinstance(stock_prices_5y.index, pd.DatetimeIndex): stock_prices_5y.index = pd.to_datetime(stock_prices_5y.index)
+                            if stock_prices_5y.index.tz is not None: stock_prices_5y.index = stock_prices_5y.index.tz_localize(None)
+                            if not isinstance(market_prices_5y.index, pd.DatetimeIndex): market_prices_5y.index = pd.to_datetime(market_prices_5y.index)
+                            if market_prices_5y.index.tz is not None: market_prices_5y.index = market_prices_5y.index.tz_localize(None)
+
+                            stock_monthly_prices = stock_prices_5y.resample('ME').last().dropna()
+                            market_monthly_prices = market_prices_5y.resample('ME').last().dropna()
+
+                            if len(stock_monthly_prices) >= 12 and len(market_monthly_prices) >= 12:
+                                base_gpcm['Stock_Monthly_Prices_5Y'] = stock_monthly_prices
+                                base_gpcm['Market_Monthly_Prices_5Y'] = market_monthly_prices
+                                
+                                # Python-side Beta Calculation
+                                s_ret = stock_monthly_prices.pct_change().dropna()
+                                m_ret = market_monthly_prices.pct_change().dropna()
+                                raw_5y, adj_5y = calculate_beta(s_ret, m_ret)
+                                base_gpcm['Beta_5Y_Monthly_Raw'] = raw_5y
+                                base_gpcm['Beta_5Y_Monthly_Adj'] = adj_5y
+                                
+                                # Unlevered Beta Calculation
+                                if adj_5y is not None:
+                                    equity_m = base_gpcm['Market_Cap_M'] + base_gpcm['NCI']
+                                    base_gpcm['Unlevered_Beta_5Y'] = calculate_unlevered_beta(adj_5y, base_gpcm['IBD'], equity_m, base_gpcm['Tax_Rate'])
+                            else:
+                                st.warning(f"{ticker}: 월별 데이터가 부족합니다")
+                                base_gpcm['Stock_Monthly_Prices_5Y'] = None; base_gpcm['Market_Monthly_Prices_5Y'] = None
+                                base_gpcm['Beta_5Y_Monthly_Raw'] = None; base_gpcm['Beta_5Y_Monthly_Adj'] = None
+                        else:
+                            base_gpcm['Stock_Monthly_Prices_5Y'] = None; base_gpcm['Market_Monthly_Prices_5Y'] = None
+                            base_gpcm['Beta_5Y_Monthly_Raw'] = None; base_gpcm['Beta_5Y_Monthly_Adj'] = None
+                    else:
+                        base_gpcm['Stock_Monthly_Prices_5Y'] = None; base_gpcm['Market_Monthly_Prices_5Y'] = None
+                        base_gpcm['Beta_5Y_Monthly_Raw'] = None; base_gpcm['Beta_5Y_Monthly_Adj'] = None
+
+                    # 2Y Weekly
+                    start_2y = (base_dt - timedelta(days=365*2+20)).strftime('%Y-%m-%d')
+                    stock_data_2y = None; market_data_2y = None
+                    try:
+                        stock_hist_2y = stock.history(start=start_2y, end=end_date, auto_adjust=False)
+                        if not stock_hist_2y.empty: stock_data_2y = stock_hist_2y
+
+                        market_data_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
+                        if market_data_2y is not None and not market_data_2y.empty:
+                            if not isinstance(market_data_2y.index, pd.DatetimeIndex): market_data_2y.index = pd.to_datetime(market_data_2y.index)
+                            if market_data_2y.index.tz is not None: market_data_2y.index = market_data_2y.index.tz_localize(None)
+                    except Exception as e: st.warning(f"{ticker} 2Y 데이터 수집 실패: {e}")
+
+                    if stock_data_2y is not None and market_data_2y is not None:
+                        if not stock_data_2y.empty and not market_data_2y.empty:
+                            stock_prices_2y = stock_data_2y['Close'] if isinstance(stock_data_2y, pd.DataFrame) and 'Close' in stock_data_2y.columns else (stock_data_2y.iloc[:, 0] if isinstance(stock_data_2y, pd.DataFrame) else stock_data_2y)
+                            market_prices_2y = market_data_2y['Close'] if isinstance(market_data_2y, pd.DataFrame) and 'Close' in market_data_2y.columns else (market_data_2y.iloc[:, 0] if isinstance(market_data_2y, pd.DataFrame) else market_data_2y)
+
+                            if not isinstance(stock_prices_2y.index, pd.DatetimeIndex): stock_prices_2y.index = pd.to_datetime(stock_prices_2y.index)
+                            if stock_prices_2y.index.tz is not None: stock_prices_2y.index = stock_prices_2y.index.tz_localize(None)
+                            if not isinstance(market_prices_2y.index, pd.DatetimeIndex): market_prices_2y.index = pd.to_datetime(market_prices_2y.index)
+                            if market_prices_2y.index.tz is not None: market_prices_2y.index = market_prices_2y.index.tz_localize(None)
+
+                            stock_weekly_prices = stock_prices_2y.resample('W').last().dropna()
+                            market_weekly_prices = market_prices_2y.resample('W').last().dropna()
+
+                            if len(stock_weekly_prices) >= 50 and len(market_weekly_prices) >= 50:
+                                base_gpcm['Stock_Weekly_Prices_2Y'] = stock_weekly_prices
+                                base_gpcm['Market_Weekly_Prices_2Y'] = market_weekly_prices
+                                
+                                # Python-side Beta Calculation
+                                s_ret_w = stock_weekly_prices.pct_change().dropna()
+                                m_ret_w = market_weekly_prices.pct_change().dropna()
+                                raw_2y, adj_2y = calculate_beta(s_ret_w, m_ret_w)
+                                base_gpcm['Beta_2Y_Weekly_Raw'] = raw_2y
+                                base_gpcm['Beta_2Y_Weekly_Adj'] = adj_2y
+                                
+                                # Unlevered Beta Calculation
+                                if adj_2y is not None:
+                                    equity_m = base_gpcm['Market_Cap_M'] + base_gpcm['NCI']
+                                    base_gpcm['Unlevered_Beta_2Y'] = calculate_unlevered_beta(adj_2y, base_gpcm['IBD'], equity_m, base_gpcm['Tax_Rate'])
+                            else:
+                                base_gpcm['Stock_Weekly_Prices_2Y'] = None; base_gpcm['Market_Weekly_Prices_2Y'] = None
+                                base_gpcm['Beta_2Y_Weekly_Raw'] = None; base_gpcm['Beta_2Y_Weekly_Adj'] = None
+                        else:
+                            base_gpcm['Stock_Weekly_Prices_2Y'] = None; base_gpcm['Market_Weekly_Prices_2Y'] = None
+                            base_gpcm['Beta_2Y_Weekly_Raw'] = None; base_gpcm['Beta_2Y_Weekly_Adj'] = None
+                    else:
+                        base_gpcm['Stock_Weekly_Prices_2Y'] = None; base_gpcm['Market_Weekly_Prices_2Y'] = None
+                        base_gpcm['Beta_2Y_Weekly_Raw'] = None; base_gpcm['Beta_2Y_Weekly_Adj'] = None
+                except Exception as e: 
+                    base_gpcm['Stock_Monthly_Prices_5Y'] = None; base_gpcm['Market_Monthly_Prices_5Y'] = None
+                    base_gpcm['Beta_5Y_Monthly_Raw'] = None; base_gpcm['Beta_5Y_Monthly_Adj'] = None
+                    base_gpcm['Beta_2Y_Weekly_Raw'] = None; base_gpcm['Beta_2Y_Weekly_Adj'] = None
+                    base_gpcm['Stock_Weekly_Prices_2Y'] = None; base_gpcm['Market_Weekly_Prices_2Y'] = None
 
         except Exception as e:
             st.error(f"Error fetching {ticker}: {e}")
             continue
 
     # ========================================
-    # [7] Target WACC 계산 (별도 시트용)
+    # [7] Target WACC 계산 (별도 시트용 - Base Label 'Y' 기준 데이터로만 수행)
     # ========================================
-    status_text.text("Target WACC 계산 중...")
-
-    # 7-1. 평균 부채비율 계산
-    debt_ratios = [gpcm['Debt_Ratio'] for gpcm in gpcm_data.values() if gpcm['Debt_Ratio'] > 0]
+    # 7-1. 평균 부채비율 계산 (base label 기준)
+    base_gpcm_list = list(all_period_data[base_label].values())
+    debt_ratios = [g['Debt_Ratio'] for g in base_gpcm_list if g['Debt_Ratio'] > 0]
     if debt_ratios:
         avg_debt_ratio = np.mean(debt_ratios)
         st.info(f"📊 피어 평균 부채비율 (D/V): {avg_debt_ratio*100:.1f}%")
@@ -803,7 +847,7 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
     beta_field = 'Unlevered_Beta_5Y' if beta_type == '5Y' else 'Unlevered_Beta_2Y'
     beta_label = "5Y Monthly" if beta_type == '5Y' else "2Y Weekly"
 
-    for gpcm in gpcm_data.values():
+    for gpcm in base_gpcm_list:
         if gpcm[beta_field] is not None and gpcm[beta_field] > 0:
             unlevered_betas.append(gpcm[beta_field])
 
@@ -815,8 +859,6 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
         st.warning(f"⚠️ Unlevered Beta ({beta_label}) 계산 불가. 기본값 {avg_unlevered_beta:.2f} 사용")
 
     # 7-3. Target의 Relevered Beta 계산
-    # Relevered Beta = Unlevered Beta × (1 + (1 - Tax Rate) × (D/E))
-    # D/E = D/V ÷ (1 - D/V)
     if avg_debt_ratio < 1.0:
         target_de_ratio = avg_debt_ratio / (1 - avg_debt_ratio)
         target_relevered_beta = avg_unlevered_beta * (1 + (1 - target_tax_rate) * target_de_ratio)
@@ -824,15 +866,12 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
         target_relevered_beta = avg_unlevered_beta
 
     # 7-4. Target의 자기자본비용 (Ke) 계산
-    # Ke = Rf + MRP × Relevered Beta + Size Premium
     target_ke = rf_rate + mrp * target_relevered_beta + size_premium
 
     # 7-5. Target의 세후 타인자본비용 (Kd_aftertax) 계산
-    # Kd_aftertax = Kd_pretax × (1 - Tax Rate)
     target_kd_aftertax = kd_pretax * (1 - target_tax_rate)
 
     # 7-6. Target의 WACC 계산
-    # WACC = (E/V) × Ke + (D/V) × Kd_aftertax
     equity_weight = 1 - avg_debt_ratio
     debt_weight = avg_debt_ratio
     target_wacc = equity_weight * target_ke + debt_weight * target_kd_aftertax
@@ -854,16 +893,26 @@ def get_gpcm_data(tickers_list, base_date_str, mrp=0.08, kd_pretax=0.035, size_p
         'Debt_Weight': debt_weight,
         'Target_WACC': target_wacc
     }
-
     st.success(f"✅ Target WACC: {target_wacc*100:.2f}%")
-
-    status_text.text("Data collection complete!")
-    return gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs, price_rel_dfs, ticker_to_name, avg_debt_ratio, target_wacc_data
+    return all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs, price_rel_dfs, ticker_to_name, avg_debt_ratio, target_wacc_data
 
 
-def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs, price_rel_dfs, base_date_str, ticker_to_name, target_wacc_data, beta_type="5Y"):
+def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs, price_rel_dfs, base_period_str, target_periods, ticker_to_name, target_wacc_data, beta_type="5Y"):
     output = io.BytesIO()
     wb = Workbook(); wb.remove(wb.active)
+
+    base_gpcm_data = all_period_data.get('Y', {})
+    # Determine labels in order (Recent, Y, Y-1, Y-2...)
+    def label_sort_key(x):
+        if x == 'Recent': return -1
+        if x == 'Y': return 0
+        try: return int(x.split('-')[1])
+        except: return 999
+    rel_labels = sorted([k for k in all_period_data.keys() if all_period_data[k]], key=label_sort_key)
+    
+    # Sheet Colors
+    COLOR_DARK_BLUE = '00338D'
+    COLOR_PURPLE = '6A1B9A'
 
     # Styles & Colors (v17)
     C_BL='00338D'; C_DB='1E2A5E'; C_MB='005EB8'; C_LB='C3D7EE'; C_PB='E8EFF8'
@@ -881,7 +930,15 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
 
     pH=PatternFill('solid',fgColor=C_BL); pW=PatternFill('solid',fgColor=C_W)
     pST=PatternFill('solid',fgColor=C_LG); pSEC=PatternFill('solid',fgColor=C_DB)
-    pSTAT=PatternFill('solid',fgColor=C_LB)
+    fHL=Font(name='Arial',bold=True,size=9,color=C_DB); fSEC=Font(name='Arial',bold=True,size=10,color=C_W)
+    fMUL=Font(name='Arial',bold=True,size=10,color=C_BL); fNOTE=Font(name='Arial',size=8,color=C_MG,italic=True)
+    fSTAT=Font(name='Arial',bold=True,size=9,color=C_DB)
+    fFRM=Font(name='Arial',size=9,color='000000'); fFRM_B=Font(name='Arial',bold=True,size=9,color='000000')
+    fLINK=Font(name='Arial',size=9,color='008000'); fLINK_B=Font(name='Arial',bold=True,size=9,color='008000')
+
+    pH=PatternFill('solid',fgColor=C_BL); pW=PatternFill('solid',fgColor=C_W)
+    pST=PatternFill('solid',fgColor=C_LG); pSEC=PatternFill('solid',fgColor=C_DB)
+    pSTAT=PatternFill('solid',fgColor=C_LB); pBETA=PatternFill('solid',fgColor='E8F5E9')
 
     ev_fills = {'Cash':PatternFill('solid',fgColor=C_GR), 'IBD':PatternFill('solid',fgColor=C_YL),
                 'NCI':PatternFill('solid',fgColor=C_PB), 'NOA(Option)':PatternFill('solid',fgColor=C_NOA),
@@ -901,67 +958,150 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
     NF_M='#,##0;(#,##0);"-"'; NF_M1='#,##0.0;(#,##0.0);"-"'; NF_PRC='#,##0.00;(#,##0.00);"-"'
     NF_INT='#,##0;(#,##0);"-"'; NF_EPS='#,##0.00;(#,##0.00);"-"'; NF_X='0.0"x";(0.0"x");"-"'
 
-    # [Sheet 1] BS_Full
-    ws_bs = wb.create_sheet('BS_Full')
-    if raw_bs_rows:
-        df_bs = pd.DataFrame(raw_bs_rows)
-        cols = [('Company','Company',18),('Ticker','Ticker',10), ('Period','Period',12),('Currency','Curr',6), ('Account','Account',42),('EV_Tag','EV Tag',14), ('Amount_M','Amount (M)',18)]
-        ws_bs.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(cols)); sc(ws_bs.cell(1,1,'Balance Sheet Full'),fo=fT)
-        r=3
-        for i,(lb,key) in enumerate([('Cash','Cash'),('IBD','IBD'),('NCI','NCI'),('NOA(Option)','NOA(Option)'),('Equity','Equity')]):
-            sc(ws_bs.cell(r,i+1,lb), fo=Font(name='Arial',size=8,bold=True),fi=ev_fills[key],al=aC,bd=BD)
-        r=5
-        for i,(col,disp,w) in enumerate(cols): ws_bs.column_dimensions[get_column_letter(i+1)].width=w; sc(ws_bs.cell(r,i+1,disp),fo=fH,fi=pH,al=aC,bd=BD)
-        hdr=r; r+=1
-        for _,rd in df_bs.iterrows():
-            ev_tag=rd['EV_Tag']; is_hl=bool(ev_tag)
-            row_fi=ev_fills.get(ev_tag, pST if r%2==0 else pW) if is_hl else (pST if r%2==0 else pW)
-            row_font=fHL if is_hl else fA
-            for i,(col,_,_) in enumerate(cols):
-                c=ws_bs.cell(r,i+1); v=rd[col]
-                if isinstance(v,(float,np.floating)): c.value=round(v,1) if pd.notna(v) else None
-                else: c.value=v
-                sc(c,fo=row_font,fi=row_fi,al=aR if col=='Amount_M' else aL,bd=BD,nf=NF_M if col=='Amount_M' else None)
-            r+=1
-        ws_bs.auto_filter.ref=f"A{hdr}:{get_column_letter(len(cols))}{r-1}"; ws_bs.freeze_panes=f'A{hdr+1}'
+    # [Sheet 1] Multiples_Trend (Move to front as per user request)
+    ws_trend = wb.create_sheet('Multiples_Trend')
+    ws_trend.sheet_properties.tabColor = COLOR_DARK_BLUE
+    
+    ws_trend.merge_cells(start_row=1, start_column=1, end_row=1, end_column=20)
+    sc(ws_trend.cell(1,1,'Multiples Trend Summary (Excel Formulas)'), fo=fT)
+    ws_trend.merge_cells(start_row=2, start_column=1, end_row=2, end_column=20)
+    sc(ws_trend.cell(2,1,'Base on dynamic BS/PL Sheets per period | Unit: Millions (local currency), Multiple (x)'), fo=fS)
 
-    # [Sheet 2] PL_Data
-    ws_pl = wb.create_sheet('PL_Data')
-    if raw_pl_rows:
-        df_pl = pd.DataFrame(raw_pl_rows).sort_values(['Company','_sort','Q_Label'])
-        cols = [('Company','Company',18),('Ticker','Ticker',10), ('Currency','Curr',6),('Account','Account',42), ('GPCM_Tag','GPCM Tag',14),('Unit','Unit',10), ('PL_Source','Source',14),('Q_Label','Q Label',9), ('Period','Period',12),('Amount_M','Amount',18)]
-        ws_pl.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(cols)); sc(ws_pl.cell(1,1,'Income Statement'),fo=fT)
-        r=5
-        for i,(col,disp,w) in enumerate(cols): ws_pl.column_dimensions[get_column_letter(i+1)].width=w; sc(ws_pl.cell(r,i+1,disp),fo=fH,fi=pH,al=aC,bd=BD)
-        hdr=r; r+=1
-        for _,rd in df_pl.iterrows():
-            is_hl=bool(rd['GPCM_Tag']); row_fi=ev_fills['PL_HL'] if is_hl else (pST if r%2==0 else pW)
-            row_font=fHL if is_hl else fA
-            for i,(col,_,_) in enumerate(cols):
-                if col=='_sort': continue
-                c=ws_pl.cell(r,i+1); v=rd[col]
-                if isinstance(v,(float,np.floating)): c.value=round(v,1) if pd.notna(v) else None
-                else: c.value=v
-                is_eps=rd.get('Unit','')=='per share'; nf=NF_EPS if is_eps else NF_M
-                sc(c,fo=row_font,fi=row_fi,al=aR if col=='Amount_M' else aL,bd=BD,nf=nf if col=='Amount_M' else None)
-            r+=1
-        ws_pl.auto_filter.ref=f"A{hdr}:{get_column_letter(len(cols))}{r-1}"; ws_pl.freeze_panes=f'A{hdr+1}'
+    tr_r = 4
+    trend_headers = ['Company', 'Ticker', 'Year Label', 'Period', 'Close', 'Shares', 'Mkt Cap', 'Cash', 'IBD', 'NCI', 'Equity', 'Revenue', 'EBIT', 'EBITDA', 'NI_Parent', 'EV', 'EV/EBITDA', 'PER', 'PBR', 'PSR']
+    for i, h in enumerate(trend_headers, 1):
+        sc(ws_trend.cell(tr_r, i, h), fo=fH, fi=pH, al=aC, bd=BD)
+        
+    ws_trend.column_dimensions['A'].width = 18
+    ws_trend.column_dimensions['B'].width = 10
+    ws_trend.column_dimensions['C'].width = 10 
+    ws_trend.column_dimensions['D'].width = 12 
+    for col_l in 'EFGHIJKLMNOP': ws_trend.column_dimensions[col_l].width = 14
+    for col_l in 'QRST': ws_trend.column_dimensions[col_l].width = 11
 
-    # [Sheet 3] Market_Cap
+    tr_r += 1
+    mc_sht = "'Market_Cap'"
+    for ticker_idx, (ticker, name) in enumerate(ticker_to_name.items()):
+        for label in rel_labels:
+            gpcm = all_period_data[label].get(ticker)
+            if not gpcm: continue
+            
+            p_dt = gpcm.get('Base_Date', '-')
+            row_fi = pW if ticker_idx % 2 == 0 else pST
+
+            ws_trend.cell(tr_r, 1, name); sc(ws_trend.cell(tr_r, 1), fo=fA, fi=row_fi, al=aL, bd=BD)
+            ws_trend.cell(tr_r, 2, ticker); sc(ws_trend.cell(tr_r, 2), fo=fA, fi=row_fi, al=aC, bd=BD)
+            ws_trend.cell(tr_r, 3, label); sc(ws_trend.cell(tr_r, 3), fo=fA, fi=row_fi, al=aC, bd=BD)
+            ws_trend.cell(tr_r, 4, p_dt); sc(ws_trend.cell(tr_r, 4), fo=fA, fi=row_fi, al=aC, bd=BD)
+            
+            # E, F, G: Close, Shares, Mkt Cap
+            ws_trend.cell(tr_r, 5).value = f'=SUMIFS({mc_sht}!F:F, {mc_sht}!B:B, $B{tr_r}, {mc_sht}!H:H, $C{tr_r})'
+            sc(ws_trend.cell(tr_r, 5), fo=fLINK, fi=row_fi, al=aR, bd=BD, nf=NF_PRC)
+            ws_trend.cell(tr_r, 6).value = f'=SUMIFS({mc_sht}!G:G, {mc_sht}!B:B, $B{tr_r}, {mc_sht}!H:H, $C{tr_r})'
+            sc(ws_trend.cell(tr_r, 6), fo=fLINK, fi=row_fi, al=aR, bd=BD, nf=NF_INT)
+            ws_trend.cell(tr_r, 7).value = f'=SUMIFS({mc_sht}!H:H, {mc_sht}!B:B, $B{tr_r}, {mc_sht}!H:H, $C{tr_r})'
+            sc(ws_trend.cell(tr_r, 7), fo=fLINK, fi=row_fi, al=aR, bd=BD, nf=NF_M1)
+
+            # H, I, J, K: Cash, IBD, NCI, Equity
+            bs_sn = f"BS_Full_{label}"
+            pl_sn = f"PL_Data_{label}"
+            ws_trend.cell(tr_r, 8).value = f'=SUMIFS(\'{bs_sn}\'!G:G, \'{bs_sn}\'!B:B, $B{tr_r}, \'{bs_sn}\'!F:F, "Cash")'
+            ws_trend.cell(tr_r, 9).value = f'=SUMIFS(\'{bs_sn}\'!G:G, \'{bs_sn}\'!B:B, $B{tr_r}, \'{bs_sn}\'!F:F, "IBD")'
+            ws_trend.cell(tr_r, 10).value = f'=SUMIFS(\'{bs_sn}\'!G:G, \'{bs_sn}\'!B:B, $B{tr_r}, \'{bs_sn}\'!F:F, "NCI")'
+            ws_trend.cell(tr_r, 11).value = f'=SUMIFS(\'{bs_sn}\'!G:G, \'{bs_sn}\'!B:B, $B{tr_r}, \'{bs_sn}\'!F:F, "Equity")'
+            for c_idx in range(8, 12): sc(ws_trend.cell(tr_r, c_idx), fo=fLINK, fi=row_fi, al=aR, bd=BD, nf=NF_M)
+
+            # L, M, N, O: Revenue, EBIT, EBITDA, NI_Parent
+            ws_trend.cell(tr_r, 12).value = f'=SUMIFS(\'{pl_sn}\'!J:J, \'{pl_sn}\'!B:B, $B{tr_r}, \'{pl_sn}\'!E:E, "Revenue")'
+            ws_trend.cell(tr_r, 13).value = f'=SUMIFS(\'{pl_sn}\'!J:J, \'{pl_sn}\'!B:B, $B{tr_r}, \'{pl_sn}\'!D:D, "Operating Income")'
+            ws_trend.cell(tr_r, 14).value = f'=M{tr_r} + SUMIFS(\'{pl_sn}\'!J:J, \'{pl_sn}\'!B:B, $B{tr_r}, \'{pl_sn}\'!D:D, "EBITDA") - SUMIFS(\'{pl_sn}\'!J:J, \'{pl_sn}\'!B:B, $B{tr_r}, \'{pl_sn}\'!D:D, "EBIT")'
+            ws_trend.cell(tr_r, 15).value = f'=SUMIFS(\'{pl_sn}\'!J:J, \'{pl_sn}\'!B:B, $B{tr_r}, \'{pl_sn}\'!E:E, "NI_Parent")'
+            for c_idx in [12, 13, 15]: sc(ws_trend.cell(tr_r, c_idx), fo=fLINK, fi=row_fi, al=aR, bd=BD, nf=NF_M)
+            sc(ws_trend.cell(tr_r, 14), fo=fFRM_B, fi=row_fi, al=aR, bd=BD, nf=NF_M)
+
+            # P: EV = Mkt Cap(G) + IBD(I) - Cash(H) + NCI(J)
+            ws_trend.cell(tr_r, 16).value = f'=G{tr_r} + I{tr_r} - H{tr_r} + J{tr_r}'
+            sc(ws_trend.cell(tr_r, 16), fo=fFRM_B, fi=PatternFill('solid',fgColor='E3F2FD'), al=aR, bd=BD, nf=NF_M)
+
+            # Q, R, S, T: EV/EBITDA, PER, PBR, PSR
+            ws_trend.cell(tr_r, 17).value = f'=IFERROR(IF(N{tr_r}>0, P{tr_r}/N{tr_r}, "N/M"), "N/M")'
+            ws_trend.cell(tr_r, 18).value = f'=IFERROR(IF(O{tr_r}>0, G{tr_r}/O{tr_r}, "N/M"), "N/M")'
+            ws_trend.cell(tr_r, 19).value = f'=IFERROR(IF(K{tr_r}>0, G{tr_r}/K{tr_r}, "N/M"), "N/M")'
+            ws_trend.cell(tr_r, 20).value = f'=IFERROR(IF(L{tr_r}>0, G{tr_r}/L{tr_r}, "N/M"), "N/M")'
+            for c_idx in range(17, 21): sc(ws_trend.cell(tr_r, c_idx), fo=fFRM_B, fi=PatternFill('solid',fgColor='FFF9C4'), al=aR, bd=BD, nf=NF_X)
+
+            tr_r += 1
+
+    ws_trend.auto_filter.ref = f"A4:T{tr_r-1}"
+    ws_trend.freeze_panes = 'A5'
+
+    # [Sheet 2] BS_Full
+    for label in rel_labels:
+        bs_rows_p = [r for r in raw_bs_rows if r.get('Label') == label]
+        if bs_rows_p:
+            ws_bs = wb.create_sheet(f'BS_Full_{label}')
+            ws_bs.sheet_properties.tabColor = COLOR_DARK_BLUE
+            df_bs = pd.DataFrame(bs_rows_p)
+            cols = [('Company','Company',18),('Ticker','Ticker',10), ('Period','Period',12),('Currency','Curr',6), ('Account','Account',42),('EV_Tag','EV Tag',14), ('Amount_M','Amount (M)',18)]
+            ws_bs.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(cols)); sc(ws_bs.cell(1,1,f'Balance Sheet ({label})'),fo=fT)
+            r=3
+            for i,(lb,key) in enumerate([('Cash','Cash'),('IBD','IBD'),('NCI','NCI'),('NOA(Option)','NOA(Option)'),('Equity','Equity')]):
+                sc(ws_bs.cell(r,i+1,lb), fo=Font(name='Arial',size=8,bold=True),fi=ev_fills[key],al=aC,bd=BD)
+            r=5
+            for i,(col,disp,w) in enumerate(cols): ws_bs.column_dimensions[get_column_letter(i+1)].width=w; sc(ws_bs.cell(r,i+1,disp),fo=fH,fi=pH,al=aC,bd=BD)
+            hdr=r; r+=1
+            for _,rd in df_bs.iterrows():
+                ev_tag=rd.get('EV_Tag', ''); is_hl=bool(ev_tag)
+                row_fi=ev_fills.get(ev_tag, pST if r%2==0 else pW) if is_hl else (pST if r%2==0 else pW)
+                row_font=fHL if is_hl else fA
+                for i,(col,_,_) in enumerate(cols):
+                    c=ws_bs.cell(r,i+1); v=rd.get(col, '')
+                    if isinstance(v,(float,np.floating)): c.value=round(v,1) if pd.notna(v) else None
+                    else: c.value=v
+                    sc(c,fo=row_font,fi=row_fi,al=aR if col=='Amount_M' else aL,bd=BD,nf=NF_M if col=='Amount_M' else None)
+                r+=1
+            ws_bs.auto_filter.ref=f"A{hdr}:{get_column_letter(len(cols))}{r-1}"; ws_bs.freeze_panes=f'A{hdr+1}'
+
+    # [Sheet 3] PL_Data
+    for label in rel_labels:
+        pl_rows_p = [r for r in raw_pl_rows if r.get('Label') == label]
+        if pl_rows_p:
+            ws_pl = wb.create_sheet(f'PL_Data_{label}')
+            ws_pl.sheet_properties.tabColor = COLOR_DARK_BLUE
+            df_pl = pd.DataFrame(pl_rows_p).sort_values(['Company','_sort','Q_Label'])
+            cols = [('Company','Company',18),('Ticker','Ticker',10), ('Currency','Curr',6),('Account','Account',42), ('GPCM_Tag','GPCM Tag',14),('Unit','Unit',10), ('PL_Source','Source',14),('Q_Label','Q Label',9), ('Period','Period',12),('Amount_M','Amount',18)]
+            ws_pl.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(cols)); sc(ws_pl.cell(1,1,f'Income Statement ({label})'),fo=fT)
+            r=5
+            for i,(col,disp,w) in enumerate(cols): ws_pl.column_dimensions[get_column_letter(i+1)].width=w; sc(ws_pl.cell(r,i+1,disp),fo=fH,fi=pH,al=aC,bd=BD)
+            hdr=r; r+=1
+            for _,rd in df_pl.iterrows():
+                is_hl=bool(rd.get('GPCM_Tag', '')); row_fi=ev_fills.get('PL_HL', pW) if is_hl else (pST if r%2==0 else pW)
+                row_font=fHL if is_hl else fA
+                for i,(col,_,_) in enumerate(cols):
+                    if col=='_sort': continue
+                    c=ws_pl.cell(r,i+1); v=rd.get(col, '')
+                    if isinstance(v,(float,np.floating)): c.value=round(v,1) if pd.notna(v) else None
+                    else: c.value=v
+                    is_eps=rd.get('Unit','')=='per share'; nf=NF_EPS if is_eps else NF_M
+                    sc(c,fo=row_font,fi=row_fi,al=aR if col=='Amount_M' else aL,bd=BD,nf=nf if col=='Amount_M' else None)
+                r+=1
+            ws_pl.auto_filter.ref=f"A{hdr}:{get_column_letter(len(cols))}{r-1}"; ws_pl.freeze_panes=f'A{hdr+1}'
+
+    # [Sheet 4] Market_Cap
     ws_mc = wb.create_sheet('Market_Cap')
+    ws_mc.sheet_properties.tabColor = COLOR_DARK_BLUE
     if market_rows:
         df_mkt = pd.DataFrame(market_rows)
-        cols = [('Company','Company',18),('Ticker','Ticker',10), ('Base_Date','Base Date',12),('Price_Date','Price Date',12), ('Currency','Curr',6),('Close','Close Price',14), ('Shares','Shares (Ord.)',18),('Market_Cap_M','Mkt Cap (M)',20)]
+        cols = [('Company','Company',18),('Ticker','Ticker',10), ('Base_Date','Base Date',12),('Price_Date','Price Date',12), ('Currency','Curr',6),('Close','Close Price',14), ('Shares','Shares (Ord.)',18),('Label','Label',10), ('Market_Cap_M','Mkt Cap (M)',20)]
         ws_mc.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(cols)); sc(ws_mc.cell(1,1,'Market Capitalization'),fo=fT)
         ws_mc.merge_cells(start_row=2,start_column=1,end_row=2,end_column=len(cols)); sc(ws_mc.cell(2,1,'Mkt Cap = Ordinary Shares Number (자기주식 차감) × Close Price (auto_adjust=False)'), fo=fS)
         r=4
         for i,(col,disp,w) in enumerate(cols): ws_mc.column_dimensions[get_column_letter(i+1)].width=w; sc(ws_mc.cell(r,i+1,disp),fo=fH,fi=pH,al=aC,bd=BD)
         mc_hdr=r; r+=1
-        MC_DATA_START=r
         for _,rd in df_mkt.iterrows():
             ev=(r%2==0)
             for i,(col,_,_) in enumerate(cols):
-                c=ws_mc.cell(r,i+1); v=rd[col]
+                c=ws_mc.cell(r,i+1); v=rd.get(col, '')
                 if isinstance(v,(float,np.floating)): c.value=round(v,2) if pd.notna(v) else None
                 else: c.value=v
                 nf=NF_PRC if col=='Close' else (NF_INT if col=='Shares' else (NF_M1 if col=='Market_Cap_M' else None))
@@ -969,9 +1109,9 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
             r+=1
         ws_mc.auto_filter.ref=f"A{mc_hdr}:{get_column_letter(len(cols))}{r-1}"; ws_mc.freeze_panes=f'A{mc_hdr+1}'
 
-    # [Sheet 3.5] Beta_Calculation (엑셀 수식으로 베타 계산)
+    # [Sheet 5] Beta_Calculation
     ws_beta = wb.create_sheet('Beta_Calculation')
-    wb.move_sheet('Beta_Calculation', offset=-3)  # 맨 앞으로 (Sheet 위치: 0)
+    ws_beta.sheet_properties.tabColor = COLOR_DARK_BLUE
 
     # 제목
     ws_beta.merge_cells('A1:F1')
@@ -980,14 +1120,14 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
 
     ws_beta.merge_cells('A2:F2')
     sc(ws_beta['A2'], fo=Font(name='Arial', size=9, color=C_MG, italic=True))
-    ws_beta['A2'] = f'5-Year Monthly & 2-Year Weekly Returns | Base: {base_date_str}'
+    ws_beta['A2'] = f'5-Year Monthly & 2-Year Weekly Returns | Base: {base_period_str}'
 
     r_beta = 4
 
     # 각 ticker별로 베타 계산 섹션 생성
     beta_result_rows = {}  # ticker: (raw_5y, adj_5y, raw_2y, adj_2y) 매핑
 
-    for idx, (ticker, gpcm) in enumerate(gpcm_data.items()):
+    for idx, (ticker, gpcm) in enumerate(base_gpcm_data.items()):
         # 회사 정보
         company_name = gpcm['Company']
         market_idx = gpcm['Market_Index']
@@ -1161,12 +1301,12 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
 
     ws_beta.freeze_panes = 'A4'
 
-    # [Sheet 4] GPCM
+    # [Sheet 7] GPCM (Valuation Summary)
     ws = wb.create_sheet('GPCM')
-    wb.move_sheet('GPCM', offset=-5)  # 맨 앞으로 (Sheet 위치: 0)
+    ws.sheet_properties.tabColor = COLOR_PURPLE
     TOTAL_COLS = 35  # D/E Ratio 컬럼 추가 (34 → 35)
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=TOTAL_COLS); sc(ws.cell(1,1,'GPCM Valuation Summary with Beta Analysis'), fo=fT)
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=TOTAL_COLS); sc(ws.cell(2,1,f'Base: {base_date_str} | Unit: Millions (local currency) | EV = MCap + IBD − Cash + NCI | Target WACC: See WACC_Calculation Sheet'), fo=fS)
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=TOTAL_COLS); sc(ws.cell(2,1,f'Base: {base_period_str} | Unit: Millions (local currency) | EV = MCap + IBD − Cash + NCI | Target WACC: See WACC_Calculation Sheet'), fo=fS)
 
     r=4
     sections = [(1,3,'Company Info'),(4,4,'Other Information'),(8,6,'BS → EV Components'),(14,4,'PL (LTM / Annual)'),(18,3,'Market Data'),(21,5,'Valuation Multiples'),(26,10,'Beta & Risk Analysis')]
@@ -1190,34 +1330,38 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
               10,10,10,10,14,9,10,10,12,12]
     for i,(h,w) in enumerate(zip(headers,widths)): ws.column_dimensions[get_column_letter(i+1)].width=w; sc(ws.cell(r,i+1,h), fo=fH, fi=pH, al=aC, bd=BD)
     
-    DATA_START=6; n_companies=len(gpcm_data); DATA_END=DATA_START+n_companies-1
+    DATA_START=6; n_companies=len(base_gpcm_data); DATA_END=DATA_START+n_companies-1
+    MC_DATA_START=5
     NF_BETA='0.00;(0.00);"-"'; NF_PCT='0.0%;(0.0%);"-"'; NF_RATIO='0.00;(0.00);"-"'
-    pBETA=PatternFill('solid',fgColor='E8F5E9')
-    for idx,(ticker, gpcm) in enumerate(gpcm_data.items()):
+    
+    bs_sn = "BS_Full_Y"
+    pl_sn = "PL_Data_Y"
+    
+    for idx,(ticker, gpcm) in enumerate(base_gpcm_data.items()):
         r=DATA_START+idx; mc_row=MC_DATA_START+idx; ev_row=(r%2==0); base_fi=pST if ev_row else pW
         # A-G: Company Info + Other Info
         vals=[gpcm['Company'],ticker,gpcm['Base_Date'],gpcm['Currency'],gpcm['PL_Source'],gpcm['Exchange'],gpcm['Market_Index']]
         for ci,v in enumerate(vals,1): ws.cell(r,ci,v); sc(ws.cell(r,ci), fo=fA, fi=base_fi, al=aL, bd=BD)
 
         # H-M: BS → EV Components (Formulas)
-        ws.cell(r,8).value=f'=SUMIFS(BS_Full!$G:$G,BS_Full!$B:$B,$B{r},BS_Full!$F:$F,"Cash")'; sc(ws.cell(r,8), fo=fLINK_B, fi=ev_fills['Cash'], al=aR, bd=BD, nf=NF_M)
-        ws.cell(r,9).value=f'=SUMIFS(BS_Full!$G:$G,BS_Full!$B:$B,$B{r},BS_Full!$F:$F,"IBD")'; sc(ws.cell(r,9), fo=fLINK_B, fi=ev_fills['IBD'], al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,8).value=f'=SUMIFS(\'{bs_sn}\'!$G:$G,\'{bs_sn}\'!$B:$B,$B{r},\'{bs_sn}\'!$F:$F,"Cash")'; sc(ws.cell(r,8), fo=fLINK_B, fi=ev_fills['Cash'], al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,9).value=f'=SUMIFS(\'{bs_sn}\'!$G:$G,\'{bs_sn}\'!$B:$B,$B{r},\'{bs_sn}\'!$F:$F,"IBD")'; sc(ws.cell(r,9), fo=fLINK_B, fi=ev_fills['IBD'], al=aR, bd=BD, nf=NF_M)
         ws.cell(r,10).value=f'=I{r}-H{r}'; sc(ws.cell(r,10), fo=fFRM_B, fi=base_fi, al=aR, bd=BD, nf=NF_M)
-        ws.cell(r,11).value=f'=SUMIFS(BS_Full!$G:$G,BS_Full!$B:$B,$B{r},BS_Full!$F:$F,"NCI")'; sc(ws.cell(r,11), fo=fLINK_B, fi=ev_fills['NCI'], al=aR, bd=BD, nf=NF_M)
-        ws.cell(r,12).value=f'=SUMIFS(BS_Full!$G:$G,BS_Full!$B:$B,$B{r},BS_Full!$F:$F,"Equity")'; sc(ws.cell(r,12), fo=fLINK_B, fi=ev_fills['Equity'], al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,11).value=f'=SUMIFS(\'{bs_sn}\'!$G:$G,\'{bs_sn}\'!$B:$B,$B{r},\'{bs_sn}\'!$F:$F,"NCI")'; sc(ws.cell(r,11), fo=fLINK_B, fi=ev_fills['NCI'], al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,12).value=f'=SUMIFS(\'{bs_sn}\'!$G:$G,\'{bs_sn}\'!$B:$B,$B{r},\'{bs_sn}\'!$F:$F,"Equity")'; sc(ws.cell(r,12), fo=fLINK_B, fi=ev_fills['Equity'], al=aR, bd=BD, nf=NF_M)
         # M (EV)
         ws.cell(r,13).value=f'=T{r}+I{r}-H{r}+K{r}'; sc(ws.cell(r,13), fo=fFRM_B, fi=PatternFill('solid',fgColor=C_PB), al=aR, bd=BD, nf=NF_M)
 
         # N-Q: PL (LTM/Annual)
-        ws.cell(r,14).value=f'=SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$E:$E,"Revenue")'; sc(ws.cell(r,14), fo=fLINK_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
-        ws.cell(r,15).value=f'=SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$D:$D,"Operating Income")'; sc(ws.cell(r,15), fo=fLINK_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
-        ws.cell(r,16).value=f'=O{r}+SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$D:$D,"EBITDA")-SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$D:$D,"EBIT")'; sc(ws.cell(r,16), fo=fFRM_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
-        ws.cell(r,17).value=f'=SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$E:$E,"NI_Parent")'; sc(ws.cell(r,17), fo=fLINK_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,14).value=f'=SUMIFS(\'{pl_sn}\'!$J:$J,\'{pl_sn}\'!$B:$B,$B{r},\'{pl_sn}\'!$E:$E,"Revenue")'; sc(ws.cell(r,14), fo=fLINK_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,15).value=f'=SUMIFS(\'{pl_sn}\'!$J:$J,\'{pl_sn}\'!$B:$B,$B{r},\'{pl_sn}\'!$D:$D,"Operating Income")'; sc(ws.cell(r,15), fo=fLINK_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,16).value=f'=O{r}+SUMIFS(\'{pl_sn}\'!$J:$J,\'{pl_sn}\'!$B:$B,$B{r},\'{pl_sn}\'!$D:$D,"EBITDA")-SUMIFS(\'{pl_sn}\'!$J:$J,\'{pl_sn}\'!$B:$B,$B{r},\'{pl_sn}\'!$D:$D,"EBIT")'; sc(ws.cell(r,16), fo=fFRM_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,17).value=f'=SUMIFS(\'{pl_sn}\'!$J:$J,\'{pl_sn}\'!$B:$B,$B{r},\'{pl_sn}\'!$E:$E,"NI_Parent")'; sc(ws.cell(r,17), fo=fLINK_B, fi=ev_fills['PL_HL'], al=aR, bd=BD, nf=NF_M)
 
         # R-T: Market Data
         ws.cell(r,18).value=f'=Market_Cap!F{mc_row}'; sc(ws.cell(r,18), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_PRC)
         ws.cell(r,19).value=f'=Market_Cap!G{mc_row}'; sc(ws.cell(r,19), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_INT)
-        ws.cell(r,20).value=f'=Market_Cap!H{mc_row}'; sc(ws.cell(r,20), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_M1)
+        ws.cell(r,20).value=f'=Market_Cap!I{mc_row}'; sc(ws.cell(r,20), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_M1)
 
         # U-Y: Valuation Multiples
         pMULT=PatternFill('solid',fgColor=C_PB)
@@ -1260,7 +1404,7 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
         sc(ws.cell(r,29), fo=fLINK, fi=PatternFill('solid',fgColor='FFF9C4'), al=aR, bd=BD, nf=NF_BETA)
 
         # Pretax Income (Formula)
-        ws.cell(r,30).value=f'=SUMIFS(PL_Data!$J:$J,PL_Data!$B:$B,$B{r},PL_Data!$D:$D,"Pretax Income")'; sc(ws.cell(r,30), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_M)
+        ws.cell(r,30).value=f'=SUMIFS(\'{pl_sn}\'!$J:$J,\'{pl_sn}\'!$B:$B,$B{r},\'{pl_sn}\'!$D:$D,"Pretax Income")'; sc(ws.cell(r,30), fo=fLINK, fi=base_fi, al=aR, bd=BD, nf=NF_M)
 
         # Tax Rate
         ws.cell(r,31,gpcm['Tax_Rate']); sc(ws.cell(r,31), fo=fA, fi=base_fi, al=aR, bd=BD, nf=NF_PCT)
@@ -1311,7 +1455,7 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
     r+=2
     notes = [
         '[ Valuation Methodology Notes ]',
-        f'• Base Date: {base_date_str} | Unit: Millions (local currency)',
+        f'• Base Date: {base_period_str} | Unit: Millions (local currency)',
         '• EV = Market Cap + IBD − Cash + NCI',
         '• Cash includes: Cash & Cash Equivalents + Other Short-Term Investments',
         '• NOA(Option) in BS_Full: Long-Term Equity Investment, Investment In Financial Assets, Investment Properties etc.',
@@ -1363,18 +1507,13 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
     # 틀고정: BS → EV Components 이전 (H6 = Company/Ticker/등 고정, BS부터 스크롤)
     ws.freeze_panes='H6'
 
-    # [Sheet 4.5] WACC_Calculation (Target 기업의 WACC 계산)
+    # [Sheet 6] WACC_Calculation (Target 기업의 WACC 계산)
     ws_wacc = wb.create_sheet('WACC_Calculation')
-    wb.move_sheet('WACC_Calculation', offset=-5)  # GPCM 다음 위치 (Sheet 위치: 1)
-
-    # WACC 시트 제목
-    ws_wacc.merge_cells('A1:D1')
-    sc(ws_wacc['A1'], fo=Font(name='Arial', bold=True, size=14, color=C_BL))
-    ws_wacc['A1'] = 'Target WACC Calculation'
+    ws_wacc.sheet_properties.tabColor = COLOR_DARK_BLUE
 
     ws_wacc.merge_cells('A2:D2')
     sc(ws_wacc['A2'], fo=Font(name='Arial', size=9, color=C_MG, italic=True))
-    ws_wacc['A2'] = f'Base: {base_date_str} | Peer Average Method'
+    ws_wacc['A2'] = f'Base: {base_period_str} | Peer Average Method'
 
     # 스타일 정의
     pWACC_PARAM = PatternFill('solid', fgColor='E3F2FD')  # 연한 파란색 (입력값)
@@ -1674,6 +1813,10 @@ def create_excel(gpcm_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs
             chart.series.append(s)
         ws_ph.add_chart(chart, f"{get_column_letter(rel_start+len(df_m.columns)+1)}3")
 
+    # Temp 시트 삭제
+    if 'Temp' in wb.sheetnames:
+        del wb['Temp']
+
     wb.save(output)
     output.seek(0)
     return output
@@ -1694,6 +1837,269 @@ except:
 
 # 현재 시간 (이미 import datetime이 되어 있으므로 바로 사용)
 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def export_historical_excel_global_v2(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, target_periods, ticker_to_name):
+    import io, pandas as pd, numpy as np
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    output = io.BytesIO()
+    wb = Workbook(); wb.remove(wb.active)
+
+    # Determine labels in order (Recent, Y, Y-1, Y-2...)
+    def label_sort_key(x):
+        if x == 'Recent': return -1
+        if x == 'Y': return 0
+        try: return int(x.split('-')[1])
+        except: return 999
+    rel_labels = sorted([k for k in all_period_data.keys() if all_period_data[k]], key=label_sort_key)
+    
+    # Sheet Colors
+    COLOR_DARK_BLUE = '00338D'
+    COLOR_PURPLE = '6A1B9A'
+
+    # Styles & Colors (NameError sc 방지용 로컬 정의)
+    C_BL='00338D'; C_DB='1E2A5E'; C_MB='005EB8'; C_LB='C3D7EE'; C_PB='E8EFF8'
+    C_DG='333333'; C_MG='666666'; C_LG='F5F5F5'; C_BG='B0B0B0'; C_W='FFFFFF'
+    C_GR='E2EFDA'; C_YL='FFF8E1'; C_NOA='FCE4EC'
+
+    S1=Side(style='thin',color=C_BG); BD=Border(left=S1,right=S1,top=S1,bottom=S1)
+    fT=Font(name='Arial',bold=True,size=14,color=C_BL); fS=Font(name='Arial',size=9,color=C_MG,italic=True)
+    fH=Font(name='Arial',bold=True,size=9,color=C_W); fA=Font(name='Arial',size=9,color=C_DG)
+    fHL=Font(name='Arial',bold=True,size=9,color=C_DB)
+    fFRM=Font(name='Arial',size=9,color='000000'); fFRM_B=Font(name='Arial',bold=True,size=9,color='000000')
+    fLINK=Font(name='Arial',size=9,color='008000')
+
+    pH=PatternFill('solid',fgColor=C_BL); pW=PatternFill('solid',fgColor=C_W)
+    pST=PatternFill('solid',fgColor=C_LG); pSEC2=PatternFill('solid',fgColor=C_DB)
+    pSEC1=PatternFill('solid',fgColor='1565C0') # 진한 파랑
+
+    ev_fills = {'Cash':PatternFill('solid',fgColor=C_GR), 'IBD':PatternFill('solid',fgColor=C_YL),
+                'NCI':PatternFill('solid',fgColor=C_PB), 'NOA(Option)':PatternFill('solid',fgColor=C_NOA),
+                'Equity':PatternFill('solid',fgColor=C_LB), 'PL_HL':PatternFill('solid',fgColor=C_YL),
+                'NI_Parent':PatternFill('solid',fgColor=C_YL)}
+    
+    aC=Alignment(horizontal='center',vertical='center',wrap_text=True)
+    aL=Alignment(horizontal='left',vertical='center',indent=1)
+    aR=Alignment(horizontal='right',vertical='center')
+    NF_M='#,##0;(#,##0);"-"'; NF_M1='#,##0.0;(#,##0.0);"-"'; NF_PRC='#,##0.00;(#,##0.00);"-"'
+    NF_INT='#,##0;(#,##0);"-"'; NF_EPS='#,##0.00;(#,##0.00);"-"'; NF_X='0.0"x";(0.0"x");"-"'; NF_PCT='0.0%;(0.0%);"-"'
+
+    def sc(c,fo=None,fi=None,al=None,bd=None,nf=None):
+        if fo:c.font=fo
+        if fi:c.fill=fi
+        if al:c.alignment=al
+        if bd:c.border=bd
+        if nf:c.number_format=nf
+
+    # [1] Summary Sheet
+    ws_summ = wb.create_sheet('Historical_Summary')
+    ws_summ.sheet_properties.tabColor = COLOR_PURPLE
+    
+    ws_summ.merge_cells('A1:AA1')
+    ws_summ['A1'] = f"Historical Financial Summary - yfinance Base (Label: Y, Y-1...)"
+    sc(ws_summ['A1'], fo=fT)
+    ws_summ.merge_cells('A2:AA2')
+    ws_summ['A2'] = "Base on dynamic BS/PL Sheets per period | Unit: Millions (local currency)"
+    sc(ws_summ['A2'], fo=fS)
+    
+    # ... (metrics definition remains same)
+    
+    mc_map = {} 
+    
+    ws_summ.cell(row=3, column=1, value="Company"); sc(ws_summ.cell(row=3, column=1), fo=fH, fi=pSEC1, al=aC, bd=BD)
+    ws_summ.cell(row=3, column=2, value="Ticker"); sc(ws_summ.cell(row=3, column=2), fo=fH, fi=pSEC1, al=aC, bd=BD)
+    ws_summ.merge_cells('A3:A4')
+    ws_summ.merge_cells('B3:B4')
+
+    col_idx = 3
+    for m_key, m_name, _, _ in [
+        ('Financial Date', 'Financial Date', 'Formula_Date', None),
+        ('Revenue', 'Revenue(매출)', 'PL_Tag', NF_M), 
+        ('Gross Profit', 'Gross Profit', 'PL_Acc', NF_M), 
+        ('Operating Income', 'EBIT(영업이익)', 'PL_Acc', NF_M), 
+        ('EBITDA_Calc', 'EBITDA', 'Formula', NF_M), 
+        ('NI_Parent', 'Net Income(순이익)', 'PL_Tag', NF_M),
+        ('Total Assets', 'Total Assets(자산)', 'BS_Acc', NF_M), 
+        ('Total Liabilities Net Minority Interest', 'Total Liab(부채)', 'BS_Acc', NF_M), 
+        ('Equity', 'Equity(자본)', 'BS_Tag', NF_M),
+        ('Cash', 'Cash', 'BS_Tag', NF_M), 
+        ('IBD', 'IBD(차입금)', 'BS_Tag', NF_M),
+        ('NCI', 'NCI(비지배지분)', 'BS_Tag', NF_M),
+        ('NetDebt', 'Net Debt(순부채)', 'Formula', NF_M),
+        ('OPM', 'OPM(영업이익률)', 'Formula', NF_PCT), 
+        ('DebtRatio', 'Debt Ratio(부채비율)', 'Formula', NF_PCT),
+        ('Mkt_Cap', 'Market Cap(시가총액)', 'Mkt', NF_M1),
+        ('EV', 'EV(기업가치)', 'Formula', NF_M),
+    ]:
+        start_col = col_idx
+        end_col = col_idx + len(rel_labels) - 1
+        ws_summ.merge_cells(start_row=3, start_column=start_col, end_row=3, end_column=end_col)
+        ws_summ.cell(row=3, column=start_col, value=m_name)
+        sc(ws_summ.cell(row=3, column=start_col), fo=fH, fi=pSEC1, al=aC, bd=BD)
+        
+        for label in rel_labels:
+            ws_summ.cell(row=4, column=col_idx, value=label)
+            sc(ws_summ.cell(row=4, column=col_idx), fo=fH, fi=pSEC2, al=aC, bd=BD)
+            mc_map[(m_key, label)] = get_column_letter(col_idx)
+            col_idx += 1
+
+    r = 5
+    for ticker, comp_name in ticker_to_name.items():
+        ws_summ.cell(row=r, column=1, value=comp_name); sc(ws_summ.cell(row=r, column=1), fo=fA, bd=BD)
+        ws_summ.cell(row=r, column=2, value=ticker); sc(ws_summ.cell(row=r, column=2), fo=fA, al=aC, bd=BD)
+        
+        c = 3
+        for m_key, m_name, m_type, fmt in [
+            ('Financial Date', 'Financial Date', 'Formula_Date', None),
+            ('Revenue', 'Revenue(매출)', 'PL_Tag', NF_M), 
+            ('Gross Profit', 'Gross Profit', 'PL_Acc', NF_M), 
+            ('Operating Income', 'EBIT(영업이익)', 'PL_Acc', NF_M), 
+            ('EBITDA_Calc', 'EBITDA', 'Formula', NF_M), 
+            ('NI_Parent', 'Net Income(순익)', 'PL_Tag', NF_M),
+            ('Total Assets', 'Total Assets(자산)', 'BS_Acc', NF_M), 
+            ('Total Liabilities Net Minority Interest', 'Total Liab(부채)', 'BS_Acc', NF_M), 
+            ('Equity', 'Equity(자본)', 'BS_Tag', NF_M),
+            ('Cash', 'Cash', 'BS_Tag', NF_M), 
+            ('IBD', 'IBD(차입금)', 'BS_Tag', NF_M),
+            ('NCI', 'NCI(비지배지분)', 'BS_Tag', NF_M),
+            ('NetDebt', 'Net Debt(순부채)', 'Formula', NF_M),
+            ('OPM', 'OPM(영업이익률)', 'Formula', NF_PCT), 
+            ('DebtRatio', 'Debt Ratio(부채비율)', 'Formula', NF_PCT),
+            ('Mkt_Cap', 'Market Cap(시가총액)', 'Mkt', NF_M1),
+            ('EV', 'EV(기업가치)', 'Formula', NF_M),
+        ]:
+            for label in rel_labels:
+                is_recent = (label == 'Recent')
+                bs_sn = 'BS_최신' if is_recent else f"BS_Full_{label}"
+                pl_sn = 'PL_최신' if is_recent else f"PL_Data_{label}"
+                
+                v = ""
+                if m_type == 'Formula_Date':
+                    # Get actual fiscal date for this peer and label
+                    gpcm_p = all_period_data[label].get(ticker)
+                    v = gpcm_p.get('Base_Date', '-') if gpcm_p else "-"
+                elif m_type == 'BS_Tag':
+                    v = f'=SUMIFS(\'{bs_sn}\'!G:G, \'{bs_sn}\'!B:B, $B{r}, \'{bs_sn}\'!F:F, "{m_key}")'
+                elif m_type == 'BS_Acc':
+                    v = f'=SUMIFS(\'{bs_sn}\'!G:G, \'{bs_sn}\'!B:B, $B{r}, \'{bs_sn}\'!E:E, "{m_key}")'
+                elif m_type == 'PL_Tag':
+                    v = f'=SUMIFS(\'{pl_sn}\'!J:J, \'{pl_sn}\'!B:B, $B{r}, \'{pl_sn}\'!E:E, "{m_key}")'
+                elif m_type == 'PL_Acc':
+                    v = f'=SUMIFS(\'{pl_sn}\'!J:J, \'{pl_sn}\'!B:B, $B{r}, \'{pl_sn}\'!D:D, "{m_key}")'
+                elif m_type == 'Mkt':
+                    v = f'=SUMIFS(Market_Cap!I:I, Market_Cap!B:B, $B{r}, Market_Cap!H:H, "{label}")'
+                elif m_type == 'Formula':
+                    if m_key == 'EBITDA_Calc':
+                        ebit_addr = f"{mc_map[('Operating Income', label)]}{r}"
+                        v = f'={ebit_addr} + SUMIFS(\'{pl_sn}\'!J:J, \'{pl_sn}\'!B:B, $B{r}, \'{pl_sn}\'!D:D, "EBITDA") - SUMIFS(\'{pl_sn}\'!J:J, \'{pl_sn}\'!B:B, $B{r}, \'{pl_sn}\'!D:D, "EBIT")'
+                    elif m_key == 'NetDebt':
+                        v = f"={mc_map[('IBD', label)]}{r} - {mc_map[('Cash', label)]}{r}"
+                    elif m_key == 'OPM':
+                        v = f'=IFERROR({mc_map[('Operating Income', label)]}{r}/{mc_map[('Revenue', label)]}{r}, "")'
+                    elif m_key == 'DebtRatio':
+                        v = f'=IFERROR({mc_map[('Total Liabilities Net Minority Interest', label)]}{r}/{mc_map[('Equity', label)]}{r}, "")'
+                    elif m_key == 'EV':
+                        v = f"={mc_map[('Mkt_Cap', label)]}{r} + {mc_map[('IBD', label)]}{r} - {mc_map[('Cash', label)]}{r} + {mc_map[('NCI', label)]}{r}"
+
+                ws_summ.cell(row=r, column=c, value=v)
+                font_style = fFRM_B if m_type == 'Formula' else (fA if m_type == 'Formula_Date' else fLINK)
+                sc(ws_summ.cell(row=r, column=c), fo=font_style, nf=fmt, bd=BD)
+                c += 1
+        r += 1
+
+    ws_summ.column_dimensions['A'].width = 18
+    ws_summ.column_dimensions['B'].width = 10
+    for i in range(3, c):
+        ws_summ.column_dimensions[get_column_letter(i)].width = 14
+    ws_summ.freeze_panes = "C5"
+
+    # [2] BS_Full, PL_Data 시트들 생성
+    # Recent 시트들을 먼저 생성하여 Summary 바로 뒤에 오도록 함 (index 1, 2)
+    # bs_idx = 1 # Historical_Summary가 0번
+    for label in rel_labels:
+        bs_rows_p = [row for row in raw_bs_rows if row.get('Label') == label]
+        if bs_rows_p:
+            is_recent = (label == 'Recent')
+            sheet_title = 'BS_최신' if is_recent else f'BS_Full_{label}'
+            # Recent면 인덱스 1에 삽입, 아니면 맨 뒤에 추가
+            ws_bs = wb.create_sheet(sheet_title, 1 if is_recent else None)
+            ws_bs.sheet_properties.tabColor = COLOR_DARK_BLUE
+            
+            df_bs = pd.DataFrame(bs_rows_p)
+            cols = [('Company','Company',18),('Ticker','Ticker',10), ('Period','Period',12),('Currency','Curr',6), ('Account','Account',42),('EV_Tag','EV Tag',14), ('Amount_M','Amount (M)',18)]
+            ws_bs.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(cols)); sc(ws_bs.cell(1,1,f'Balance Sheet ({label})'),fo=fT)
+            r_idx=3
+            for i,(lb,key) in enumerate([('Cash','Cash'),('IBD','IBD'),('NCI','NCI'),('NOA(Option)','NOA(Option)'),('Equity','Equity')]):
+                sc(ws_bs.cell(r_idx,i+1,lb), fo=Font(name='Arial',size=8,bold=True),fi=ev_fills[key],al=aC,bd=BD)
+            r_idx=5
+            for i,(col,disp,w) in enumerate(cols): ws_bs.column_dimensions[get_column_letter(i+1)].width=w; sc(ws_bs.cell(r_idx,i+1,disp),fo=fH,fi=pH,al=aC,bd=BD)
+            hdr=r_idx; r_idx+=1
+            for _,rd in df_bs.iterrows():
+                ev_tag=rd.get('EV_Tag', ''); is_hl=bool(ev_tag)
+                row_fi=ev_fills.get(ev_tag, pST if r_idx%2==0 else pW) if is_hl else (pST if r_idx%2==0 else pW)
+                row_font=fHL if is_hl else fA
+                for i,(col,_,_) in enumerate(cols):
+                    c_cell=ws_bs.cell(r_idx,i+1); v=rd.get(col, '')
+                    if isinstance(v,(float,np.floating)): c_cell.value=round(v,1) if pd.notna(v) else None
+                    else: c_cell.value=v
+                    sc(c_cell,fo=row_font,fi=row_fi,al=aR if col=='Amount_M' else aL,bd=BD,nf=NF_M if col=='Amount_M' else None)
+                r_idx+=1
+            ws_bs.auto_filter.ref=f"A{hdr}:{get_column_letter(len(cols))}{r_idx-1}"; ws_bs.freeze_panes=f'A{hdr+1}'
+
+    for label in rel_labels:
+        pl_rows_p = [row for row in raw_pl_rows if row.get('Label') == label]
+        if pl_rows_p:
+            is_recent = (label == 'Recent')
+            sheet_title = 'PL_최신' if is_recent else f'PL_Data_{label}'
+            # Recent면 인덱스 2에 삽입 (BS_최신이 인덱스 1이므로 그 뒤), 아니면 맨 뒤에 추가
+            ws_pl = wb.create_sheet(sheet_title, 2 if is_recent else None)
+            ws_pl.sheet_properties.tabColor = COLOR_DARK_BLUE
+            
+            df_pl = pd.DataFrame(pl_rows_p).sort_values(['Company','_sort','Q_Label'])
+            cols = [('Company','Company',18),('Ticker','Ticker',10), ('Currency','Curr',6),('Account','Account',42), ('GPCM_Tag','GPCM Tag',14),('Unit','Unit',10), ('PL_Source','Source',14),('Q_Label','Q Label',9), ('Period','Period',12),('Amount_M','Amount',18)]
+            ws_pl.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(cols)); sc(ws_pl.cell(1,1,f'Income Statement ({label})'),fo=fT)
+            r_idx=5
+            for i,(col,disp,w) in enumerate(cols): ws_pl.column_dimensions[get_column_letter(i+1)].width=w; sc(ws_pl.cell(r_idx,i+1,disp),fo=fH,fi=pH,al=aC,bd=BD)
+            hdr=r_idx; r_idx+=1
+            for _,rd in df_pl.iterrows():
+                is_hl=bool(rd.get('GPCM_Tag', '')); row_fi=ev_fills.get('PL_HL', pW) if is_hl else (pST if r_idx%2==0 else pW)
+                row_font=fHL if is_hl else fA
+                for i,(col,_,_) in enumerate(cols):
+                    if col=='_sort': continue
+                    c_cell=ws_pl.cell(r_idx,i+1); v=rd.get(col, '')
+                    if isinstance(v,(float,np.floating)): c_cell.value=round(v,1) if pd.notna(v) else None
+                    else: c_cell.value=v
+                    is_eps=rd.get('Unit','')=='per share'; nf=NF_EPS if is_eps else NF_M
+                    sc(c_cell,fo=row_font,fi=row_fi,al=aR if col=='Amount_M' else aL,bd=BD,nf=nf if col=='Amount_M' else None)
+                r_idx+=1
+            ws_pl.auto_filter.ref=f"A{hdr}:{get_column_letter(len(cols))}{r_idx-1}"; ws_pl.freeze_panes=f'A{hdr+1}'
+
+    # [3] Market_Cap Sheet
+    ws_mc = wb.create_sheet('Market_Cap')
+    ws_mc.sheet_properties.tabColor = COLOR_DARK_BLUE
+    if market_rows:
+        df_mkt = pd.DataFrame(market_rows)
+        cols = [('Company','Company',18),('Ticker','Ticker',10), ('Base_Date','Base Date',12),('Price_Date','Price Date',12), ('Currency','Curr',6),('Close','Close Price',14), ('Shares','Shares (Ord.)',18),('Label','Label',10),('Market_Cap_M','Mkt Cap (M)',20)]
+        ws_mc.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(cols)); sc(ws_mc.cell(1,1,'Market Capitalization'),fo=fT)
+        r_idx=4
+        for i,(col,disp,w) in enumerate(cols): ws_mc.column_dimensions[get_column_letter(i+1)].width=w; sc(ws_mc.cell(r_idx,i+1,disp),fo=fH,fi=pH,al=aC,bd=BD)
+        hdr=r_idx; r_idx+=1
+        for _,rd in df_mkt.iterrows():
+            ev=(r_idx%2==0)
+            for i,(col,_,_) in enumerate(cols):
+                c_cell=ws_mc.cell(r_idx,i+1); v=rd.get(col, '')
+                if isinstance(v,(float,np.floating)): c_cell.value=round(v,2) if pd.notna(v) else None
+                else: c_cell.value=v
+                nf=NF_PRC if col=='Close' else (NF_INT if col=='Shares' else (NF_M1 if col=='Market_Cap_M' else None))
+                sc(c_cell,fo=fA,fi=pST if ev else pW,al=aR if nf else aL,bd=BD,nf=nf)
+            r_idx+=1
+        ws_mc.auto_filter.ref=f"A{hdr}:{get_column_letter(len(cols))}{r_idx-1}"; ws_mc.freeze_panes=f'A{hdr+1}'
+
+    wb.save(output)
+    output.seek(0)
+    return output
 
 # 로그 출력 (Manage app > Logs 터미널에서 확인 가능)
 print(f"👉 [접속 알림] {now_str} / 사용자: {user_email}")
@@ -1765,14 +2171,38 @@ st.markdown("---")
 with st.sidebar:
     st.header("Settings")
     
-    # 1. Date Input (Year/Quarter -> End Date)
-    st.subheader("1. 기준일 설정")
-    sel_year = st.number_input("Year", min_value=2020, max_value=2030, value=2025)
-    sel_qtr = st.selectbox("Quarter", ["1Q", "2Q", "3Q", "4Q"], index=2) # Default 3Q
+    app_mode = st.selectbox("Analysis Mode", ["GPCM Valuation (Multi-Period)", "Historical FS Summary (과거재무정보 요약)"])
     
-    q_end_map = {"1Q": "03-31", "2Q": "06-30", "3Q": "09-30", "4Q": "12-31"}
-    base_date_str = f"{sel_year}-{q_end_map[sel_qtr]}"
-    st.info(f"선택된 기준일: {base_date_str}")
+    st.subheader("1. 분석 기간 설정")
+    lookback_years = st.slider("분석 년수 (N개년)", min_value=1, max_value=10, value=3 if app_mode == "Historical FS Summary (과거재무정보 요약)" else 1)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        base_year = st.number_input("Base Year (Y)", min_value=2010, max_value=2030, value=2024)
+    with col2:
+        cycle_choice = "Annual"
+        st.info("💡 분석 기준: 연간(Annual) 고정")
+            
+    # Annual: User might want actual fiscal date, but for selection we use Y-12-31 as proxy
+    base_period_str = f"{base_year}-12-31"
+
+    # target_periods will now represent "Labels" or "Relative Indices" for the Excel sheets
+    # But for backward compatibility in the fetching loop, we'll generate calendar proxies 
+    # and then get_gpcm_data will fetch the ACTUAL nearest annuals.
+    target_periods = []
+    for i in range(lookback_years):
+        # We use a proxy date to represent Y, Y-1, Y-2...
+        proxy_year = base_year - i
+        target_periods.append(f"{proxy_year}-12-31")
+    
+    target_periods = sorted(target_periods) # Ascending order for the fetching loop
+
+    base_period_str = target_periods[-1] if target_periods else f"{base_year}-12-31"
+    
+    if app_mode == "Historical FS Summary (과거재무정보 요약)":
+        st.info(f"분석 기준: Y={base_year}부터 과거 {lookback_years}개년 실제 연간재무제표")
+    else:
+        st.info(f"기준일: {base_period_str} | 과거 추이: {lookback_years-1}개년 연간 데이터")
 
     # 2. Ticker Input
     st.subheader("2. Ticker List")
@@ -1866,71 +2296,105 @@ PYT.VI"""
 if btn_run:
     target_tickers = [t.strip() for t in txt_input.split('\n') if t.strip()]
 
-    with st.spinner("데이터 추출 및 분석 중... 잠시만 기다려주세요..."):
-        # Run Data Logic with WACC parameters (목표 부채비율은 자동 계산)
-        gpcm_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel, t_map, avg_debt_ratio, target_wacc_data = get_gpcm_data(
-            target_tickers,
-            base_date_str,
-            mrp=mrp_input,
-            kd_pretax=kd_pretax_input,
-            size_premium=size_premium_input,
-            target_tax_rate=target_tax_rate_input,
-            user_rf_rate=rf_input,
-            beta_type=beta_type_input
-        )
-        
-        # 1. Summary Table
-        st.subheader("📋 GPCM Multiples Summary")
-        summary_list = []
-        for t, g in gpcm_data.items():
-            ev = g['Market_Cap_M'] + g['IBD'] - g['Cash'] + g['NCI'] # NOA Option 미반영
-            ev_ebitda = ev/g['EBITDA'] if g['EBITDA']>0 else None
-            ev_ebit = ev/g['EBIT'] if g['EBIT']>0 else None
-            per = g['Market_Cap_M']/g['NI_Parent'] if g['NI_Parent']>0 else None
-            pbr = g['Market_Cap_M']/g['Equity'] if g['Equity']>0 else None
-            psr = g['Market_Cap_M']/g['Revenue'] if g['Revenue']>0 else None
-            
-            summary_list.append({
-                'Ticker': t, 'Company': g['Company'],
-                'EV/EBITDA': ev_ebitda, 'EV/EBIT': ev_ebit, 'PER': per, 'PBR': pbr, 'PSR': psr
-            })
-        df_sum = pd.DataFrame(summary_list)
-        st.dataframe(df_sum.style.format({
-            'EV/EBITDA': '{:.1f}x', 'EV/EBIT': '{:.1f}x', 'PER': '{:.1f}x', 'PBR': '{:.1f}x', 'PSR': '{:.1f}x'
-        }, na_rep='N/M'))
+    if not target_tickers:
+        st.warning("분석할 Ticker를 입력하세요.")
+        st.stop()
 
-        # 평균 자본구조 표시
-        st.success(f"✅ **피어 평균 부채비율 (목표 자본구조)**: {avg_debt_ratio*100:.1f}%")
+    if app_mode == "Target WACC Calculation Only":
+        st.info("지원 예정인 기능입니다 (별도의 WACC 계산기 통합 시). 현재는 GPCM Valuation 모드에서 함께 제공됩니다.")
+        st.stop()
 
-        # 2. Statistics Table
-        st.subheader("📊 Multiples Statistics")
-       
-        # [안전장치] 데이터가 비어있지 않은 경우에만 통계 계산 수행
-        if not df_sum.empty:
-            stats = []
-            for col in ['EV/EBITDA', 'EV/EBIT', 'PER', 'PBR', 'PSR']:
-                # 해당 컬럼이 실제로 존재하는지 확인 (KeyError 방지)
-                if col in df_sum.columns:
-                    vals = [x for x in df_sum[col] if pd.notnull(x)]
-                    if vals:
-                        stats.append({'Metric': col, 'Mean': np.mean(vals), 'Median': np.median(vals), 'Max': np.max(vals), 'Min': np.min(vals)})
-                    else:
-                        stats.append({'Metric': col, 'Mean': None, 'Median': None, 'Max': None, 'Min': None})
+    with st.spinner(f"데이터 추출 및 분석 중 ({app_mode})... 잠시만 기다려주세요..."):
+        if app_mode == "GPCM Valuation (Multi-Period)":
+            # Run Data Logic with WACC parameters
+            all_period_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel, t_map, avg_debt_ratio, target_wacc_data = get_gpcm_data(
+                target_tickers,
+                target_periods,
+                mrp=mrp_input,
+                kd_pretax=kd_pretax_input,
+                size_premium=size_premium_input,
+                target_tax_rate=target_tax_rate_input,
+                user_rf_rate=rf_input,
+                beta_type=beta_type_input
+            )
             
-            if stats:
-                st.dataframe(pd.DataFrame(stats).set_index('Metric').style.format('{:.1f}x', na_rep='N/M'))
+            # 1. Summary Table (최신 Base Date 기준)
+            st.subheader(f"📋 GPCM Multiples Summary (Base: {base_period_str})")
+            summary_list = []
+            base_gpcm_data = all_period_data.get(base_period_str, {})
+            
+            for t, g in base_gpcm_data.items():
+                ev = g['Market_Cap_M'] + g['IBD'] - g['Cash'] + g['NCI'] # NOA Option 미반영
+                ev_ebitda = ev/g['EBITDA'] if g['EBITDA']>0 else None
+                ev_ebit = ev/g['EBIT'] if g['EBIT']>0 else None
+                per = g['Market_Cap_M']/g['NI_Parent'] if g['NI_Parent']>0 else None
+                pbr = g['Market_Cap_M']/g['Equity'] if g['Equity']>0 else None
+                psr = g['Market_Cap_M']/g['Revenue'] if g['Revenue']>0 else None
+                
+                summary_list.append({
+                    'Ticker': t, 'Company': g['Company'],
+                    'EV/EBITDA': ev_ebitda, 'EV/EBIT': ev_ebit, 'PER': per, 'PBR': pbr, 'PSR': psr
+                })
+            df_sum = pd.DataFrame(summary_list)
+            st.dataframe(df_sum.style.format({
+                'EV/EBITDA': '{:.1f}x', 'EV/EBIT': '{:.1f}x', 'PER': '{:.1f}x', 'PBR': '{:.1f}x', 'PSR': '{:.1f}x'
+            }, na_rep='N/M'))
+
+            # 평균 자본구조 표시
+            st.success(f"✅ **피어 평균 부채비율 (목표 자본구조, 최신 기준)**: {avg_debt_ratio*100:.1f}%")
+
+            # 2. Statistics Table
+            st.subheader("📊 Multiples Statistics")
+           
+            if not df_sum.empty:
+                stats = []
+                for col in ['EV/EBITDA', 'EV/EBIT', 'PER', 'PBR', 'PSR']:
+                    if col in df_sum.columns:
+                        vals = [x for x in df_sum[col] if pd.notnull(x)]
+                        if vals:
+                            stats.append({'Metric': col, 'Mean': np.mean(vals), 'Median': np.median(vals), 'Max': np.max(vals), 'Min': np.min(vals)})
+                        else:
+                            stats.append({'Metric': col, 'Mean': None, 'Median': None, 'Max': None, 'Min': None})
+                
+                if stats:
+                    st.dataframe(pd.DataFrame(stats).set_index('Metric').style.format('{:.1f}x', na_rep='N/M'))
+                else:
+                    st.warning("통계를 산출할 유효한 데이터가 없습니다.")
             else:
-                st.warning("통계를 산출할 유효한 데이터가 없습니다.")
-        else:
-            st.error("데이터를 불러오지 못했습니다. 잠시 후 다시 시도해주세요 (Yahoo Rate Limit).")
+                st.error("데이터를 불러오지 못했습니다. 잠시 후 다시 시도해주세요 (Yahoo Rate Limit).")
 
-        # 3. Excel Download
-        excel_data = create_excel(gpcm_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel, base_date_str, t_map, target_wacc_data, beta_type=beta_type_input)
-        
-        # 다운로드 버튼 (누르고 있어도 화면 유지됨)
-        st.download_button(
-            label="📥 Report Download (Excel)",
-            data=excel_data,
-            file_name=f"Global_GPCM_{base_date_str.replace('-','')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+            # 3. Excel Download
+            excel_data = create_excel(all_period_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel, base_period_str, target_periods, t_map, target_wacc_data, beta_type=beta_type_input)
+            
+            st.download_button(
+                label="📥 GPCM Report Download (Excel)",
+                data=excel_data,
+                file_name=f"Global_GPCM_{base_period_str.replace('-','')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            
+        elif app_mode == "Historical FS Summary (과거재무정보 요약)":
+            all_period_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel, t_map, _, _ = get_gpcm_data(
+                target_tickers,
+                target_periods,
+                mrp=mrp_input,
+                kd_pretax=kd_pretax_input,
+                size_premium=size_premium_input,
+                target_tax_rate=target_tax_rate_input,
+                user_rf_rate=rf_input,
+                beta_type="5Y",
+                force_annual=True
+            )
+            
+            excel_data = export_historical_excel_global_v2(all_period_data, raw_bs, raw_pl, mkt_rows, target_periods, t_map)
+            
+            if excel_data:
+                st.success("✅ 기간별(년/분기별) 재무정보 및 요약 엑셀 생성이 완료되었습니다.")
+                st.download_button(
+                    label="📥 Historical FS Summary Download (Excel)",
+                    data=excel_data,
+                    file_name=f"Historical_FS_Summary_{target_tickers[0]}_etc.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            else:
+                st.warning("추출된 재무/주가 데이터가 없습니다.")
