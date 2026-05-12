@@ -24,6 +24,58 @@ import requests
 from bs4 import BeautifulSoup
 
 # ==========================================
+# Module-level constants & small helpers
+# ==========================================
+
+# 국가 코드 → KPMG 테이블 국가명 매핑 (두 곳에서 공통 사용)
+COUNTRY_NAME_MAP = {
+    'US': 'United States', 'JP': 'Japan', 'CN': 'China', 'IN': 'India',
+    'CA': 'Canada', 'GB': 'United Kingdom', 'DE': 'Germany', 'FR': 'France',
+    'AU': 'Australia', 'AT': 'Austria', 'NL': 'Netherlands', 'BE': 'Belgium',
+    'IT': 'Italy', 'ES': 'Spain', 'SE': 'Sweden', 'NO': 'Norway',
+    'DK': 'Denmark', 'FI': 'Finland', 'IE': 'Ireland', 'CH': 'Switzerland',
+    'MX': 'Mexico',
+}
+
+
+def label_sort_key(x):
+    """'Recent' → -1, 'Y' → 0, 'Y-N' → N."""
+    if x == 'Recent':
+        return -1
+    if x == 'Y':
+        return 0
+    try:
+        return int(x.split('-')[1])
+    except Exception:
+        return 999
+
+
+def norm_df(df):
+    """DataFrame 컬럼의 timezone-aware datetime을 tz-naive로 표준화."""
+    if df is not None and not df.empty:
+        df.columns = [d.replace(tzinfo=None) if hasattr(d, 'tzinfo') else d for d in df.columns]
+    return df
+
+
+def _to_price_series(df, col='Close'):
+    """yf.download / stock.history 결과에서 1-D 가격 Series 추출.
+
+    yfinance >= 0.2.31 에서 yf.download 가 multi-level column DataFrame 을
+    반환할 수 있으므로, 항상 1-D Series 를 보장한다.
+    """
+    if isinstance(df, pd.Series):
+        return df
+    if col in df.columns:
+        s = df[col]
+    else:
+        s = df.iloc[:, 0]
+    # multi-level column 이면 첫 번째 열만 선택
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    return s
+
+
+# ==========================================
 # 1. Helper Functions (v17 Logic + Beta Calculation)
 # ==========================================
 
@@ -155,11 +207,8 @@ def calculate_beta(stock_returns, market_returns, min_periods=20):
 
         return float(raw_beta), float(adjusted_beta)
 
-    except Exception as e:
-        # 계산 중 에러 발생 시 None 반환
+    except Exception:
         return None, None
-
-    return raw_beta, adjusted_beta
 
 @st.cache_data(ttl=86400)
 def get_kpmg_tax_rates():
@@ -192,8 +241,10 @@ def get_kpmg_tax_rates():
                     try:
                         rate = float(rate_text) / 100
                         tax_rates[country] = rate
-                    except: continue
-    except: pass
+                    except Exception:
+                        continue
+    except Exception:
+        pass
     return tax_rates
 
 def get_corporate_tax_rates_from_wikipedia():
@@ -382,16 +433,11 @@ def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_
             currency = info.get('currency', 'USD')
             exchange, market_idx = get_market_index(ticker)
 
-            # [핵심] 재무 데이터 가져오기 및 타임존 표준화 (tz-naive)
+            # 재무 데이터 가져오기 및 타임존 표준화 (tz-naive)
             a_is = stock.income_stmt
             q_is = stock.quarterly_income_stmt
             a_bs = stock.balance_sheet
             q_bs = stock.quarterly_balance_sheet
-
-            def norm_df(df):
-                if df is not None and not df.empty:
-                    df.columns = [d.replace(tzinfo=None) if hasattr(d, 'tzinfo') else d for d in df.columns]
-                return df
 
             a_is = norm_df(a_is)
             q_is = norm_df(q_is)
@@ -415,7 +461,8 @@ def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_
             for label, f_dt_obj in labels_to_fetch:
                 if hasattr(f_dt_obj, 'tzinfo'): f_dt_obj = f_dt_obj.replace(tzinfo=None)
                 f_dt_str = f_dt_obj.strftime('%Y-%m-%d')
-                
+                bs_shares = None  # 루프마다 초기화
+
                 gpcm = {
                     'Company': company_name, 'Ticker': ticker, 'Currency': currency,
                     'Base_Date': f_dt_str, # 실제 결산일 표시
@@ -429,10 +476,8 @@ def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_
                     'Debt_Ratio': 0, 'Unlevered_Beta_5Y': None, 'Unlevered_Beta_2Y': None,
                 }
 
-                # [수정] BS 최신 시점 엄밀 선택 (Strict Max <= Base Date)
-                # 연간/분기를 합쳐서 기준일(base_dt) 이전의 가장 최신 날짜 1개를 찾음
-                a_bs = stock.balance_sheet
-                q_bs = stock.quarterly_balance_sheet
+                # BS 최신 시점 엄밀 선택 (Strict Max <= Base Date)
+                # a_bs / q_bs 는 루프 밖(line ~430)에서 이미 가져온 변수를 재사용
                 all_possible_bs_dates = []
                 if a_bs is not None and not a_bs.empty:
                     all_possible_bs_dates.extend([d for d in a_bs.columns if d <= base_dt + timedelta(days=7)])
@@ -476,7 +521,7 @@ def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_
                     hist = stock.history(start=(f_dt_obj - timedelta(days=10)).strftime('%Y-%m-%d'), end=(f_dt_obj + timedelta(days=1)).strftime('%Y-%m-%d'), auto_adjust=False)
                     close = float(hist['Close'].iloc[-1]) if (not hist.empty and 'Close' in hist.columns) else 0.0
                     p_date = hist.index[-1].strftime('%Y-%m-%d') if not hist.empty else '-'
-                except: close=0.0; p_date='-'
+                except Exception: close=0.0; p_date='-'
                 gpcm['Close'] = close
                 gpcm['Market_Cap_M'] = (close * gpcm['Shares'] / 1e6) if gpcm['Shares'] else 0.0
                 market_rows.append({
@@ -536,21 +581,14 @@ def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_
                         pt_val = a_is.loc['Pretax Income', f_pl_lookup]
                         if pd.notna(pt_val): gpcm['Pretax_Income'] = float(pt_val) / 1e6
                     gpcm['Tax_Rate'] = get_korean_marginal_tax_rate(gpcm['Pretax_Income'])
-                else: 
-                    # KPMG 국가명 맵핑 (KPMG 테이블의 Key와 매칭)
-                    c_name_map = {
-                        'US':'United States', 'JP':'Japan', 'CN':'China', 'IN':'India', 'CA':'Canada', 
-                        'GB':'United Kingdom', 'DE':'Germany', 'FR':'France', 'AU':'Australia',
-                        'AT':'Austria', 'NL':'Netherlands', 'BE':'Belgium', 'IT':'Italy', 'ES':'Spain',
-                        'SE':'Sweden', 'NO':'Norway', 'DK':'Denmark', 'FI':'Finland', 'IE':'Ireland', 'CH':'Switzerland'
-                    }
-                    c_full_name = c_name_map.get(country_code, '')
+                else:
+                    c_full_name = COUNTRY_NAME_MAP.get(country_code, '')
                     gpcm['Tax_Rate'] = k_rates.get(c_full_name, 0.25)
 
                 # [6] LTM Adjustment for Base Period (Y)
                 if label == base_label and not force_annual:
                     try:
-                        q_is = stock.quarterly_income_stmt
+                        # q_is 는 루프 밖에서 이미 가져온 변수 재사용
                         if q_is is not None and not q_is.empty:
                             # 1. 기준일(base_dt) 이전의 가용 분기 결산일 찾기
                             valid_q_dates = sorted([d for d in q_is.columns if d <= base_dt + timedelta(days=15)], reverse=True)
@@ -562,11 +600,7 @@ def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_
                                 if len(ltm_q_dates) == 4:
                                     # 기존 Annual 기반 PL 데이터 제거 (이 티커와 이 레이블에 대해)
                                     # global raw_pl_rows를 수정해야 하므로 주의 (여기서는 지역 변수처럼 사용되고 있다면 문제 없음)
-                                    # raw_pl_rows = [r for r in raw_pl_rows if not (r['Ticker'] == ticker and r['Label'] == label)]
-                                    # 위 방식은 리스트를 새로 만드므로, 원본 리스트를 유지하기 위해 index를 찾아 지우거나 필터링 다시 수행
-                                    filtered_pl = [r for r in raw_pl_rows if not (r['Ticker'] == ticker and r['Label'] == label)]
-                                    raw_pl_rows.clear()
-                                    raw_pl_rows.extend(filtered_pl)
+                                    raw_pl_rows[:] = [r for r in raw_pl_rows if not (r['Ticker'] == ticker and r['Label'] == label)]
 
                                     # 4개 분기 각각에 대해 PL 데이터 추가 (transparency: D-0Q ~ D-3Q)
                                     for i, q_dt in enumerate(ltm_q_dates):
@@ -619,15 +653,10 @@ def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_
                                     if country_code == 'KR':
                                         gpcm['Tax_Rate'] = get_korean_marginal_tax_rate(gpcm['Pretax_Income'])
                                     else:
-                                        c_name_map = {
-                                            'US':'United States', 'JP':'Japan', 'CN':'China', 'IN':'India', 'CA':'Canada', 
-                                            'GB':'United Kingdom', 'DE':'Germany', 'FR':'France', 'AU':'Australia',
-                                            'AT':'Austria', 'NL':'Netherlands', 'BE':'Belgium', 'IT':'Italy', 'ES':'Spain',
-                                            'SE':'Sweden', 'NO':'Norway', 'DK':'Denmark', 'FI':'Finland', 'IE':'Ireland', 'CH':'Switzerland'
-                                        }
-                                        c_full_name = c_name_map.get(country_code, '')
+                                        c_full_name = COUNTRY_NAME_MAP.get(country_code, '')
                                         gpcm['Tax_Rate'] = k_rates.get(c_full_name, 0.25)
-                    except: pass
+                    except Exception:
+                        pass
 
                 # Save to all_period_data
                 all_period_data[label][ticker] = gpcm
@@ -678,7 +707,7 @@ def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_
                             hist_r = stock.history(period='1d', auto_adjust=False)
                             close_r = float(hist_r['Close'].iloc[-1]) if not hist_r.empty else info.get('previousClose', 0)
                             p_date_r = hist_r.index[-1].strftime('%Y-%m-%d') if not hist_r.empty else '-'
-                        except: close_r=0.0; p_date_r='-'
+                        except Exception: close_r=0.0; p_date_r='-'
                         gpcm_recent['Close'] = close_r
                         gpcm_recent['Market_Cap_M'] = (close_r * gpcm_recent['Shares'] / 1e6) if gpcm_recent['Shares'] else 0.0
                         market_rows.append({
@@ -716,7 +745,8 @@ def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_
                         gpcm_recent['NI_Parent'] = calc_sums_r['NI_Parent']
                         
                         all_period_data['Recent'][ticker] = gpcm_recent
-                except: pass
+                except Exception:
+                    pass
 
             # [Beta Calculation] Only for the Base Period (Label 'Y')
             base_gpcm = all_period_data.get('Y', {}).get(ticker)
@@ -724,11 +754,12 @@ def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_
                 # Price History
                 try:
                     hist_10y_raw = stock.history(start=(base_dt - timedelta(days=365*10+20)).strftime('%Y-%m-%d'), end=base_dt.strftime('%Y-%m-%d'), auto_adjust=False)
-                    hist_10y = hist_10y_raw['Close'] if 'Close' in hist_10y_raw.columns else hist_10y_raw.iloc[:,0]
+                    hist_10y = _to_price_series(hist_10y_raw)
                     if not hist_10y.empty:
                         abs_s = hist_10y.copy(); abs_s.name = ticker; price_abs_dfs.append(abs_s)
                         rel_s = (hist_10y / hist_10y.iloc[0]) * 100; rel_s.name = ticker; price_rel_dfs.append(rel_s)
-                except: pass
+                except Exception:
+                    pass
 
                 try:
                     start_5y = (base_dt - timedelta(days=365*5+20)).strftime('%Y-%m-%d')
@@ -749,9 +780,9 @@ def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_
 
                     if stock_data_5y is not None and market_data_5y is not None:
                         if not stock_data_5y.empty and not market_data_5y.empty:
-                            stock_prices_5y = stock_data_5y['Close'] if isinstance(stock_data_5y, pd.DataFrame) and 'Close' in stock_data_5y.columns else (stock_data_5y.iloc[:, 0] if isinstance(stock_data_5y, pd.DataFrame) else stock_data_5y)
-                            market_prices_5y = market_data_5y['Close'] if isinstance(market_data_5y, pd.DataFrame) and 'Close' in market_data_5y.columns else (market_data_5y.iloc[:, 0] if isinstance(market_data_5y, pd.DataFrame) else market_data_5y)
-                            
+                            stock_prices_5y = _to_price_series(stock_data_5y)
+                            market_prices_5y = _to_price_series(market_data_5y)
+
                             if not isinstance(stock_prices_5y.index, pd.DatetimeIndex): stock_prices_5y.index = pd.to_datetime(stock_prices_5y.index)
                             if stock_prices_5y.index.tz is not None: stock_prices_5y.index = stock_prices_5y.index.tz_localize(None)
                             if not isinstance(market_prices_5y.index, pd.DatetimeIndex): market_prices_5y.index = pd.to_datetime(market_prices_5y.index)
@@ -801,8 +832,8 @@ def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_
 
                     if stock_data_2y is not None and market_data_2y is not None:
                         if not stock_data_2y.empty and not market_data_2y.empty:
-                            stock_prices_2y = stock_data_2y['Close'] if isinstance(stock_data_2y, pd.DataFrame) and 'Close' in stock_data_2y.columns else (stock_data_2y.iloc[:, 0] if isinstance(stock_data_2y, pd.DataFrame) else stock_data_2y)
-                            market_prices_2y = market_data_2y['Close'] if isinstance(market_data_2y, pd.DataFrame) and 'Close' in market_data_2y.columns else (market_data_2y.iloc[:, 0] if isinstance(market_data_2y, pd.DataFrame) else market_data_2y)
+                            stock_prices_2y = _to_price_series(stock_data_2y)
+                            market_prices_2y = _to_price_series(market_data_2y)
 
                             if not isinstance(stock_prices_2y.index, pd.DatetimeIndex): stock_prices_2y.index = pd.to_datetime(stock_prices_2y.index)
                             if stock_prices_2y.index.tz is not None: stock_prices_2y.index = stock_prices_2y.index.tz_localize(None)
@@ -917,12 +948,6 @@ def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_a
     wb = Workbook(); wb.remove(wb.active)
 
     base_gpcm_data = all_period_data.get('Y', {})
-    # Determine labels in order (Recent, Y, Y-1, Y-2...)
-    def label_sort_key(x):
-        if x == 'Recent': return -1
-        if x == 'Y': return 0
-        try: return int(x.split('-')[1])
-        except: return 999
     rel_labels = sorted([k for k in all_period_data.keys() if all_period_data[k]], key=label_sort_key)
     
     # Sheet Colors
@@ -937,14 +962,6 @@ def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_a
     S1=Side(style='thin',color=C_BG); BD=Border(left=S1,right=S1,top=S1,bottom=S1)
     fT=Font(name='Arial',bold=True,size=14,color=C_BL); fS=Font(name='Arial',size=9,color=C_MG,italic=True)
     fH=Font(name='Arial',bold=True,size=9,color=C_W); fA=Font(name='Arial',size=9,color=C_DG)
-    fHL=Font(name='Arial',bold=True,size=9,color=C_DB); fSEC=Font(name='Arial',bold=True,size=10,color=C_W)
-    fMUL=Font(name='Arial',bold=True,size=10,color=C_BL); fNOTE=Font(name='Arial',size=8,color=C_MG,italic=True)
-    fSTAT=Font(name='Arial',bold=True,size=9,color=C_DB)
-    fFRM=Font(name='Arial',size=9,color='000000'); fFRM_B=Font(name='Arial',bold=True,size=9,color='000000')
-    fLINK=Font(name='Arial',size=9,color='008000'); fLINK_B=Font(name='Arial',bold=True,size=9,color='008000')
-
-    pH=PatternFill('solid',fgColor=C_BL); pW=PatternFill('solid',fgColor=C_W)
-    pST=PatternFill('solid',fgColor=C_LG); pSEC=PatternFill('solid',fgColor=C_DB)
     fHL=Font(name='Arial',bold=True,size=9,color=C_DB); fSEC=Font(name='Arial',bold=True,size=10,color=C_W)
     fMUL=Font(name='Arial',bold=True,size=10,color=C_BL); fNOTE=Font(name='Arial',size=8,color=C_MG,italic=True)
     fSTAT=Font(name='Arial',bold=True,size=9,color=C_DB)
@@ -1854,7 +1871,7 @@ def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_a
     def hist_sort(s):
         if '최신' in s: return -1
         try: return int(s.split('-')[1])
-        except: return 999
+        except Exception: return 999
     hist_sheets.sort(key=hist_sort)
     
     final_order = []
@@ -1895,29 +1912,19 @@ st.set_page_config(page_title="Global GPCM Generator", layout="wide", page_icon=
 # [User Access Log] 접속자 로그 기록 (Console 출력)
 # ---------------------------------------------------------
 try:
-    # Streamlit Cloud (Private) 환경에서 이메일 가져오기
-    user_email = st.experimental_user.email if st.experimental_user.email else "Anonymous"
-except:
+    # Streamlit Cloud (Private) 환경에서 이메일 가져오기 (st.user: 최신, experimental_user: 구버전 fallback)
+    _u = getattr(st, 'user', None) or getattr(st, 'experimental_user', None)
+    user_email = (_u.email if _u and _u.email else "Anonymous")
+except Exception:
     user_email = "Local_Dev"
 
 # 현재 시간 (이미 import datetime이 되어 있으므로 바로 사용)
 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def export_historical_excel_global_v2(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, target_periods, ticker_to_name):
-    import io, pandas as pd, numpy as np
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
-
     output = io.BytesIO()
     wb = Workbook(); wb.remove(wb.active)
 
-    # Determine labels in order (Recent, Y, Y-1, Y-2...)
-    def label_sort_key(x):
-        if x == 'Recent': return -1
-        if x == 'Y': return 0
-        try: return int(x.split('-')[1])
-        except: return 999
     rel_labels = sorted([k for k in all_period_data.keys() if all_period_data[k]], key=label_sort_key)
     
     # Sheet Colors
@@ -2062,9 +2069,13 @@ def export_historical_excel_global_v2(all_period_data, raw_bs_rows, raw_pl_rows,
                     elif m_key == 'NetDebt':
                         v = f"={mc_map[('IBD', label)]}{r} - {mc_map[('Cash', label)]}{r}"
                     elif m_key == 'OPM':
-                        v = f'=IFERROR({mc_map[('Operating Income', label)]}{r}/{mc_map[('Revenue', label)]}{r}, "")'
+                        _num = mc_map[('Operating Income', label)]
+                        _den = mc_map[('Revenue', label)]
+                        v = f'=IFERROR({_num}{r}/{_den}{r}, "")'
                     elif m_key == 'DebtRatio':
-                        v = f'=IFERROR({mc_map[('Total Liabilities Net Minority Interest', label)]}{r}/{mc_map[('Equity', label)]}{r}, "")'
+                        _num = mc_map[('Total Liabilities Net Minority Interest', label)]
+                        _den = mc_map[('Equity', label)]
+                        v = f'=IFERROR({_num}{r}/{_den}{r}, "")'
                     elif m_key == 'EV':
                         v = f"={mc_map[('Mkt_Cap', label)]}{r} + {mc_map[('IBD', label)]}{r} - {mc_map[('Cash', label)]}{r} + {mc_map[('NCI', label)]}{r}"
 
@@ -2390,10 +2401,6 @@ if btn_run:
         st.warning("분석할 Ticker를 입력하세요.")
         st.stop()
 
-    if app_mode == "Target WACC Calculation Only":
-        st.info("지원 예정인 기능입니다 (별도의 WACC 계산기 통합 시). 현재는 GPCM Valuation 모드에서 함께 제공됩니다.")
-        st.stop()
-
     with st.spinner(f"데이터 추출 및 분석 중 ({app_mode})... 잠시만 기다려주세요..."):
         if app_mode == "GPCM Valuation (Multi-Period)":
             # Run Data Logic with WACC parameters
@@ -2411,7 +2418,7 @@ if btn_run:
             # 1. Summary Table (최신 Base Date 기준)
             st.subheader(f"📋 GPCM Multiples Summary (Base: {base_period_str})")
             summary_list = []
-            base_gpcm_data = all_period_data.get(base_period_str, {})
+            base_gpcm_data = all_period_data.get('Y', {})
             
             for t, g in base_gpcm_data.items():
                 ev = g['Market_Cap_M'] + g['IBD'] - g['Cash'] + g['NCI'] # NOA Option 미반영
