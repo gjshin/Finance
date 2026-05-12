@@ -2,7 +2,7 @@ streamlit
 yfinance
 pandas
 openpyxl
-opendartreader
+OpenDartReader
 finance-datareader
 numpy
 scipy
