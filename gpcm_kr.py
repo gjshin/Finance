@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup # 주식수 크롤링을 위해 추가
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.workbook.defined_name import DefinedName
 
 # 최신 수정: 2026-02-17 15:00 KST
 # 주요 변경사항:
@@ -39,11 +40,27 @@ warnings.filterwarnings('ignore')
 # ==========================================
 RCODE_MAP = {'1Q': '11013', '2Q': '11012', '3Q': '11014', '4Q': '11011'}
 QUARTER_INFO = {'1Q': '03-31', '2Q': '06-30', '3Q': '09-30', '4Q': '12-31'}
-DEBUG_PL = False  # 로그 출력 줄임
+
+BETA_5Y_DAYS = 365 * 5 + 20
+BETA_2Y_DAYS = 365 * 2 + 20
+MIN_MONTHLY_PTS = 12
+MIN_WEEKLY_PTS = 50
 
 # ==========================================
 # 1. Helper Functions
 # ==========================================
+
+def _to_price_series(df, col='Close'):
+    """yf.download / fdr.DataReader 결과에서 1-D 가격 Series 추출."""
+    if isinstance(df, pd.Series):
+        return df
+    if col in df.columns:
+        s = df[col]
+    else:
+        s = df.iloc[:, 0]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    return s
 
 def get_market_index(ticker):
     """
@@ -105,7 +122,7 @@ def get_ltm_required_periods(year: int, qtr: str):
         (year - 1, qtr, 'prior_same_q'),
     ]
 
-@st.cache_resource
+@st.cache_resource(ttl=3600)
 def get_krx_listing():
     """KRX 상장종목 목록 조회 - 재시도 및 fallback 포함 (Streamlit Cloud 에러 대응)"""
     # 1차 시도: KRX 전체 (최대 3번)
@@ -153,13 +170,13 @@ def resolve_company_info(dart_instance, ticker: str):
     corp_code = None
     try:
         corp_code = dart_instance.find_corp_code(ticker)
-    except:
+    except Exception:
         corp_code = None
 
     if not corp_code and krx_name:
         try:
             corp_code = dart_instance.find_corp_code(krx_name)
-        except:
+        except Exception:
             corp_code = None
 
     return corp_code, krx_name
@@ -173,7 +190,7 @@ def get_stock_price(ticker: str, date_str: str):
         if df is not None and not df.empty:
             return float(df.iloc[-1]['Close']), df.index[-1].strftime('%Y-%m-%d')
         return None, None
-    except:
+    except Exception:
         return None, None
 
 def _to_int(x):
@@ -184,7 +201,7 @@ def _to_int(x):
         if s == '' or s.lower() == 'nan':
             return None
         return int(float(s))
-    except:
+    except Exception:
         return None
 
 # --- DART 유통주식수 ---
@@ -251,7 +268,7 @@ def get_outstanding_shares(api_key, corp_code: str, ticker: str, bsns_year: int,
     order = ['11011', '11012', '11014', '11013']
     try:
         current_idx = order.index(reprt_code)
-    except:
+    except Exception:
         current_idx = 3 # 기본 사업보고서 매핑
 
     cy = bsns_year
@@ -281,7 +298,7 @@ def get_outstanding_shares(api_key, corp_code: str, ticker: str, bsns_year: int,
                 meta_f = dict(meta)
                 meta_f['shares'] = shares_krx
                 return shares_krx, 'KRX', meta_f
-    except:
+    except Exception:
         pass
 
     return None, 'N/A', meta
@@ -375,9 +392,7 @@ PL_PRETAX_INCOME = {
     '법인세비용차감전순손실', '세전이익', '법인세차감전이익'
 }
 
-def _norm_pl(s):
-    s = "" if s is None else str(s).strip()
-    return re.sub(r"\s+", "", s)
+_norm_pl = _norm
 
 def match_pl_core_only(account_nm, aid=None):
     if aid == 'ifrs-full_ProfitLoss': return 'NI'
@@ -407,35 +422,28 @@ def pick_pl_value(row: pd.Series, qtr: str):
     return None
 
 # --- DART PL Fetch Functions (Need dart instance) ---
-def safe_finstate(dart_instance, corp_code, year, reprt_code, fs_div=None, max_retry=2):
+def _safe_dart_call(fn, *args, max_retry=2, **kwargs):
     last_err = None
     for _ in range(max_retry + 1):
         try:
-            if fs_div is None:
-                df = dart_instance.finstate(corp_code, year, reprt_code=reprt_code)
-            else:
-                df = dart_instance.finstate(corp_code, year, reprt_code=reprt_code, fs_div=fs_div)
-            if df is not None and not df.empty: return df, None
+            df = fn(*args, **kwargs)
             return df, None
         except Exception as e:
             last_err = e
             time.sleep(0.4)
     return None, last_err
 
+def safe_finstate(dart_instance, corp_code, year, reprt_code, fs_div=None, max_retry=2):
+    kwargs = {'reprt_code': reprt_code}
+    if fs_div is not None:
+        kwargs['fs_div'] = fs_div
+    return _safe_dart_call(dart_instance.finstate, corp_code, year, max_retry=max_retry, **kwargs)
+
 def safe_finstate_all(dart_instance, corp_code, year, reprt_code, fs_div=None, max_retry=2):
-    last_err = None
-    for _ in range(max_retry + 1):
-        try:
-            if fs_div is None:
-                df = dart_instance.finstate_all(corp_code, year, reprt_code=reprt_code)
-            else:
-                df = dart_instance.finstate_all(corp_code, year, reprt_code=reprt_code, fs_div=fs_div)
-            if df is not None and not df.empty: return df, None
-            return df, None
-        except Exception as e:
-            last_err = e
-            time.sleep(0.4)
-    return None, last_err
+    kwargs = {'reprt_code': reprt_code}
+    if fs_div is not None:
+        kwargs['fs_div'] = fs_div
+    return _safe_dart_call(dart_instance.finstate_all, corp_code, year, max_retry=max_retry, **kwargs)
 
 def fetch_pl_df(dart_instance, corp_code, year, reprt_code):
     for fs in ['CFS', 'OFS']:
@@ -681,11 +689,7 @@ def calculate_historical_metrics(df_summ):
 
     return df_summ
 
-from openpyxl import Workbook
-from openpyxl.utils import get_column_letter
-
 def export_historical_excel(df_summ, df_details, periods_to_fetch):
-    import io
     output = io.BytesIO()
     wb = Workbook()
     
@@ -933,10 +937,6 @@ def add_gpcm_section_row(ws):
 # ==========================================
 
 def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, status_container, progress_bar):
-    # DART & KRX 로드 패스
-    from datetime import datetime, timedelta
-    import pandas as pd
-    import numpy as np
     df_krx = get_krx_listing()
     
     # 변수 초기화
@@ -953,6 +953,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
     all_multiples = []
 
     total_tickers = len(target_code_list)
+    dart_fs_cache = {}  # DART API Call 최소화를 위한 캐시 (전체 run 공유)
 
     for idx, ticker in enumerate(target_code_list):
         status_container.write(f"Processing [{ticker}] ({idx+1}/{total_tickers})...")
@@ -975,9 +976,6 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
             'Stock_Weekly_Prices_2Y': None, 'Market_Weekly_Prices_2Y': None,
             'Exchange': 'KRX', 'Market_Index': 'KS11',
         }
-
-        # DART API Call 최소화를 위한 로컬 캐시
-        dart_fs_cache = {}
 
         for tp in target_periods:
             tyear, tqtr = parse_period(tp)
@@ -1026,7 +1024,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                                     df_all = _df
                                     dart_fs_cache[cache_key] = _df
                                     break
-                            except:
+                            except Exception:
                                 continue
 
                     if df_all is not None and not df_all.empty:
@@ -1060,7 +1058,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                 if cache_key_pl in dart_fs_cache:
                     df_is, pl_src = dart_fs_cache[cache_key_pl]
                 else:
-                    df_pl_raw, pl_src, pl_flag = fetch_pl_df(dart, corp_code, year, r_code)
+                    df_pl_raw, pl_src, _ = fetch_pl_df(dart, corp_code, year, r_code)
                     if df_pl_raw is not None and not df_pl_raw.empty:
                         df_is = filter_income_statement(df_pl_raw)
                         dart_fs_cache[cache_key_pl] = (df_is, pl_src)
@@ -1113,78 +1111,65 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
         temp_metrics['Market_Index'] = market_idx
 
         try:
-            # 5년 월간 베타 데이터
-            start_5y = (pd.to_datetime(base_date_str) - timedelta(days=365*5+20)).strftime('%Y-%m-%d')
             end_date = base_date_str
+            start_5y = (pd.to_datetime(base_date_str) - timedelta(days=BETA_5Y_DAYS)).strftime('%Y-%m-%d')
+            start_2y = (pd.to_datetime(base_date_str) - timedelta(days=BETA_2Y_DAYS)).strftime('%Y-%m-%d')
 
-            # 주가 데이터 수집 (시장지수는 yf 사용 가능성 대응)
+            # 5년 월간 베타 데이터
             stock_data_5y = fdr.DataReader(ticker, start_5y, end_date)
             if market_idx.startswith('^'):
                 market_data_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)
-                if isinstance(market_data_5y.columns, pd.MultiIndex):
-                    market_data_5y.columns = market_data_5y.columns.droplevel(1) # MultiIndex 제거
             else:
                 market_data_5y = fdr.DataReader(market_idx, start_5y, end_date)
 
             if stock_data_5y is not None and not stock_data_5y.empty and market_data_5y is not None and not market_data_5y.empty:
-                # Close 컬럼 추출
-                stock_prices_5y = stock_data_5y['Close'] if 'Close' in stock_data_5y.columns else stock_data_5y.iloc[:, 0]
-                market_prices_5y = market_data_5y['Close'] if 'Close' in market_data_5y.columns else market_data_5y.iloc[:, 0]
+                stock_prices_5y = _to_price_series(stock_data_5y)
+                market_prices_5y = _to_price_series(market_data_5y)
 
-                # 인덱스를 timezone-naive DatetimeIndex로 변환
                 if not isinstance(stock_prices_5y.index, pd.DatetimeIndex):
                     stock_prices_5y.index = pd.to_datetime(stock_prices_5y.index)
                 if stock_prices_5y.index.tz is not None:
                     stock_prices_5y.index = stock_prices_5y.index.tz_localize(None)
-
                 if not isinstance(market_prices_5y.index, pd.DatetimeIndex):
                     market_prices_5y.index = pd.to_datetime(market_prices_5y.index)
                 if market_prices_5y.index.tz is not None:
                     market_prices_5y.index = market_prices_5y.index.tz_localize(None)
 
-                # 월말 종가 저장
                 stock_monthly_prices = stock_prices_5y.resample('ME').last().dropna()
                 market_monthly_prices = market_prices_5y.resample('ME').last().dropna()
 
-                if len(stock_monthly_prices) >= 12 and len(market_monthly_prices) >= 12:
+                if len(stock_monthly_prices) >= MIN_MONTHLY_PTS and len(market_monthly_prices) >= MIN_MONTHLY_PTS:
                     temp_metrics['Stock_Monthly_Prices_5Y'] = stock_monthly_prices
                     temp_metrics['Market_Monthly_Prices_5Y'] = market_monthly_prices
 
-            start_2y = (pd.to_datetime(base_date_str) - timedelta(days=365*2+20)).strftime('%Y-%m-%d')
-
+            # 2년 주간 베타 데이터
             stock_data_2y = fdr.DataReader(ticker, start_2y, end_date)
             if market_idx.startswith('^'):
                 market_data_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
-                if isinstance(market_data_2y.columns, pd.MultiIndex):
-                    market_data_2y.columns = market_data_2y.columns.droplevel(1)
             else:
                 market_data_2y = fdr.DataReader(market_idx, start_2y, end_date)
 
             if stock_data_2y is not None and not stock_data_2y.empty and market_data_2y is not None and not market_data_2y.empty:
-                # Close 컬럼 추출
-                stock_prices_2y = stock_data_2y['Close'] if 'Close' in stock_data_2y.columns else stock_data_2y.iloc[:, 0]
-                market_prices_2y = market_data_2y['Close'] if 'Close' in market_data_2y.columns else market_data_2y.iloc[:, 0]
+                stock_prices_2y = _to_price_series(stock_data_2y)
+                market_prices_2y = _to_price_series(market_data_2y)
 
-                # 인덱스를 timezone-naive DatetimeIndex로 변환
                 if not isinstance(stock_prices_2y.index, pd.DatetimeIndex):
                     stock_prices_2y.index = pd.to_datetime(stock_prices_2y.index)
                 if stock_prices_2y.index.tz is not None:
                     stock_prices_2y.index = stock_prices_2y.index.tz_localize(None)
-
                 if not isinstance(market_prices_2y.index, pd.DatetimeIndex):
                     market_prices_2y.index = pd.to_datetime(market_prices_2y.index)
                 if market_prices_2y.index.tz is not None:
                     market_prices_2y.index = market_prices_2y.index.tz_localize(None)
 
-                # 주간 종가 저장 (금요일 기준)
                 stock_weekly_prices = stock_prices_2y.resample('W-FRI').last().dropna()
                 market_weekly_prices = market_prices_2y.resample('W-FRI').last().dropna()
 
-                if len(stock_weekly_prices) >= 50 and len(market_weekly_prices) >= 50:
+                if len(stock_weekly_prices) >= MIN_WEEKLY_PTS and len(market_weekly_prices) >= MIN_WEEKLY_PTS:
                     temp_metrics['Stock_Weekly_Prices_2Y'] = stock_weekly_prices
                     temp_metrics['Market_Weekly_Prices_2Y'] = market_weekly_prices
 
-        except Exception as e:
+        except Exception:
             pass  # Beta 데이터 수집 실패 시 계속 진행
 
         screen_summary_data.append(temp_metrics)
@@ -1242,7 +1227,7 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
         if stock_monthly_5y is not None and market_monthly_5y is not None and not stock_monthly_5y.empty and not market_monthly_5y.empty:
             try:
                 common_dates = stock_monthly_5y.index.intersection(market_monthly_5y.index)
-                if len(common_dates) > 12:
+                if len(common_dates) > MIN_MONTHLY_PTS:
                     stock_ret = stock_monthly_5y.loc[common_dates].pct_change().dropna()
                     market_ret = market_monthly_5y.loc[common_dates].pct_change().dropna()
                     common_idx = stock_ret.index.intersection(market_ret.index)
@@ -1253,19 +1238,17 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
                         beta_raw = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else np.nan
                         beta_adj = (2/3) * beta_raw + (1/3) * 1
 
-                        # Unlevered Beta = Adj Beta / (1 + (1 - Tax Rate) × D/E)
-                        # tax_rate는 이미 위에서 get_korean_marginal_tax_rate()로 계산됨
                         if not np.isnan(beta_adj) and equity > 0:
                             unlevered_beta_5y = beta_adj / (1 + (1 - tax_rate) * de_ratio)
                             avg_unlevered_betas_5y.append(unlevered_beta_5y)
-            except:
+            except Exception:
                 pass
 
         # 2Y Weekly Beta
         if stock_weekly_2y is not None and market_weekly_2y is not None and not stock_weekly_2y.empty and not market_weekly_2y.empty:
             try:
                 common_dates = stock_weekly_2y.index.intersection(market_weekly_2y.index)
-                if len(common_dates) > 50:
+                if len(common_dates) > MIN_WEEKLY_PTS:
                     stock_ret = stock_weekly_2y.loc[common_dates].pct_change().dropna()
                     market_ret = market_weekly_2y.loc[common_dates].pct_change().dropna()
                     common_idx = stock_ret.index.intersection(market_ret.index)
@@ -1276,12 +1259,10 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
                         beta_raw = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else np.nan
                         beta_adj = (2/3) * beta_raw + (1/3) * 1
 
-                        # Unlevered Beta
-                        # tax_rate는 이미 위에서 get_korean_marginal_tax_rate()로 계산됨
                         if not np.isnan(beta_adj) and equity > 0:
                             unlevered_beta_2y = beta_adj / (1 + (1 - tax_rate) * de_ratio)
                             avg_unlevered_betas_2y.append(unlevered_beta_2y)
-            except:
+            except Exception:
                 pass
 
     # 평균값 계산
@@ -1332,11 +1313,6 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
     return target_wacc_data, avg_debt_ratio
 
 def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summary_data, raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name, target_wacc_data, beta_type_input, notes_list, avg_debt_ratio, base_date_str, df_screen, target_periods):
-    import io
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
-    from openpyxl.workbook.defined_name import DefinedName
     # 2. 엑셀 생성 (메모리)
     output = io.BytesIO()
     wb = Workbook()
@@ -1853,8 +1829,6 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
     ws_wacc.freeze_panes = 'A4'
 
     # Named Range 정의 (다른 시트에서 참조 가능)
-    from openpyxl.workbook.defined_name import DefinedName
-
     wb.defined_names['Target_WACC'] = DefinedName('Target_WACC', attr_text=f"'WACC_Calculation'!$B${row_wacc_final}")
     wb.defined_names['Target_Rf'] = DefinedName('Target_Rf', attr_text="'WACC_Calculation'!$B$6")
     wb.defined_names['Target_MRP'] = DefinedName('Target_MRP', attr_text="'WACC_Calculation'!$B$7")
