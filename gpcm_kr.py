@@ -953,7 +953,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
     all_multiples = []
 
     total_tickers = len(target_code_list)
-    dart_fs_cache = {}  # DART API Call 최소화를 위한 캐시 (전체 run 공유)
+    dart_fs_cache = {}  # DART API Call 최소화를 위한 캐시 (ticker 포함 키로 충돌 방지)
 
     for idx, ticker in enumerate(target_code_list):
         status_container.write(f"Processing [{ticker}] ({idx+1}/{total_tickers})...")
@@ -1013,7 +1013,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                 # 2) BS Fetch (finstate_all: 상세) - CFS 우선 → OFS
                 if role in ('current_cum', 'annual'):
                     df_all = None
-                    cache_key = f"all_{year}_{r_code}"
+                    cache_key = f"all_{ticker}_{year}_{r_code}"
                     if cache_key in dart_fs_cache:
                         df_all = dart_fs_cache[cache_key]
                     else:
@@ -1054,7 +1054,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
 
                 # 3) PL Fetch
                 df_is = None
-                cache_key_pl = f"pl_{year}_{r_code}"
+                cache_key_pl = f"pl_{ticker}_{year}_{r_code}"
                 if cache_key_pl in dart_fs_cache:
                     df_is, pl_src = dart_fs_cache[cache_key_pl]
                 else:
