@@ -366,6 +366,9 @@ def match_bs_ev_component(account_nm, account_id):
         return 'Equity_Total', '자본총계'
     if aid == 'ifrs-full_EquityAttributableToOwnersOfParent':
         return 'Equity_P', '지배기업지분'
+    # 계정명 표기가 회사마다 달라(비지배지분/비지배주주지분/소수주주지분) 표준계정코드를 우선 사용
+    if aid == 'ifrs-full_NoncontrollingInterests':
+        return 'NCI', '비지배지분'
     if aid == 'dart_ElementsOfOtherStockholdersEquity':
         return None, None
 
@@ -385,7 +388,7 @@ def match_bs_ev_component(account_nm, account_id):
         if not any(ex.replace(" ", "") in acct_n for ex in IBD_EXCLUDE):
             return 'IBD', acct
 
-    if ('비지배지분' in acct or '소수주주지분' in acct) and ('귀속' not in acct):
+    if (('비지배' in acct_n and '지분' in acct_n) or '소수주주지분' in acct_n) and ('귀속' not in acct):
         return 'NCI', '비지배지분'
 
     noa_keywords = ['관계기업', '지분법', '공동기업', '종속기업', '금융자산', '금융상품']
