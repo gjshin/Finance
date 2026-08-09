@@ -62,6 +62,35 @@ def _to_price_series(df, col='Close'):
         s = s.iloc[:, 0]
     return s
 
+def _slice_from(df, start_date_str):
+    """이미 받아둔 넓은 구간 시계열에서 start_date 이후만 잘라낸다."""
+    if df is None or len(df) == 0:
+        return df
+    try:
+        idx = df.index
+        if not isinstance(idx, pd.DatetimeIndex):
+            idx = pd.to_datetime(idx)
+        start = pd.to_datetime(start_date_str)
+        if getattr(idx, 'tz', None) is not None:
+            start = start.tz_localize(idx.tz)
+        return df[idx >= start]
+    except Exception:
+        return df
+
+
+def _get_market_index_data(market_idx, start, end, cache):
+    """시장지수는 전 종목 공통이므로 (지수, 시작, 종료) 기준으로 1회만 조회한다."""
+    key = (market_idx, start, end)
+    if key in cache:
+        return cache[key]
+    if market_idx.startswith('^'):
+        data = yf.download(market_idx, start=start, end=end, progress=False)
+    else:
+        data = fdr.DataReader(market_idx, start, end)
+    cache[key] = data
+    return data
+
+
 def get_market_index(ticker):
     """
     티커 기반으로 거래소 및 시장지수 코드 반환 (한국 종목만 지원)
@@ -134,6 +163,29 @@ def parse_period(p: str):
 
 def get_base_date_str(year: int, qtr: str):
     return f"{year}-{QUARTER_INFO[qtr]}"
+
+# 정기보고서 법정 제출기한 (결산일로부터 경과일수)
+FILING_DEADLINE_DAYS = {'1Q': 45, '2Q': 45, '3Q': 45, '4Q': 90}
+
+def is_period_filed(year: int, qtr: str, asof: datetime = None):
+    """해당 분기 정기보고서의 제출기한이 지났는지 여부 (= 조회 가능한지)"""
+    asof = asof or datetime.now()
+    qtr_end = pd.to_datetime(f"{year}-{QUARTER_INFO[qtr]}")
+    return (qtr_end + timedelta(days=FILING_DEADLINE_DAYS[qtr])) <= asof
+
+def get_latest_filed_period(asof: datetime = None):
+    """오늘 기준으로 실제 공시가 끝난 가장 최근 분기를 (연도, 분기)로 반환"""
+    asof = asof or datetime.now()
+    y, q_idx = asof.year, 3
+    for _ in range(12):
+        qtr = ['1Q', '2Q', '3Q', '4Q'][q_idx]
+        if is_period_filed(y, qtr, asof):
+            return y, qtr
+        q_idx -= 1
+        if q_idx < 0:
+            y -= 1
+            q_idx = 3
+    return asof.year - 1, '4Q'
 
 def get_ltm_required_periods(year: int, qtr: str):
     if qtr == '4Q':
@@ -229,7 +281,25 @@ def _to_int(x):
 # --- DART 유통주식수 ---
 DART_STOCKTOTQY_URL = "https://opendart.fss.or.kr/api/stockTotqySttus.json"
 
-def fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code: str):
+# 매 호출마다 새 TLS 연결을 맺지 않도록 세션 재사용
+_DART_SESSION = requests.Session()
+
+def fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code: str, cache=None):
+    """같은 (회사, 연도, 보고서)를 기간별로 반복 조회하므로 결과를 캐시한다.
+    '데이터 없음' 응답도 캐시해야 fallback 탐색의 재조회가 사라진다.
+    다만 네트워크 오류(ERR)는 캐시하지 않아 일시적 실패가 고정되지 않도록 한다."""
+    ck = ('shares', corp_code, int(bsns_year), str(reprt_code))
+    if cache is not None and ck in cache:
+        return cache[ck]
+
+    shares, meta = _fetch_dart_distb_shares(api_key, corp_code, bsns_year, reprt_code)
+
+    if cache is not None and meta.get('status') != 'ERR':
+        cache[ck] = (shares, meta)
+    return shares, meta
+
+
+def _fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code: str):
     meta = {'shares': None, 'rcept_no': None, 'stlm_dt': None, 'se': None, 'status': None, 'message': None}
     try:
         params = {
@@ -238,7 +308,7 @@ def fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code:
             'bsns_year': str(bsns_year),
             'reprt_code': str(reprt_code),
         }
-        resp = requests.get(DART_STOCKTOTQY_URL, params=params, timeout=10)
+        resp = _DART_SESSION.get(DART_STOCKTOTQY_URL, params=params, timeout=10)
         resp.raise_for_status()
         js = resp.json()
 
@@ -279,15 +349,15 @@ def fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code:
         meta['message'] = str(e)
         return None, meta
 
-def get_outstanding_shares(api_key, corp_code: str, ticker: str, bsns_year: int, reprt_code: str, df_krx: pd.DataFrame):
+def get_outstanding_shares(api_key, corp_code: str, ticker: str, bsns_year: int, reprt_code: str, df_krx: pd.DataFrame, cache=None):
     # 1. DART API 조회 (요청한 기준년도/분기)
-    shares, meta = fetch_dart_distb_shares(api_key, corp_code, bsns_year, reprt_code)
+    shares, meta = fetch_dart_distb_shares(api_key, corp_code, bsns_year, reprt_code, cache=cache)
     if shares is not None and shares > 0:
         return shares, f"DART({reprt_code})", meta
 
     # 2. 직전 보고서들에서 주식수 조회 시도 (요청 분기에 주식수 누락 시)
-    # 순서: 11011 (1Q), 11012 (2Q), 11014 (3Q), 11013 (4Q)
-    order = ['11011', '11012', '11014', '11013']
+    # 시간순: 11013 (1Q), 11012 (반기), 11014 (3Q), 11011 (사업보고서)
+    order = ['11013', '11012', '11014', '11011']
     try:
         current_idx = order.index(reprt_code)
     except Exception:
@@ -303,7 +373,7 @@ def get_outstanding_shares(api_key, corp_code: str, ticker: str, bsns_year: int,
             ci = 3
         
         fb_code = order[ci]
-        fb_shares, fb_meta = fetch_dart_distb_shares(api_key, corp_code, cy, fb_code)
+        fb_shares, fb_meta = fetch_dart_distb_shares(api_key, corp_code, cy, fb_code, cache=cache)
         
         if fb_shares is not None and fb_shares > 0:
             # 과거 분기 정보를 찾았을 경우, 해당 출처(년도와 보고서 코드) 명시하여 반환
@@ -365,6 +435,13 @@ def match_bs_ev_component(account_nm, account_id):
         return 'Equity_Total', '자본총계'
     if aid == 'ifrs-full_EquityAttributableToOwnersOfParent':
         return 'Equity_P', '지배기업지분'
+    # 계정명 표기가 회사마다 달라(비지배지분/비지배주주지분/소수주주지분) 표준계정코드를 우선 사용
+    if aid == 'ifrs-full_NoncontrollingInterests':
+        return 'NCI', '비지배지분'
+    # 우선주 자본금: 시가총액(보통주)에 잡히지 않으므로 자기자본가치에 별도 가산
+    # '자본금'을 요구해 부채로 분류된 상환우선주(상환전환우선주부채 등)의 중복계상을 방지
+    if '우선주' in acct_n and '자본금' in acct_n and '부채' not in acct_n:
+        return 'Preferred', acct
     if aid == 'dart_ElementsOfOtherStockholdersEquity':
         return None, None
 
@@ -384,7 +461,7 @@ def match_bs_ev_component(account_nm, account_id):
         if not any(ex.replace(" ", "") in acct_n for ex in IBD_EXCLUDE):
             return 'IBD', acct
 
-    if ('비지배지분' in acct or '소수주주지분' in acct) and ('귀속' not in acct):
+    if (('비지배' in acct_n and '지분' in acct_n) or '소수주주지분' in acct_n) and ('귀속' not in acct):
         return 'NCI', '비지배지분'
 
     noa_keywords = ['관계기업', '지분법', '공동기업', '종속기업', '금융자산', '금융상품']
@@ -455,11 +532,9 @@ def _safe_dart_call(fn, *args, max_retry=2, **kwargs):
             time.sleep(0.4)
     return None, last_err
 
-def safe_finstate(dart_instance, corp_code, year, reprt_code, fs_div=None, max_retry=2):
-    kwargs = {'reprt_code': reprt_code}
-    if fs_div is not None:
-        kwargs['fs_div'] = fs_div
-    return _safe_dart_call(dart_instance.finstate, corp_code, year, max_retry=max_retry, **kwargs)
+def safe_finstate(dart_instance, corp_code, year, reprt_code, max_retry=2):
+    # OpenDartReader.finstate 는 fs_div 인자를 받지 않는다 (finstate_all 에만 존재)
+    return _safe_dart_call(dart_instance.finstate, corp_code, year, max_retry=max_retry, reprt_code=reprt_code)
 
 def safe_finstate_all(dart_instance, corp_code, year, reprt_code, fs_div=None, max_retry=2):
     kwargs = {'reprt_code': reprt_code}
@@ -468,13 +543,9 @@ def safe_finstate_all(dart_instance, corp_code, year, reprt_code, fs_div=None, m
     return _safe_dart_call(dart_instance.finstate_all, corp_code, year, max_retry=max_retry, **kwargs)
 
 def fetch_pl_df(dart_instance, corp_code, year, reprt_code):
-    for fs in ['CFS', 'OFS']:
-        df, err = safe_finstate(dart_instance, corp_code, year, reprt_code, fs_div=fs)
-        if df is not None and not df.empty: return df, f'finstate|{fs}', None
-    
-    df, err = safe_finstate(dart_instance, corp_code, year, reprt_code, fs_div=None)
-    if df is not None and not df.empty: return df, 'finstate|no_fs_div', None
-    
+    df, err = safe_finstate(dart_instance, corp_code, year, reprt_code)
+    if df is not None and not df.empty: return df, 'finstate', None
+
     for fs in ['CFS', 'OFS']:
         df, err = safe_finstate_all(dart_instance, corp_code, year, reprt_code, fs_div=fs)
         if df is not None and not df.empty: return df, f'finstate_all|{fs}', None
@@ -949,6 +1020,7 @@ def add_gpcm_section_row(ws):
         (6, 12, "BS & EV Components", pSEC3), (13,17, "PL(Annual & LTM)",   pSEC4),
         (18,20, "Market Data",        pSEC5), (21,25, "Valuation Multiples", pSEC6),
         (26,35, "Beta & Risk Analysis", PatternFill('solid', fgColor='6A1B9A')),
+        (36,36, "Equity Adj",           pSEC3),
     ]
     for c1, c2, label, fill in sections:
         ws.merge_cells(start_row=sec_row, start_column=c1, end_row=sec_row, end_column=c2)
@@ -976,6 +1048,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
 
     total_tickers = len(target_code_list)
     dart_fs_cache = {}  # DART API Call 최소화를 위한 캐시 (ticker 포함 키로 충돌 방지)
+    market_idx_cache = {}  # 시장지수 시계열 캐시 (전 종목 공통)
 
     for idx, ticker in enumerate(target_code_list):
         status_container.write(f"Processing [{ticker}] ({idx+1}/{total_tickers})...")
@@ -992,7 +1065,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
         # 임시 저장소 (화면 출력용) - 최신 기준일 데이터
         temp_metrics = {
             'Company': display_name, 'Ticker': ticker,
-            'Market_Cap': 0, 'Cash': 0, 'IBD': 0, 'NCI': 0, 'NOA': 0, 'Equity': 0,
+            'Market_Cap': 0, 'Cash': 0, 'IBD': 0, 'NCI': 0, 'NOA': 0, 'Equity': 0, 'Preferred': 0,
             'Revenue': 0, 'EBIT': 0, 'NI': 0, 'Pretax_Income': 0,
             'Stock_Monthly_Prices_5Y': None, 'Market_Monthly_Prices_5Y': None,
             'Stock_Weekly_Prices_2Y': None, 'Market_Weekly_Prices_2Y': None,
@@ -1004,7 +1077,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
             required_periods = get_ltm_required_periods(tyear, tqtr)
             
             period_metrics = {
-                'Market_Cap': 0, 'Cash': 0, 'IBD': 0, 'NCI': 0, 'NOA': 0, 'Equity': 0,
+                'Market_Cap': 0, 'Cash': 0, 'IBD': 0, 'NCI': 0, 'NOA': 0, 'Equity': 0, 'Preferred': 0,
                 'Revenue': 0, 'EBIT': 0, 'NI': 0, 'Pretax_Income': 0
             }
 
@@ -1015,7 +1088,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                 # 1) Market Cap (기준시점만)
                 if role in ('current_cum', 'annual'):
                     price, price_date = get_stock_price(ticker, bds)
-                    shares, shares_src, sh_meta = get_outstanding_shares(api_key_input, corp_code, ticker, year, r_code, df_krx)
+                    shares, shares_src, sh_meta = get_outstanding_shares(api_key_input, corp_code, ticker, year, r_code, df_krx, cache=dart_fs_cache)
 
                     mkt_100m = 0
                     if price is not None and shares is not None and shares > 0:
@@ -1066,6 +1139,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                                 elif ev_comp == 'IBD': period_metrics['IBD'] += val_100m
                                 elif ev_comp == 'NCI': period_metrics['NCI'] += val_100m
                                 elif ev_comp == 'NOA': period_metrics['NOA'] += val_100m
+                                elif ev_comp == 'Preferred': period_metrics['Preferred'] += val_100m
                                 elif ev_comp in ['Equity_Total', 'Equity_P']: period_metrics['Equity'] += val_100m
 
                             raw_bs_rows.append({
@@ -1138,11 +1212,9 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
             start_2y = (pd.to_datetime(base_date_str) - timedelta(days=BETA_2Y_DAYS)).strftime('%Y-%m-%d')
 
             # 5년 월간 베타 데이터
+            # 시장지수는 모든 종목이 동일하므로 종목마다 다시 받지 않고 캐시에서 재사용
             stock_data_5y = fdr.DataReader(ticker, start_5y, end_date)
-            if market_idx.startswith('^'):
-                market_data_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)
-            else:
-                market_data_5y = fdr.DataReader(market_idx, start_5y, end_date)
+            market_data_5y = _get_market_index_data(market_idx, start_5y, end_date, market_idx_cache)
 
             if stock_data_5y is not None and not stock_data_5y.empty and market_data_5y is not None and not market_data_5y.empty:
                 stock_prices_5y = _to_price_series(stock_data_5y)
@@ -1165,11 +1237,9 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                     temp_metrics['Market_Monthly_Prices_5Y'] = market_monthly_prices
 
             # 2년 주간 베타 데이터
-            stock_data_2y = fdr.DataReader(ticker, start_2y, end_date)
-            if market_idx.startswith('^'):
-                market_data_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
-            else:
-                market_data_2y = fdr.DataReader(market_idx, start_2y, end_date)
+            # 2년 구간은 위에서 받은 5년 구간의 부분집합이므로 잘라 쓴다 (재조회 불필요)
+            stock_data_2y = _slice_from(stock_data_5y, start_2y)
+            market_data_2y = _slice_from(market_data_5y, start_2y)
 
             if stock_data_2y is not None and not stock_data_2y.empty and market_data_2y is not None and not market_data_2y.empty:
                 stock_prices_2y = _to_price_series(stock_data_2y)
@@ -1222,17 +1292,18 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
         mkt_cap = comp_data.get('Market_Cap', 0)
         ibd = comp_data.get('IBD', 0)
         nci = comp_data.get('NCI', 0)
+        pref = comp_data.get('Preferred', 0)  # 우선주 자본금 (시가총액은 보통주만 반영)
         equity = comp_data.get('Equity', 0)
         pretax_income = comp_data.get('Pretax_Income', 0)
 
-        # Debt Ratio (D/V) = IBD / (Mkt Cap + IBD + NCI)
-        total_value = mkt_cap + ibd + nci
+        # Debt Ratio (D/V) = IBD / (Mkt Cap + 우선주 + IBD + NCI)
+        total_value = mkt_cap + pref + ibd + nci
         if total_value > 0:
             debt_ratio = ibd / total_value
             avg_debt_ratios.append(debt_ratio)
 
-        # D/E Ratio = IBD / (Mkt Cap + NCI)
-        equity_value = mkt_cap + nci
+        # D/E Ratio = IBD / (Mkt Cap + 우선주 + NCI)
+        equity_value = mkt_cap + pref + nci
         de_ratio = ibd / equity_value if equity_value > 0 else 0
 
         # 한계세율 계산 (사업연도별 한국 법인세율표, 지방소득세 포함)
@@ -1870,12 +1941,12 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
     # 시트 순서: GPCM, WACC_Calculation, Beta_Calculation, BS_Full, PL_Data, Market_Cap, LTM_Calc
     wb.move_sheet('WACC_Calculation', offset=-4)  # GPCM 다음 (index 1)
     wb.move_sheet('Beta_Calculation', offset=-3)  # WACC 다음 (index 2)
-    TOTAL_COLS = 35
+    TOTAL_COLS = 36
     ws.merge_cells(f'A1:{get_column_letter(TOTAL_COLS)}1'); ws['A1'] = "GPCM Valuation Summary with Beta Analysis"; sc(ws['A1'], fo=fT)
-    ws.merge_cells(f'A2:{get_column_letter(TOTAL_COLS)}2'); ws['A2'] = f"Base: {base_period_str} | Unit: 억원 | EV = MCap + IBD − Cash + NCI − NOA"; sc(ws['A2'], fo=fS)
+    ws.merge_cells(f'A2:{get_column_letter(TOTAL_COLS)}2'); ws['A2'] = f"Base: {base_period_str} | Unit: 억원 | EV = MCap + 우선주 + IBD − Cash + NCI − NOA"; sc(ws['A2'], fo=fS)
     add_gpcm_section_row(ws)
-    headers = ['Company','Ticker','Base Date','Curr','PL Source','Cash','IBD','NOA','Net Debt','NCI','Equity','EV','Revenue','EBIT','D&A','EBITDA','NI','Price','Shares','Mkt Cap','EV/EBITDA','EV/EBIT','PER','PBR','PSR','β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','D/E Ratio','Debt Ratio (D/V)','Unlevered β 5Y','Unlevered β 2Y']
-    widths = [18, 10, 11, 6, 13, 13, 13, 13, 13, 12, 13, 15, 13, 13, 10, 13, 13, 12, 15, 15, 12, 12, 10, 10, 10, 10, 10, 10, 10, 13, 9, 10, 10, 12, 12]
+    headers = ['Company','Ticker','Base Date','Curr','PL Source','Cash','IBD','NOA','Net Debt','NCI','Equity','EV','Revenue','EBIT','D&A','EBITDA','NI','Price','Shares','Mkt Cap','EV/EBITDA','EV/EBIT','PER','PBR','PSR','β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','D/E Ratio','Debt Ratio (D/V)','Unlevered β 5Y','Unlevered β 2Y','우선주(장부)']
+    widths = [18, 10, 11, 6, 13, 13, 13, 13, 13, 12, 13, 15, 13, 13, 10, 13, 13, 12, 15, 15, 12, 12, 10, 10, 10, 10, 10, 10, 10, 13, 9, 10, 10, 12, 12, 13]
     header_row = 5
     for i, (h, w) in enumerate(zip(headers, widths), 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -1891,7 +1962,7 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
         ws.cell(r,9).value = f'=G{r}-F{r}-H{r}'; sc(ws.cell(r,9), fo=fFRM, fi=bg, nf=NB, bd=BD)
         ws.cell(r,10).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "NCI")'; sc(ws.cell(r,10), fo=fLINK, fi=ev_fills['NCI'], nf=NB, bd=BD)
         ws.cell(r,11).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "Equity_Total")'; sc(ws.cell(r,11), fo=fLINK, fi=ev_fills['Equity'], nf=NB, bd=BD)
-        ws.cell(r,12).value = f'=T{r}+G{r}-F{r}+J{r}-H{r}'; sc(ws.cell(r,12), fo=fFRM, fi=bg, nf=NB, bd=BD)
+        ws.cell(r,12).value = f'=T{r}+AJ{r}+G{r}-F{r}+J{r}-H{r}'; sc(ws.cell(r,12), fo=fFRM, fi=bg, nf=NB, bd=BD)
         ws.cell(r,13).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "Revenue")'; sc(ws.cell(r,13), fo=fLINK, fi=ev_fills['PL_HL'], nf=NB, bd=BD)
         ws.cell(r,14).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "EBIT")'; sc(ws.cell(r,14), fo=fLINK, fi=ev_fills['PL_HL'], nf=NB, bd=BD)
         sc(ws.cell(r,15), fi=PatternFill('solid', fgColor='FFFF00'), nf=NB, bd=BD) # D&A 수기
@@ -1948,11 +2019,11 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
         ws.cell(r,31).value = f'=IF(AD{r}<=2, 0.099, IF(AD{r}<=200, 0.209, IF(AD{r}<=3000, 0.231, 0.264)))'
         sc(ws.cell(r,31), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
 
-        # 컬럼 32: D/E Ratio = IBD / (Mkt Cap + NCI)
-        ws.cell(r,32).value = f'=IF(T{r}+J{r}>0, G{r}/(T{r}+J{r}), 0)'; sc(ws.cell(r,32), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
+        # 컬럼 32: D/E Ratio = IBD / (Mkt Cap + 우선주 + NCI)
+        ws.cell(r,32).value = f'=IF(T{r}+AJ{r}+J{r}>0, G{r}/(T{r}+AJ{r}+J{r}), 0)'; sc(ws.cell(r,32), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
 
-        # 컬럼 33: Debt Ratio (D/V) = IBD / (Mkt Cap + IBD + NCI)
-        ws.cell(r,33).value = f'=IF(T{r}+G{r}+J{r}>0, G{r}/(T{r}+G{r}+J{r}), 0)'; sc(ws.cell(r,33), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
+        # 컬럼 33: Debt Ratio (D/V) = IBD / (Mkt Cap + 우선주 + IBD + NCI)
+        ws.cell(r,33).value = f'=IF(T{r}+AJ{r}+G{r}+J{r}>0, G{r}/(T{r}+AJ{r}+G{r}+J{r}), 0)'; sc(ws.cell(r,33), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
 
         # 컬럼 34: Unlevered Beta 5Y = β 5Y Adj / (1 + (1 - Tax Rate) × D/E Ratio)
         # 컬럼 27 (AA) = β 5Y Adj, 컬럼 31 (AE) = Tax Rate, 컬럼 32 (AF) = D/E Ratio
@@ -1961,6 +2032,10 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
         # 컬럼 35: Unlevered Beta 2Y = β 2Y Adj / (1 + (1 - Tax Rate) × D/E Ratio)
         # 컬럼 29 (AC) = β 2Y Adj, 컬럼 31 (AE) = Tax Rate, 컬럼 32 (AF) = D/E Ratio
         ws.cell(r,35).value = f'=IF(AC{r}>0, AC{r}/(1+(1-AE{r})*AF{r}), "")'; sc(ws.cell(r,35), fo=fFRM, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
+
+        # 컬럼 36: 우선주 자본금 (시가총액은 보통주만 반영하므로 자기자본가치에 별도 가산)
+        ws.cell(r,36).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "Preferred")'
+        sc(ws.cell(r,36), fo=fLINK, fi=ev_fills['Equity'], nf=NB, bd=BD)
         r += 1
     r_end = r - 1; r += 1
     for stat, fn in [('Mean','AVERAGE'), ('Median','MEDIAN'), ('Max','MAX'), ('Min','MIN')]:
@@ -2066,25 +2141,28 @@ with st.sidebar:
     # 모드별 입력 파라미터 분기
     if ui_mode == "GPCM Valuation (기존)":
         # 다기간 GPCM 파라미터
-        current_year = datetime.now().year
-        
+        # 기본값은 '아직 공시되지 않은 미래 분기'가 잡히지 않도록 실제 공시 완료된 최신 분기로 설정
+        latest_year, latest_qtr = get_latest_filed_period()
+
         st.write("**GPCM 분석 대상 기간**")
+        st.caption(f"📅 현재 조회 가능한 최신 공시: **{latest_year}년 {latest_qtr}**")
         g_cycle = st.radio("분석 주기", ["분기별 (Quarterly)", "연간별 (Annual)"], index=0, horizontal=True, help="연간별 선택 시 각 연도의 4Q(사업보고서) 데이터만 추출하여 트렌드를 구성합니다.")
-        
+
         col1, col2 = st.columns(2)
         with col1:
             st.write("**시작 기간**")
-            g_start_year = st.number_input("시작 연도", min_value=2015, max_value=2030, value=current_year - 1, step=1, key="gsy")
+            g_start_year = st.number_input("시작 연도", min_value=2015, max_value=2030, value=latest_year - 1, step=1, key="gsy")
             g_start_qtr = "1Q"
             if g_cycle == "분기별 (Quarterly)":
                 g_start_qtr = st.selectbox("시작 분기", ["1Q", "2Q", "3Q", "4Q"], index=0, key="gsq")
         with col2:
             st.write("**종료 기간 (기본 Base Date)**")
-            g_end_year = st.number_input("종료 연도", min_value=2015, max_value=2030, value=current_year, step=1, key="gey")
+            g_end_year = st.number_input("종료 연도", min_value=2015, max_value=2030, value=latest_year, step=1, key="gey")
             g_end_qtr = "4Q"
             if g_cycle == "분기별 (Quarterly)":
-                g_end_qtr = st.selectbox("종료 분기", ["1Q", "2Q", "3Q", "4Q"], index=2, key="geq")
-            
+                g_end_qtr = st.selectbox("종료 분기", ["1Q", "2Q", "3Q", "4Q"],
+                                         index=["1Q", "2Q", "3Q", "4Q"].index(latest_qtr), key="geq")
+
         target_periods = []
         qtrs = ["1Q", "2Q", "3Q", "4Q"]
         for y in range(g_start_year, g_end_year + 1):
@@ -2105,9 +2183,17 @@ with st.sidebar:
         base_period_str = target_periods[-1]
         base_year, base_qtr = parse_period(base_period_str)
         base_date_display = get_base_date_str(base_year, base_qtr)
-        
+
+        unfiled = [p for p in target_periods if not is_period_filed(*parse_period(p))]
+        if unfiled:
+            st.warning(
+                f"⚠️ 아직 공시되지 않은 기간이 포함되어 있습니다: {', '.join(unfiled)}\n\n"
+                f"해당 기간은 재무·주가 데이터가 비어 있어 결과가 0으로 나옵니다. "
+                f"종료 기간을 **{latest_year}년 {latest_qtr}** 이하로 맞춰주세요."
+            )
+
         st.info(f"Target WACC 기준일 (최신기간 적용): {base_date_display} (말일)")
-        
+
         st.subheader("Target Companies")
         tickers_input = st.text_area("대상회사의 종목코드를 한줄씩 입력하세요", value="000250\n039030\n005290", height=150)
 
@@ -2222,17 +2308,18 @@ if ui_mode == "GPCM Valuation (기존)":
         f'• Base Date: {base_period_str} ({base_date_display}) | Unit: 억원 (KRW 100M)',
         '• 공통: 연결재무제표 작성 시 CFS 우선, 미존재 시 OFS 기준으로 수집',
         '• PL: 요약 손익계산서에서 매출액/영업이익/당기순이익 3개 계정만 엄격 추출',
-        '• PL Fetch: finstate(CFS/OFS) → finstate(no fs_div) → finstate_all fallback',
+        '• PL Fetch: finstate(요약) → finstate_all(CFS/OFS) fallback',
         '• Shares: DART(stockTotqySttus) 유통주식수(distb_stock_co) 우선, 미공시 시 DART 과거보고서 fallback',
-        '• EV = Market Cap + IBD − Cash + NCI − NOA',
+        '• EV = Market Cap + 우선주(장부) + IBD − Cash + NCI − NOA',
         '• Net Debt = IBD − Cash − NOA',
         '• IBD(Option): CB/EB/BW 등 메자닌은 기본적으로 IBD(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
         '• NOA(Option): 투자자산/관계기업 등은 기본적으로 NOA(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
         '• LTM = Current Cumulative + Prior Annual − Prior Same Quarter Cumulative (단, 4Q는 Annual)',
         '• Beta: 5년 월간 & 2년 주간 수익률 기준 (FinanceDataReader 사용)',
         '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1',
-        '• D/E Ratio = IBD / (Market Cap + NCI)',
-        '• Debt Ratio (D/V) = IBD / (Market Cap + IBD + NCI)',
+        '• D/E Ratio = IBD / (Market Cap + 우선주 + NCI)',
+        '• Debt Ratio (D/V) = IBD / (Market Cap + 우선주 + IBD + NCI)',
+        '• 우선주: BS의 우선주자본금(액면) 기준. 시가총액은 보통주만 반영하므로 자기자본가치에 가산',
         '• Unlevered Beta = Levered Beta / (1 + (1 - Tax Rate) × D/E Ratio)',
         '• Tax Rate: 한국 법인세 한계세율 (지방소득세 포함, 세전순이익 기준, 사업연도별 세율표 적용)',
         '   - FY2023~2025: 2억 이하 9.9% | 2~200억 20.9% | 200~3,000억 23.1% | 3,000억 초과 26.4%',
@@ -2252,6 +2339,20 @@ else:
     st.markdown("---")
 
 # ▼▼▼▼▼ [추가 1] DART 접속 객체를 캐싱하는 함수 (if run_btn 바로 위에 넣으세요) ▼▼▼▼▼
+def check_dart_reachable(timeout=10):
+    """OpenDartReader 는 timeout 을 지정하지 않아 접속 불가 시 수 분간 멈춘다.
+    실제 조회 전에 짧은 timeout 으로 도달 가능 여부만 먼저 확인한다."""
+    try:
+        requests.get('https://opendart.fss.or.kr/api/corpCode.xml',
+                     params={'crtfc_key': 'preflight'}, timeout=timeout)
+        return True, None
+    except requests.exceptions.Timeout:
+        return False, 'timeout'
+    except requests.exceptions.ConnectionError:
+        return False, 'unreachable'
+    except Exception as e:
+        return False, str(e)
+
 @st.cache_resource
 def get_dart_reader(api_key):
     return OpenDartReader(api_key)
@@ -2274,10 +2375,22 @@ if run_btn:
                 status_container = st.status("GPCM 데이터 분석 중...", expanded=True)
                 progress_bar = st.progress(0)
 
+                ok, reason = check_dart_reachable()
+                if not ok:
+                    st.error(
+                        "**DART 서버에 접속할 수 없습니다.**\n\n"
+                        "API 키 문제가 아니라 네트워크에서 차단된 상태입니다 "
+                        "(DART 는 해외 클라우드 IP 접속을 제한합니다).\n\n"
+                        "- Streamlit Cloud 등 해외 서버에서 실행 중이라면 **국내 환경(개인 PC 또는 국내 리전)** 에서 실행해주세요.\n"
+                        "- 사내망이라면 방화벽에서 `opendart.fss.or.kr` 을 허용해야 합니다.\n\n"
+                        f"(원인: {reason})"
+                    )
+                    st.stop()
+
                 try:
                     dart = get_dart_reader(api_key_input)
                 except Exception as e:
-                    st.error(f"DART 서버 접속 실패: {e}")
+                    st.error(f"DART 인증 실패 또는 조회 오류: {e}\n\nAPI 키가 올바른지 확인해주세요.")
                     st.stop()
 
                 # 변수 초기화 및 데이터 수집
@@ -2286,8 +2399,25 @@ if run_btn:
 
                 # 1. 화면 출력용 DataFrame 구성
                 df_screen = pd.DataFrame(all_multiples)
+
+                # 1-0. 수집 실패 진단 (조용히 0으로 넘어가는 것을 방지)
+                problems = []
+                base_rows = [m for m in all_multiples if m['Period'] == base_period_str]
+                if not base_rows:
+                    problems.append(f"기준 기간({base_period_str}) 데이터를 한 건도 수집하지 못했습니다.")
+                for m in base_rows:
+                    empty_fields = [k for k in ('Market_Cap', 'Revenue', 'Equity') if not m.get(k)]
+                    if empty_fields:
+                        problems.append(f"[{m['Company']}] {base_period_str} — {', '.join(empty_fields)} 값이 없습니다.")
+                if problems:
+                    st.warning(
+                        "⚠️ **아래 항목을 수집하지 못했습니다. 배수·WACC 결과가 왜곡됩니다.**\n\n"
+                        + "\n".join(f"- {p}" for p in problems)
+                        + "\n\n대부분 아직 공시되지 않은 기간을 조회했을 때 발생합니다."
+                    )
+
                 if not df_screen.empty:
-                    df_screen['EV'] = df_screen['Market_Cap'] + df_screen['IBD'] - df_screen['Cash'] + df_screen['NCI'] - df_screen['NOA']
+                    df_screen['EV'] = df_screen['Market_Cap'] + df_screen['Preferred'] + df_screen['IBD'] - df_screen['Cash'] + df_screen['NCI'] - df_screen['NOA']
                     df_screen['EV/EBIT'] = np.where(df_screen['EBIT'] > 0, df_screen['EV'] / df_screen['EBIT'], np.nan)
                     df_screen['PER'] = np.where(df_screen['NI'] > 0, df_screen['Market_Cap'] / df_screen['NI'], np.nan)
                     df_screen['PSR'] = np.where(df_screen['Revenue'] > 0, df_screen['Market_Cap'] / df_screen['Revenue'], np.nan)
@@ -2308,6 +2438,14 @@ if run_btn:
                     target_code_list, screen_summary_data, target_tax_rate_input, rf_input, mrp_input, size_premium_input, kd_pretax_input, beta_type_input,
                     fiscal_year=base_year)
 
+                if target_wacc_data['Target_WACC'] <= rf_input:
+                    st.error(
+                        f"❌ **계산된 WACC({target_wacc_data['Target_WACC']*100:.2f}%)이 "
+                        f"무위험이자율({rf_input*100:.2f}%)보다 낮습니다.** 정상적인 결과가 아닙니다.\n\n"
+                        "시가총액이 0으로 수집되어 자본구조·베타가 붕괴한 경우입니다. "
+                        "위의 수집 실패 경고를 먼저 확인해주세요."
+                    )
+
                 # 2. 엑셀 생성 (메모리)
                 output = export_gpcm_excel(
                     base_period_str, base_qtr, target_code_list, screen_summary_data, raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name,
@@ -2327,10 +2465,22 @@ if run_btn:
                 status_container = st.status(f"다기간 재무제표 데이터 수집 중... (대상: {len(target_code_list)}개 기업 / 기간: {len(periods_to_fetch)}개)", expanded=True)
                 progress_bar = st.progress(0)
 
+                ok, reason = check_dart_reachable()
+                if not ok:
+                    st.error(
+                        "**DART 서버에 접속할 수 없습니다.**\n\n"
+                        "API 키 문제가 아니라 네트워크에서 차단된 상태입니다 "
+                        "(DART 는 해외 클라우드 IP 접속을 제한합니다).\n\n"
+                        "- Streamlit Cloud 등 해외 서버에서 실행 중이라면 **국내 환경(개인 PC 또는 국내 리전)** 에서 실행해주세요.\n"
+                        "- 사내망이라면 방화벽에서 `opendart.fss.or.kr` 을 허용해야 합니다.\n\n"
+                        f"(원인: {reason})"
+                    )
+                    st.stop()
+
                 try:
                     dart = get_dart_reader(api_key_input)
                 except Exception as e:
-                    st.error(f"DART 서버 접속 실패: {e}")
+                    st.error(f"DART 인증 실패 또는 조회 오류: {e}\n\nAPI 키가 올바른지 확인해주세요.")
                     st.stop()
                 
                 # 1. 데이터 수집
