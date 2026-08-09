@@ -71,27 +71,49 @@ def get_market_index(ticker):
     # KS11 (KOSPI)가 fdr에서 실패하는 경우가 많아 yfinance 심볼(^KS11)로 대체
     return 'KRX', '^KS11'  # 기본값: KOSPI
 
-def get_korean_marginal_tax_rate(pretax_income_100m):
-    """
-    한국 법인세 한계세율 산출 (2025년 기준, 지방세 포함)
-    과세표준 기준 (단위: 억원)
-    - 2억 이하: 9% (국세) + 0.9% (지방세 10%) = 9.9%
-    - 2억 ~ 200억: 19% + 1.9% = 20.9%
-    - 200억 ~ 3,000억: 21% + 2.1% = 23.1%
-    - 3,000억 초과: 24% + 2.4% = 26.4%
-    """
-    if pd.isna(pretax_income_100m) or pretax_income_100m == 0:
-        return 0.231  # 기본값 (중간 구간)
+# 한국 법인세 한계세율표 (사업연도별, 지방소득세 10% 포함)
+# 각 구간: (과세표준 상한(억원), 한계세율)  — 상한 None = 초과 구간
+# · FY2018~2022 : 국세 10 / 20 / 22 / 25%
+# · FY2023~2025 : 국세  9 / 19 / 21 / 24%  (2022년 세법개정, 1%p 인하)
+# · FY2026~     : 국세 10 / 20 / 22 / 25%  (2025년 세법개정, 1%p 인상 환원)
+KR_TAX_BRACKETS_PRE2023 = [(2, 0.110), (200, 0.220), (3000, 0.242), (None, 0.275)]
+KR_TAX_BRACKETS_2023 = [(2, 0.099), (200, 0.209), (3000, 0.231), (None, 0.264)]
+KR_TAX_BRACKETS_2026 = [(2, 0.110), (200, 0.220), (3000, 0.242), (None, 0.275)]
 
-    # 억원 단위로 들어온 값
-    if pretax_income_100m <= 2:
-        return 0.099
-    elif pretax_income_100m <= 200:
-        return 0.209
-    elif pretax_income_100m <= 3000:
-        return 0.231
-    else:
-        return 0.264
+
+def get_korean_tax_brackets(fiscal_year):
+    """사업연도에 적용되는 한국 법인세 한계세율표 반환."""
+    try:
+        fy = int(fiscal_year)
+    except (TypeError, ValueError):
+        fy = datetime.now().year
+    if fy >= 2026:
+        return KR_TAX_BRACKETS_2026
+    if fy >= 2023:
+        return KR_TAX_BRACKETS_2023
+    return KR_TAX_BRACKETS_PRE2023
+
+
+def get_korean_marginal_tax_rate(pretax_income_100m, fiscal_year=None):
+    """
+    한국 법인세 한계세율 산출 (지방소득세 포함, 사업연도별 세율표 적용)
+
+    Parameters:
+    - pretax_income_100m: 세전이익 (억원). 과세표준의 대용치로 사용.
+    - fiscal_year: 해당 재무제표의 결산 연도. 미지정 시 현재 연도 기준.
+
+    Note: 결손(음수) 기업은 한계세율 개념이 성립하지 않으므로
+          '2억 초과 ~ 200억' 구간 세율을 적용한다.
+    """
+    brackets = get_korean_tax_brackets(fiscal_year)
+
+    if pd.isna(pretax_income_100m) or pretax_income_100m <= 0:
+        return brackets[1][1]
+
+    for upper, rate in brackets:
+        if upper is None or pretax_income_100m <= upper:
+            return rate
+    return brackets[-1][1]
 
 def calculate_unlevered_beta(levered_beta, debt, equity, tax_rate):
     """
@@ -1182,7 +1204,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
 
     return raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name, screen_summary_data, base_year, base_qtr, base_date_str, all_multiples
 
-def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_rate_input, rf_input, mrp_input, size_premium_input, kd_pretax_input, beta_type_input):
+def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_rate_input, rf_input, mrp_input, size_premium_input, kd_pretax_input, beta_type_input, fiscal_year=None):
     # 1.5. WACC Calculation (Target 기업용)
     # Beta 시트에서 계산될 Unlevered Beta를 엑셀에서 참조할 것이므로,
     # 여기서는 대략적인 값만 계산 (정확한 값은 엑셀 수식 기반)
@@ -1213,8 +1235,8 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
         equity_value = mkt_cap + nci
         de_ratio = ibd / equity_value if equity_value > 0 else 0
 
-        # 한계세율 계산 (2025년 한국 법인세, 지방세 포함)
-        tax_rate = get_korean_marginal_tax_rate(pretax_income)
+        # 한계세율 계산 (사업연도별 한국 법인세율표, 지방소득세 포함)
+        tax_rate = get_korean_marginal_tax_rate(pretax_income, fiscal_year)
         comp_data['Tax_Rate'] = tax_rate  # 저장 (나중에 Excel 출력용)
 
         # Beta 계산 (간단히 수익률 기반)
@@ -1920,8 +1942,9 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
         # 컬럼 30: Pretax Inc (LTM_Calc에서 참조)
         ws.cell(r,30).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "Pretax_Income")'; sc(ws.cell(r,30), fo=fLINK, fi=bg, al=aR, nf=NB, bd=BD)
 
-        # 컬럼 31: Tax Rate (한국 법인세 한계세율, 2025년 기준, 지방세 포함)
-        # 2억 이하: 9.9%, 2~200억: 20.9%, 200~3000억: 23.1%, 3000억 초과: 26.4%
+        # 컬럼 31: Tax Rate (한국 법인세 한계세율, 사업연도별 세율표, 지방소득세 포함)
+        # FY2023~2025: 2억 이하 9.9% / 2~200억 20.9% / 200~3000억 23.1% / 3000억 초과 26.4%
+        # FY2026~    : 2억 이하 11.0% / 2~200억 22.0% / 200~3000억 24.2% / 3000억 초과 27.5%
         ws.cell(r,31).value = f'=IF(AD{r}<=2, 0.099, IF(AD{r}<=200, 0.209, IF(AD{r}<=3000, 0.231, 0.264)))'
         sc(ws.cell(r,31), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
 
@@ -2131,7 +2154,9 @@ with st.sidebar:
         beta_type_input = beta_type_options[beta_type_choice]
 
         kd_pretax_input = st.number_input("Kd (Pretax) - 세전 이자율 (%)", min_value=0.0, max_value=15.0, value=3.5, step=0.1, format="%.1f") / 100
-        target_tax_rate_input = st.number_input("Target 법인세율 (%)", min_value=0.0, max_value=50.0, value=26.4, step=0.1, format="%.1f") / 100
+        target_tax_rate_input = st.number_input(
+            "Target 법인세율 (%)", min_value=0.0, max_value=50.0, value=26.4, step=0.1, format="%.1f",
+            help="지방소득세 포함 한계세율. 최고구간 기준 FY2023~2025는 26.4%, FY2026부터는 27.5%입니다.") / 100
 
         run_btn = st.button("Go,Go,Go 🚀", type="primary", key="btn_gpcm")
 
@@ -2209,7 +2234,9 @@ if ui_mode == "GPCM Valuation (기존)":
         '• D/E Ratio = IBD / (Market Cap + NCI)',
         '• Debt Ratio (D/V) = IBD / (Market Cap + IBD + NCI)',
         '• Unlevered Beta = Levered Beta / (1 + (1 - Tax Rate) × D/E Ratio)',
-        '• Tax Rate: 한국 법인세 한계세율 (지방세 포함, 세전순이익 기준)',
+        '• Tax Rate: 한국 법인세 한계세율 (지방소득세 포함, 세전순이익 기준, 사업연도별 세율표 적용)',
+        '   - FY2023~2025: 2억 이하 9.9% | 2~200억 20.9% | 200~3,000억 23.1% | 3,000억 초과 26.4%',
+        '   - FY2026~    : 2억 이하 11.0% | 2~200억 22.0% | 200~3,000억 24.2% | 3,000억 초과 27.5% (2025년 세법개정)',
     ]
     for note in notes_list:
         st.text(note)
@@ -2278,7 +2305,8 @@ if run_btn:
 
                 # 1.5. WACC Calculation (Target 기업용)
                 target_wacc_data, avg_debt_ratio = calculate_wacc_and_beta(
-                    target_code_list, screen_summary_data, target_tax_rate_input, rf_input, mrp_input, size_premium_input, kd_pretax_input, beta_type_input)
+                    target_code_list, screen_summary_data, target_tax_rate_input, rf_input, mrp_input, size_premium_input, kd_pretax_input, beta_type_input,
+                    fiscal_year=base_year)
 
                 # 2. 엑셀 생성 (메모리)
                 output = export_gpcm_excel(
