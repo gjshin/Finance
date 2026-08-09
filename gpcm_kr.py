@@ -113,6 +113,29 @@ def parse_period(p: str):
 def get_base_date_str(year: int, qtr: str):
     return f"{year}-{QUARTER_INFO[qtr]}"
 
+# 정기보고서 법정 제출기한 (결산일로부터 경과일수)
+FILING_DEADLINE_DAYS = {'1Q': 45, '2Q': 45, '3Q': 45, '4Q': 90}
+
+def is_period_filed(year: int, qtr: str, asof: datetime = None):
+    """해당 분기 정기보고서의 제출기한이 지났는지 여부 (= 조회 가능한지)"""
+    asof = asof or datetime.now()
+    qtr_end = pd.to_datetime(f"{year}-{QUARTER_INFO[qtr]}")
+    return (qtr_end + timedelta(days=FILING_DEADLINE_DAYS[qtr])) <= asof
+
+def get_latest_filed_period(asof: datetime = None):
+    """오늘 기준으로 실제 공시가 끝난 가장 최근 분기를 (연도, 분기)로 반환"""
+    asof = asof or datetime.now()
+    y, q_idx = asof.year, 3
+    for _ in range(12):
+        qtr = ['1Q', '2Q', '3Q', '4Q'][q_idx]
+        if is_period_filed(y, qtr, asof):
+            return y, qtr
+        q_idx -= 1
+        if q_idx < 0:
+            y -= 1
+            q_idx = 3
+    return asof.year - 1, '4Q'
+
 def get_ltm_required_periods(year: int, qtr: str):
     if qtr == '4Q':
         return [(year, '4Q', 'annual')]
@@ -264,8 +287,8 @@ def get_outstanding_shares(api_key, corp_code: str, ticker: str, bsns_year: int,
         return shares, f"DART({reprt_code})", meta
 
     # 2. 직전 보고서들에서 주식수 조회 시도 (요청 분기에 주식수 누락 시)
-    # 순서: 11011 (1Q), 11012 (2Q), 11014 (3Q), 11013 (4Q)
-    order = ['11011', '11012', '11014', '11013']
+    # 시간순: 11013 (1Q), 11012 (반기), 11014 (3Q), 11011 (사업보고서)
+    order = ['11013', '11012', '11014', '11011']
     try:
         current_idx = order.index(reprt_code)
     except Exception:
@@ -433,11 +456,9 @@ def _safe_dart_call(fn, *args, max_retry=2, **kwargs):
             time.sleep(0.4)
     return None, last_err
 
-def safe_finstate(dart_instance, corp_code, year, reprt_code, fs_div=None, max_retry=2):
-    kwargs = {'reprt_code': reprt_code}
-    if fs_div is not None:
-        kwargs['fs_div'] = fs_div
-    return _safe_dart_call(dart_instance.finstate, corp_code, year, max_retry=max_retry, **kwargs)
+def safe_finstate(dart_instance, corp_code, year, reprt_code, max_retry=2):
+    # OpenDartReader.finstate 는 fs_div 인자를 받지 않는다 (finstate_all 에만 존재)
+    return _safe_dart_call(dart_instance.finstate, corp_code, year, max_retry=max_retry, reprt_code=reprt_code)
 
 def safe_finstate_all(dart_instance, corp_code, year, reprt_code, fs_div=None, max_retry=2):
     kwargs = {'reprt_code': reprt_code}
@@ -446,13 +467,9 @@ def safe_finstate_all(dart_instance, corp_code, year, reprt_code, fs_div=None, m
     return _safe_dart_call(dart_instance.finstate_all, corp_code, year, max_retry=max_retry, **kwargs)
 
 def fetch_pl_df(dart_instance, corp_code, year, reprt_code):
-    for fs in ['CFS', 'OFS']:
-        df, err = safe_finstate(dart_instance, corp_code, year, reprt_code, fs_div=fs)
-        if df is not None and not df.empty: return df, f'finstate|{fs}', None
-    
-    df, err = safe_finstate(dart_instance, corp_code, year, reprt_code, fs_div=None)
-    if df is not None and not df.empty: return df, 'finstate|no_fs_div', None
-    
+    df, err = safe_finstate(dart_instance, corp_code, year, reprt_code)
+    if df is not None and not df.empty: return df, 'finstate', None
+
     for fs in ['CFS', 'OFS']:
         df, err = safe_finstate_all(dart_instance, corp_code, year, reprt_code, fs_div=fs)
         if df is not None and not df.empty: return df, f'finstate_all|{fs}', None
@@ -2043,25 +2060,28 @@ with st.sidebar:
     # 모드별 입력 파라미터 분기
     if ui_mode == "GPCM Valuation (기존)":
         # 다기간 GPCM 파라미터
-        current_year = datetime.now().year
-        
+        # 기본값은 '아직 공시되지 않은 미래 분기'가 잡히지 않도록 실제 공시 완료된 최신 분기로 설정
+        latest_year, latest_qtr = get_latest_filed_period()
+
         st.write("**GPCM 분석 대상 기간**")
+        st.caption(f"📅 현재 조회 가능한 최신 공시: **{latest_year}년 {latest_qtr}**")
         g_cycle = st.radio("분석 주기", ["분기별 (Quarterly)", "연간별 (Annual)"], index=0, horizontal=True, help="연간별 선택 시 각 연도의 4Q(사업보고서) 데이터만 추출하여 트렌드를 구성합니다.")
-        
+
         col1, col2 = st.columns(2)
         with col1:
             st.write("**시작 기간**")
-            g_start_year = st.number_input("시작 연도", min_value=2015, max_value=2030, value=current_year - 1, step=1, key="gsy")
+            g_start_year = st.number_input("시작 연도", min_value=2015, max_value=2030, value=latest_year - 1, step=1, key="gsy")
             g_start_qtr = "1Q"
             if g_cycle == "분기별 (Quarterly)":
                 g_start_qtr = st.selectbox("시작 분기", ["1Q", "2Q", "3Q", "4Q"], index=0, key="gsq")
         with col2:
             st.write("**종료 기간 (기본 Base Date)**")
-            g_end_year = st.number_input("종료 연도", min_value=2015, max_value=2030, value=current_year, step=1, key="gey")
+            g_end_year = st.number_input("종료 연도", min_value=2015, max_value=2030, value=latest_year, step=1, key="gey")
             g_end_qtr = "4Q"
             if g_cycle == "분기별 (Quarterly)":
-                g_end_qtr = st.selectbox("종료 분기", ["1Q", "2Q", "3Q", "4Q"], index=2, key="geq")
-            
+                g_end_qtr = st.selectbox("종료 분기", ["1Q", "2Q", "3Q", "4Q"],
+                                         index=["1Q", "2Q", "3Q", "4Q"].index(latest_qtr), key="geq")
+
         target_periods = []
         qtrs = ["1Q", "2Q", "3Q", "4Q"]
         for y in range(g_start_year, g_end_year + 1):
@@ -2082,9 +2102,17 @@ with st.sidebar:
         base_period_str = target_periods[-1]
         base_year, base_qtr = parse_period(base_period_str)
         base_date_display = get_base_date_str(base_year, base_qtr)
-        
+
+        unfiled = [p for p in target_periods if not is_period_filed(*parse_period(p))]
+        if unfiled:
+            st.warning(
+                f"⚠️ 아직 공시되지 않은 기간이 포함되어 있습니다: {', '.join(unfiled)}\n\n"
+                f"해당 기간은 재무·주가 데이터가 비어 있어 결과가 0으로 나옵니다. "
+                f"종료 기간을 **{latest_year}년 {latest_qtr}** 이하로 맞춰주세요."
+            )
+
         st.info(f"Target WACC 기준일 (최신기간 적용): {base_date_display} (말일)")
-        
+
         st.subheader("Target Companies")
         tickers_input = st.text_area("대상회사의 종목코드를 한줄씩 입력하세요", value="000250\n039030\n005290", height=150)
 
@@ -2197,7 +2225,7 @@ if ui_mode == "GPCM Valuation (기존)":
         f'• Base Date: {base_period_str} ({base_date_display}) | Unit: 억원 (KRW 100M)',
         '• 공통: 연결재무제표 작성 시 CFS 우선, 미존재 시 OFS 기준으로 수집',
         '• PL: 요약 손익계산서에서 매출액/영업이익/당기순이익 3개 계정만 엄격 추출',
-        '• PL Fetch: finstate(CFS/OFS) → finstate(no fs_div) → finstate_all fallback',
+        '• PL Fetch: finstate(요약) → finstate_all(CFS/OFS) fallback',
         '• Shares: DART(stockTotqySttus) 유통주식수(distb_stock_co) 우선, 미공시 시 DART 과거보고서 fallback',
         '• EV = Market Cap + IBD − Cash + NCI − NOA',
         '• Net Debt = IBD − Cash − NOA',
@@ -2225,6 +2253,20 @@ else:
     st.markdown("---")
 
 # ▼▼▼▼▼ [추가 1] DART 접속 객체를 캐싱하는 함수 (if run_btn 바로 위에 넣으세요) ▼▼▼▼▼
+def check_dart_reachable(timeout=10):
+    """OpenDartReader 는 timeout 을 지정하지 않아 접속 불가 시 수 분간 멈춘다.
+    실제 조회 전에 짧은 timeout 으로 도달 가능 여부만 먼저 확인한다."""
+    try:
+        requests.get('https://opendart.fss.or.kr/api/corpCode.xml',
+                     params={'crtfc_key': 'preflight'}, timeout=timeout)
+        return True, None
+    except requests.exceptions.Timeout:
+        return False, 'timeout'
+    except requests.exceptions.ConnectionError:
+        return False, 'unreachable'
+    except Exception as e:
+        return False, str(e)
+
 @st.cache_resource
 def get_dart_reader(api_key):
     return OpenDartReader(api_key)
@@ -2247,10 +2289,22 @@ if run_btn:
                 status_container = st.status("GPCM 데이터 분석 중...", expanded=True)
                 progress_bar = st.progress(0)
 
+                ok, reason = check_dart_reachable()
+                if not ok:
+                    st.error(
+                        "**DART 서버에 접속할 수 없습니다.**\n\n"
+                        "API 키 문제가 아니라 네트워크에서 차단된 상태입니다 "
+                        "(DART 는 해외 클라우드 IP 접속을 제한합니다).\n\n"
+                        "- Streamlit Cloud 등 해외 서버에서 실행 중이라면 **국내 환경(개인 PC 또는 국내 리전)** 에서 실행해주세요.\n"
+                        "- 사내망이라면 방화벽에서 `opendart.fss.or.kr` 을 허용해야 합니다.\n\n"
+                        f"(원인: {reason})"
+                    )
+                    st.stop()
+
                 try:
                     dart = get_dart_reader(api_key_input)
                 except Exception as e:
-                    st.error(f"DART 서버 접속 실패: {e}")
+                    st.error(f"DART 인증 실패 또는 조회 오류: {e}\n\nAPI 키가 올바른지 확인해주세요.")
                     st.stop()
 
                 # 변수 초기화 및 데이터 수집
@@ -2259,6 +2313,23 @@ if run_btn:
 
                 # 1. 화면 출력용 DataFrame 구성
                 df_screen = pd.DataFrame(all_multiples)
+
+                # 1-0. 수집 실패 진단 (조용히 0으로 넘어가는 것을 방지)
+                problems = []
+                base_rows = [m for m in all_multiples if m['Period'] == base_period_str]
+                if not base_rows:
+                    problems.append(f"기준 기간({base_period_str}) 데이터를 한 건도 수집하지 못했습니다.")
+                for m in base_rows:
+                    empty_fields = [k for k in ('Market_Cap', 'Revenue', 'Equity') if not m.get(k)]
+                    if empty_fields:
+                        problems.append(f"[{m['Company']}] {base_period_str} — {', '.join(empty_fields)} 값이 없습니다.")
+                if problems:
+                    st.warning(
+                        "⚠️ **아래 항목을 수집하지 못했습니다. 배수·WACC 결과가 왜곡됩니다.**\n\n"
+                        + "\n".join(f"- {p}" for p in problems)
+                        + "\n\n대부분 아직 공시되지 않은 기간을 조회했을 때 발생합니다."
+                    )
+
                 if not df_screen.empty:
                     df_screen['EV'] = df_screen['Market_Cap'] + df_screen['IBD'] - df_screen['Cash'] + df_screen['NCI'] - df_screen['NOA']
                     df_screen['EV/EBIT'] = np.where(df_screen['EBIT'] > 0, df_screen['EV'] / df_screen['EBIT'], np.nan)
@@ -2280,6 +2351,14 @@ if run_btn:
                 target_wacc_data, avg_debt_ratio = calculate_wacc_and_beta(
                     target_code_list, screen_summary_data, target_tax_rate_input, rf_input, mrp_input, size_premium_input, kd_pretax_input, beta_type_input)
 
+                if target_wacc_data['Target_WACC'] <= rf_input:
+                    st.error(
+                        f"❌ **계산된 WACC({target_wacc_data['Target_WACC']*100:.2f}%)이 "
+                        f"무위험이자율({rf_input*100:.2f}%)보다 낮습니다.** 정상적인 결과가 아닙니다.\n\n"
+                        "시가총액이 0으로 수집되어 자본구조·베타가 붕괴한 경우입니다. "
+                        "위의 수집 실패 경고를 먼저 확인해주세요."
+                    )
+
                 # 2. 엑셀 생성 (메모리)
                 output = export_gpcm_excel(
                     base_period_str, base_qtr, target_code_list, screen_summary_data, raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name,
@@ -2299,10 +2378,22 @@ if run_btn:
                 status_container = st.status(f"다기간 재무제표 데이터 수집 중... (대상: {len(target_code_list)}개 기업 / 기간: {len(periods_to_fetch)}개)", expanded=True)
                 progress_bar = st.progress(0)
 
+                ok, reason = check_dart_reachable()
+                if not ok:
+                    st.error(
+                        "**DART 서버에 접속할 수 없습니다.**\n\n"
+                        "API 키 문제가 아니라 네트워크에서 차단된 상태입니다 "
+                        "(DART 는 해외 클라우드 IP 접속을 제한합니다).\n\n"
+                        "- Streamlit Cloud 등 해외 서버에서 실행 중이라면 **국내 환경(개인 PC 또는 국내 리전)** 에서 실행해주세요.\n"
+                        "- 사내망이라면 방화벽에서 `opendart.fss.or.kr` 을 허용해야 합니다.\n\n"
+                        f"(원인: {reason})"
+                    )
+                    st.stop()
+
                 try:
                     dart = get_dart_reader(api_key_input)
                 except Exception as e:
-                    st.error(f"DART 서버 접속 실패: {e}")
+                    st.error(f"DART 인증 실패 또는 조회 오류: {e}\n\nAPI 키가 올바른지 확인해주세요.")
                     st.stop()
                 
                 # 1. 데이터 수집
