@@ -369,6 +369,10 @@ def match_bs_ev_component(account_nm, account_id):
     # 계정명 표기가 회사마다 달라(비지배지분/비지배주주지분/소수주주지분) 표준계정코드를 우선 사용
     if aid == 'ifrs-full_NoncontrollingInterests':
         return 'NCI', '비지배지분'
+    # 우선주 자본금: 시가총액(보통주)에 잡히지 않으므로 자기자본가치에 별도 가산
+    # '자본금'을 요구해 부채로 분류된 상환우선주(상환전환우선주부채 등)의 중복계상을 방지
+    if '우선주' in acct_n and '자본금' in acct_n and '부채' not in acct_n:
+        return 'Preferred', acct
     if aid == 'dart_ElementsOfOtherStockholdersEquity':
         return None, None
 
@@ -947,6 +951,7 @@ def add_gpcm_section_row(ws):
         (6, 12, "BS & EV Components", pSEC3), (13,17, "PL(Annual & LTM)",   pSEC4),
         (18,20, "Market Data",        pSEC5), (21,25, "Valuation Multiples", pSEC6),
         (26,35, "Beta & Risk Analysis", PatternFill('solid', fgColor='6A1B9A')),
+        (36,36, "Equity Adj",           pSEC3),
     ]
     for c1, c2, label, fill in sections:
         ws.merge_cells(start_row=sec_row, start_column=c1, end_row=sec_row, end_column=c2)
@@ -990,7 +995,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
         # 임시 저장소 (화면 출력용) - 최신 기준일 데이터
         temp_metrics = {
             'Company': display_name, 'Ticker': ticker,
-            'Market_Cap': 0, 'Cash': 0, 'IBD': 0, 'NCI': 0, 'NOA': 0, 'Equity': 0,
+            'Market_Cap': 0, 'Cash': 0, 'IBD': 0, 'NCI': 0, 'NOA': 0, 'Equity': 0, 'Preferred': 0,
             'Revenue': 0, 'EBIT': 0, 'NI': 0, 'Pretax_Income': 0,
             'Stock_Monthly_Prices_5Y': None, 'Market_Monthly_Prices_5Y': None,
             'Stock_Weekly_Prices_2Y': None, 'Market_Weekly_Prices_2Y': None,
@@ -1002,7 +1007,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
             required_periods = get_ltm_required_periods(tyear, tqtr)
             
             period_metrics = {
-                'Market_Cap': 0, 'Cash': 0, 'IBD': 0, 'NCI': 0, 'NOA': 0, 'Equity': 0,
+                'Market_Cap': 0, 'Cash': 0, 'IBD': 0, 'NCI': 0, 'NOA': 0, 'Equity': 0, 'Preferred': 0,
                 'Revenue': 0, 'EBIT': 0, 'NI': 0, 'Pretax_Income': 0
             }
 
@@ -1064,6 +1069,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                                 elif ev_comp == 'IBD': period_metrics['IBD'] += val_100m
                                 elif ev_comp == 'NCI': period_metrics['NCI'] += val_100m
                                 elif ev_comp == 'NOA': period_metrics['NOA'] += val_100m
+                                elif ev_comp == 'Preferred': period_metrics['Preferred'] += val_100m
                                 elif ev_comp in ['Equity_Total', 'Equity_P']: period_metrics['Equity'] += val_100m
 
                             raw_bs_rows.append({
@@ -1220,17 +1226,18 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
         mkt_cap = comp_data.get('Market_Cap', 0)
         ibd = comp_data.get('IBD', 0)
         nci = comp_data.get('NCI', 0)
+        pref = comp_data.get('Preferred', 0)  # 우선주 자본금 (시가총액은 보통주만 반영)
         equity = comp_data.get('Equity', 0)
         pretax_income = comp_data.get('Pretax_Income', 0)
 
-        # Debt Ratio (D/V) = IBD / (Mkt Cap + IBD + NCI)
-        total_value = mkt_cap + ibd + nci
+        # Debt Ratio (D/V) = IBD / (Mkt Cap + 우선주 + IBD + NCI)
+        total_value = mkt_cap + pref + ibd + nci
         if total_value > 0:
             debt_ratio = ibd / total_value
             avg_debt_ratios.append(debt_ratio)
 
-        # D/E Ratio = IBD / (Mkt Cap + NCI)
-        equity_value = mkt_cap + nci
+        # D/E Ratio = IBD / (Mkt Cap + 우선주 + NCI)
+        equity_value = mkt_cap + pref + nci
         de_ratio = ibd / equity_value if equity_value > 0 else 0
 
         # 한계세율 계산 (2025년 한국 법인세, 지방세 포함)
@@ -1868,12 +1875,12 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
     # 시트 순서: GPCM, WACC_Calculation, Beta_Calculation, BS_Full, PL_Data, Market_Cap, LTM_Calc
     wb.move_sheet('WACC_Calculation', offset=-4)  # GPCM 다음 (index 1)
     wb.move_sheet('Beta_Calculation', offset=-3)  # WACC 다음 (index 2)
-    TOTAL_COLS = 35
+    TOTAL_COLS = 36
     ws.merge_cells(f'A1:{get_column_letter(TOTAL_COLS)}1'); ws['A1'] = "GPCM Valuation Summary with Beta Analysis"; sc(ws['A1'], fo=fT)
-    ws.merge_cells(f'A2:{get_column_letter(TOTAL_COLS)}2'); ws['A2'] = f"Base: {base_period_str} | Unit: 억원 | EV = MCap + IBD − Cash + NCI − NOA"; sc(ws['A2'], fo=fS)
+    ws.merge_cells(f'A2:{get_column_letter(TOTAL_COLS)}2'); ws['A2'] = f"Base: {base_period_str} | Unit: 억원 | EV = MCap + 우선주 + IBD − Cash + NCI − NOA"; sc(ws['A2'], fo=fS)
     add_gpcm_section_row(ws)
-    headers = ['Company','Ticker','Base Date','Curr','PL Source','Cash','IBD','NOA','Net Debt','NCI','Equity','EV','Revenue','EBIT','D&A','EBITDA','NI','Price','Shares','Mkt Cap','EV/EBITDA','EV/EBIT','PER','PBR','PSR','β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','D/E Ratio','Debt Ratio (D/V)','Unlevered β 5Y','Unlevered β 2Y']
-    widths = [18, 10, 11, 6, 13, 13, 13, 13, 13, 12, 13, 15, 13, 13, 10, 13, 13, 12, 15, 15, 12, 12, 10, 10, 10, 10, 10, 10, 10, 13, 9, 10, 10, 12, 12]
+    headers = ['Company','Ticker','Base Date','Curr','PL Source','Cash','IBD','NOA','Net Debt','NCI','Equity','EV','Revenue','EBIT','D&A','EBITDA','NI','Price','Shares','Mkt Cap','EV/EBITDA','EV/EBIT','PER','PBR','PSR','β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','D/E Ratio','Debt Ratio (D/V)','Unlevered β 5Y','Unlevered β 2Y','우선주(장부)']
+    widths = [18, 10, 11, 6, 13, 13, 13, 13, 13, 12, 13, 15, 13, 13, 10, 13, 13, 12, 15, 15, 12, 12, 10, 10, 10, 10, 10, 10, 10, 13, 9, 10, 10, 12, 12, 13]
     header_row = 5
     for i, (h, w) in enumerate(zip(headers, widths), 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -1889,7 +1896,7 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
         ws.cell(r,9).value = f'=G{r}-F{r}-H{r}'; sc(ws.cell(r,9), fo=fFRM, fi=bg, nf=NB, bd=BD)
         ws.cell(r,10).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "NCI")'; sc(ws.cell(r,10), fo=fLINK, fi=ev_fills['NCI'], nf=NB, bd=BD)
         ws.cell(r,11).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "Equity_Total")'; sc(ws.cell(r,11), fo=fLINK, fi=ev_fills['Equity'], nf=NB, bd=BD)
-        ws.cell(r,12).value = f'=T{r}+G{r}-F{r}+J{r}-H{r}'; sc(ws.cell(r,12), fo=fFRM, fi=bg, nf=NB, bd=BD)
+        ws.cell(r,12).value = f'=T{r}+AJ{r}+G{r}-F{r}+J{r}-H{r}'; sc(ws.cell(r,12), fo=fFRM, fi=bg, nf=NB, bd=BD)
         ws.cell(r,13).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "Revenue")'; sc(ws.cell(r,13), fo=fLINK, fi=ev_fills['PL_HL'], nf=NB, bd=BD)
         ws.cell(r,14).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "EBIT")'; sc(ws.cell(r,14), fo=fLINK, fi=ev_fills['PL_HL'], nf=NB, bd=BD)
         sc(ws.cell(r,15), fi=PatternFill('solid', fgColor='FFFF00'), nf=NB, bd=BD) # D&A 수기
@@ -1945,11 +1952,11 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
         ws.cell(r,31).value = f'=IF(AD{r}<=2, 0.099, IF(AD{r}<=200, 0.209, IF(AD{r}<=3000, 0.231, 0.264)))'
         sc(ws.cell(r,31), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
 
-        # 컬럼 32: D/E Ratio = IBD / (Mkt Cap + NCI)
-        ws.cell(r,32).value = f'=IF(T{r}+J{r}>0, G{r}/(T{r}+J{r}), 0)'; sc(ws.cell(r,32), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
+        # 컬럼 32: D/E Ratio = IBD / (Mkt Cap + 우선주 + NCI)
+        ws.cell(r,32).value = f'=IF(T{r}+AJ{r}+J{r}>0, G{r}/(T{r}+AJ{r}+J{r}), 0)'; sc(ws.cell(r,32), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
 
-        # 컬럼 33: Debt Ratio (D/V) = IBD / (Mkt Cap + IBD + NCI)
-        ws.cell(r,33).value = f'=IF(T{r}+G{r}+J{r}>0, G{r}/(T{r}+G{r}+J{r}), 0)'; sc(ws.cell(r,33), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
+        # 컬럼 33: Debt Ratio (D/V) = IBD / (Mkt Cap + 우선주 + IBD + NCI)
+        ws.cell(r,33).value = f'=IF(T{r}+AJ{r}+G{r}+J{r}>0, G{r}/(T{r}+AJ{r}+G{r}+J{r}), 0)'; sc(ws.cell(r,33), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
 
         # 컬럼 34: Unlevered Beta 5Y = β 5Y Adj / (1 + (1 - Tax Rate) × D/E Ratio)
         # 컬럼 27 (AA) = β 5Y Adj, 컬럼 31 (AE) = Tax Rate, 컬럼 32 (AF) = D/E Ratio
@@ -1958,6 +1965,10 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
         # 컬럼 35: Unlevered Beta 2Y = β 2Y Adj / (1 + (1 - Tax Rate) × D/E Ratio)
         # 컬럼 29 (AC) = β 2Y Adj, 컬럼 31 (AE) = Tax Rate, 컬럼 32 (AF) = D/E Ratio
         ws.cell(r,35).value = f'=IF(AC{r}>0, AC{r}/(1+(1-AE{r})*AF{r}), "")'; sc(ws.cell(r,35), fo=fFRM, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
+
+        # 컬럼 36: 우선주 자본금 (시가총액은 보통주만 반영하므로 자기자본가치에 별도 가산)
+        ws.cell(r,36).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "Preferred")'
+        sc(ws.cell(r,36), fo=fLINK, fi=ev_fills['Equity'], nf=NB, bd=BD)
         r += 1
     r_end = r - 1; r += 1
     for stat, fn in [('Mean','AVERAGE'), ('Median','MEDIAN'), ('Max','MAX'), ('Min','MIN')]:
@@ -2230,15 +2241,16 @@ if ui_mode == "GPCM Valuation (기존)":
         '• PL: 요약 손익계산서에서 매출액/영업이익/당기순이익 3개 계정만 엄격 추출',
         '• PL Fetch: finstate(요약) → finstate_all(CFS/OFS) fallback',
         '• Shares: DART(stockTotqySttus) 유통주식수(distb_stock_co) 우선, 미공시 시 DART 과거보고서 fallback',
-        '• EV = Market Cap + IBD − Cash + NCI − NOA',
+        '• EV = Market Cap + 우선주(장부) + IBD − Cash + NCI − NOA',
         '• Net Debt = IBD − Cash − NOA',
         '• IBD(Option): CB/EB/BW 등 메자닌은 기본적으로 IBD(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
         '• NOA(Option): 투자자산/관계기업 등은 기본적으로 NOA(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
         '• LTM = Current Cumulative + Prior Annual − Prior Same Quarter Cumulative (단, 4Q는 Annual)',
         '• Beta: 5년 월간 & 2년 주간 수익률 기준 (FinanceDataReader 사용)',
         '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1',
-        '• D/E Ratio = IBD / (Market Cap + NCI)',
-        '• Debt Ratio (D/V) = IBD / (Market Cap + IBD + NCI)',
+        '• D/E Ratio = IBD / (Market Cap + 우선주 + NCI)',
+        '• Debt Ratio (D/V) = IBD / (Market Cap + 우선주 + IBD + NCI)',
+        '• 우선주: BS의 우선주자본금(액면) 기준. 시가총액은 보통주만 반영하므로 자기자본가치에 가산',
         '• Unlevered Beta = Levered Beta / (1 + (1 - Tax Rate) × D/E Ratio)',
         '• Tax Rate: 한국 법인세 한계세율 (지방세 포함, 세전순이익 기준)',
     ]
@@ -2334,7 +2346,7 @@ if run_btn:
                     )
 
                 if not df_screen.empty:
-                    df_screen['EV'] = df_screen['Market_Cap'] + df_screen['IBD'] - df_screen['Cash'] + df_screen['NCI'] - df_screen['NOA']
+                    df_screen['EV'] = df_screen['Market_Cap'] + df_screen['Preferred'] + df_screen['IBD'] - df_screen['Cash'] + df_screen['NCI'] - df_screen['NOA']
                     df_screen['EV/EBIT'] = np.where(df_screen['EBIT'] > 0, df_screen['EV'] / df_screen['EBIT'], np.nan)
                     df_screen['PER'] = np.where(df_screen['NI'] > 0, df_screen['Market_Cap'] / df_screen['NI'], np.nan)
                     df_screen['PSR'] = np.where(df_screen['Revenue'] > 0, df_screen['Market_Cap'] / df_screen['Revenue'], np.nan)
