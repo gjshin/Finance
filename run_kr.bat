@@ -45,9 +45,13 @@ if errorlevel 1 goto VENV_FAIL
 :HAVE_VENV
 echo  [2/3] 필요한 프로그램을 확인/설치합니다...
 echo.
-".venv\Scripts\python.exe" -m pip install --upgrade pip --quiet
-".venv\Scripts\python.exe" -m pip install -r requirements.txt --quiet
+echo        * WARNING 으로 시작하는 문구가 보여도 정상입니다. 무시하세요.
+echo        * 처음에는 몇 분 걸립니다. 창을 닫지 말고 기다려주세요.
+echo.
+".venv\Scripts\python.exe" -m pip install --upgrade pip --quiet --disable-pip-version-check
+".venv\Scripts\python.exe" -m pip install -r requirements.txt --disable-pip-version-check
 if errorlevel 1 goto PIP_FAIL
+echo.
 echo        설치 완료
 echo.
 
