@@ -68,6 +68,50 @@ class FakeReader:
     def document(self, rcp_no, cache=True):
         return self.doc or ''
 
+    # --- 확장 기능 대역 ---
+    corp_codes = pd.DataFrame({
+        'corp_code': ['00126380', '00999999'],
+        'corp_name': ['테스트전자', '테스트비상장'],
+        'stock_code': ['005930', '']})           # 두 번째는 비상장(종목코드 없음)
+
+    def company(self, corp):
+        return {'corp_name': '테스트전자', 'induty_code': '264',
+                'est_dt': '19690113', 'ceo_nm': '홍길동',
+                'status': '000', 'message': '정상'}
+
+    def finstate(self, corp, bsns_year, reprt_code='11011'):
+        self.calls += 1
+        return pd.DataFrame([{'sj_nm': '재무상태표', 'account_nm': '자산총계',
+                              'thstrm_amount': '2,000', 'frmtrm_amount': '1,600'}])
+
+    def event(self, corp, key_word, start=None, end=None):
+        return pd.DataFrame([{'corp_code': 'x', 'rcept_no': '20240501000123',
+                              'report_nm': f'{key_word} 관련 주요사항보고서'}])
+
+    def regstate(self, corp, key_word, start=None, end=None):
+        return pd.DataFrame([{'corp_code': 'x', 'rcept_no': '20240601000456',
+                              'report_nm': f'{key_word} 증권신고서'}])
+
+    def major_shareholders(self, corp):
+        return pd.DataFrame([{'corp_code': 'x', 'repror': '홍길동', 'stkrt': '15.2'}])
+
+    def major_shareholders_exec(self, corp):
+        return pd.DataFrame([{'corp_code': 'x', 'repror': '임원A', 'sp_stock_lmp_cnt': '1000'}])
+
+    def list_date_ex(self, date=None, cache=True):
+        return pd.DataFrame([
+            {'rcept_no': '1', 'corp_name': 'A사', 'report_nm': '감사보고서(2023.12)'},
+            {'rcept_no': '2', 'corp_name': 'B사', 'report_nm': '분기보고서(2024.03)'}])
+
+    def sub_docs(self, s, match=None):
+        return pd.DataFrame([{'title': '감사보고서', 'url': 'http://x'}])
+
+    def attach_files(self, s):
+        return pd.DataFrame([{'name': '재무제표.xlsx', 'url': 'http://y'}])
+
+    def xbrl_taxonomy(self, sj_div):
+        return pd.DataFrame([{'account_id': 'ifrs-full_Assets', 'account_nm': '자산총계'}])
+
 
 def client(**kw):
     return T.DartClient(api_key=None, reader=FakeReader(**kw))
@@ -199,7 +243,8 @@ ok = T.get_report_item(
     ['테스트'], '타법인출자', [LAST_Y])
 rows = ok['results'][0]['rows']
 check_true('타법인출자 조회', len(rows) == 1 and rows[0]['inv_prm'] == '자회사A')
-check_true('내부 식별자는 제거', 'corp_code' not in rows[0] and 'rcept_no' not in rows[0])
+check_true('회사 내부코드는 제거, 접수번호는 보존(근거 추적용)',
+           'corp_code' not in rows[0] and 'rcept_no' in rows[0])
 
 print("\n=== 10. 공시 원문 섹션 추출 ===")
 doc = ("<html><p>I. 회사의 개요</p>본문 개요입니다."
@@ -216,7 +261,68 @@ check_true('감사보고서 주석 추출', '손실충당금' in note['content']
 miss = T.get_filing_document(client(doc=doc), '20240312000736', section='없는절')
 check_true('없는 절은 안내 메시지', 'error' in miss)
 
-print("\n=== 11. MCP 서버 계층 (Claude가 실제로 부르는 경로) ===")
+print("\n=== 11. 확장 기능 (OpenDartReader 전 기능) ===")
+
+# 기업개황
+prof = T.get_company_profile(client(), ['테스트'])['results'][0]['profile']
+check_true('기업개황 조회', prof.get('induty_code') == '264' and prof.get('ceo_nm') == '홍길동')
+check_true('응답코드는 제거', 'status' not in prof and 'message' not in prof)
+
+# 주요사항보고서 36종
+ev = T.get_major_events(client(), ['테스트'], '소송')
+check_true('주요사항보고서 조회', ev['results'][0]['rows'][0]['report_nm'].startswith('소송'))
+check_true('접수번호 보존', 'rcept_no' in ev['results'][0]['rows'][0])
+bad_ev = T.get_major_events(client(), ['테스트'], '없는사건')
+check_true('잘못된 사건 → 36종 목록 안내',
+           'available' in bad_ev and len(bad_ev['available']) == 36,
+           f"({len(bad_ev.get('available', []))}종)")
+
+# 증권신고서
+rs = T.get_registration_statements(client(), ['테스트'], '합병')
+check_true('증권신고서 조회', '합병' in rs['results'][0]['rows'][0]['report_nm'])
+check_true('잘못된 종류 → 6종 목록 안내',
+           len(T.get_registration_statements(client(), ['t'], 'xx')['available']) == 6)
+
+# 지분공시 2종
+sh = T.get_shareholding_reports(client(), ['테스트'], '대량보유')
+check_true('대량보유(5%) 조회', sh['results'][0]['rows'][0]['stkrt'] == '15.2')
+ex = T.get_shareholding_reports(client(), ['테스트'], '임원주요주주')
+check_true('임원·주요주주 조회', ex['results'][0]['rows'][0]['repror'] == '임원A')
+check_true('잘못된 종류 안내', 'available' in T.get_shareholding_reports(client(), ['t'], 'xx'))
+
+# 날짜별 전체 공시 + 키워드
+day = T.list_filings_by_date(client(), '2024-03-12')
+check_true('날짜별 공시 조회', day['total'] == 2)
+day_f = T.list_filings_by_date(client(), '2024-03-12', keyword='감사보고서')
+check_true('보고서명 키워드 필터', day_f['total'] == 1
+           and '감사보고서' in day_f['filings'][0]['report_nm'])
+
+# 첨부문서
+att = T.get_filing_attachments(client(), '20240312000736')
+check_true('하위문서 목록', att['sub_documents'][0]['title'] == '감사보고서')
+check_true('첨부파일 목록', att['attached_files'][0]['name'] == '재무제표.xlsx')
+
+# XBRL 표준계정
+tax = T.get_xbrl_taxonomy(client(), 'BS1')
+check_true('XBRL 표준계정 조회', tax['accounts'][0]['account_id'] == 'ifrs-full_Assets')
+
+# 요약 재무제표
+summ = T.get_financial_statements(client(), ['테스트'], LAST_Y, summary=True)
+check_true('요약 재무제표(주요계정)', summ['summary'] is True
+           and summ['results'][0]['rows'][0]['amount'] == 2000.0)
+
+# 비상장사 검색 — KRX 목록에 없어도 DART 전체 목록에서 찾아야 한다
+import types as _types
+_c = client()
+_c._listing = pd.DataFrame({'Code': ['005930'], 'Name': ['테스트전자'],
+                            'Market': ['KOSPI'], 'Sector': ['전자부품']})
+found = T.find_companies(_c, query='테스트')
+names = {c['name']: c['listed'] for c in found['companies']}
+check_true('상장사 검색', names.get('테스트전자') is True, f"→ {list(names)}")
+check_true('비상장사도 함께 검색', names.get('테스트비상장') is False)
+
+
+print("\n=== 12. MCP 서버 계층 (Claude가 실제로 부르는 경로) ===")
 import asyncio
 import json
 import os
@@ -235,7 +341,7 @@ except RuntimeError as e:
 
 # 도구가 6개 다 등록됐는지
 tools = asyncio.run(M.server.list_tools())
-check_true('도구 6종 등록', len(tools) == 6, f"({', '.join(t.name for t in tools)})")
+check_true('도구 13종 등록', len(tools) == 13, f"({len(tools)}개)")
 
 M._client = T.DartClient(api_key=None, reader=FakeReader())
 

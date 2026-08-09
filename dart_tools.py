@@ -30,6 +30,33 @@ REPORT_ITEMS = [
 ]
 
 
+# event() 로 조회 가능한 주요사항보고서 항목
+EVENT_KEYWORDS = [
+    '부도발생', '영업정지', '회생절차', '해산사유', '관리절차개시', '관리절차중단',
+    '유상증자', '무상증자', '유무상증자', '감자',
+    '전환사채발행', '신주인수권부사채발행', '교환사채발행', '조건부자본증권발행',
+    '사채권양수', '사채권양도결정',
+    '자기주식취득', '자기주식처분', '자기주식취득신탁계약체결', '자기주식취득신탁계약해지',
+    '회사합병', '회사분할', '회사분할합병', '주식교환',
+    '영업양수', '영업양도', '자산양수도', '유형자산양수', '유형자산양도',
+    '타법인증권양수', '타법인증권양도',
+    '소송',
+    '해외상장결정', '해외상장폐지결정', '해외상장', '해외상장폐지',
+]
+
+# regstate() 로 조회 가능한 증권신고서 항목
+REGSTATE_KEYWORDS = ['지분증권', '채무증권', '증권예탁증권', '합병', '분할', '주식의포괄적교환이전']
+
+
+def _rows(df, limit, drop=('corp_code',)):
+    """DataFrame → 레코드 목록. 내부 식별자만 걷어내고 접수번호는 남긴다
+    (접수번호가 있어야 원문을 열어 근거를 확인할 수 있다)."""
+    if df is None or not hasattr(df, 'empty') or df.empty:
+        return [], 0
+    recs = df.head(limit).to_dict('records')
+    return [{k: v for k, v in r.items() if k not in drop} for r in recs], int(len(df))
+
+
 def _parse_amount(x):
     """DART 금액 문자열 → float. 빈 값/0은 None(미확인)으로 돌려준다.
 
@@ -177,6 +204,28 @@ def _listing_col(df, *candidates):
     return None
 
 
+def _search_unlisted(client, query, limit, already):
+    """DART 전체 회사목록에서 이름으로 검색 (비상장 포함)."""
+    try:
+        codes = client.dart.corp_codes
+        hit = codes[codes['corp_name'].astype(str).str.contains(str(query), na=False)]
+    except Exception:
+        return []
+    out = []
+    for _, r in hit.head(limit * 3).iterrows():
+        name = str(r.get('corp_name', ''))
+        if name in already:
+            continue
+        stock = str(r.get('stock_code', '') or '').strip()
+        if stock:      # 상장사는 위에서 이미 처리했다
+            continue
+        out.append({'ticker': None, 'name': name, 'market': None,
+                    'sector': None, 'listed': False,
+                    'corp_code': str(r.get('corp_code', ''))})
+        if len(out) >= limit:
+            break
+    return out
+
 def find_companies(client, query=None, sector=None, market=None, limit=30):
     """이름·종목코드·업종으로 회사를 찾는다. 다른 모든 도구의 출발점.
 
@@ -218,7 +267,14 @@ def find_companies(client, query=None, sector=None, market=None, limit=30):
             'name': str(r[col_name]) if col_name else None,
             'market': str(r[col_mkt]) if col_mkt else None,
             'sector': str(r[col_sec]) if col_sec else None,
+            'listed': True,
         })
+
+    # KRX 목록은 상장사만 담고 있다. 딜 업무에서는 비상장 타겟도 찾아야 하므로
+    # 이름으로 찾는 경우엔 DART 전체 회사목록(비상장 포함)까지 뒤진다.
+    if query and not sector and len(companies) < limit:
+        companies.extend(_search_unlisted(client, query, limit - len(companies),
+                                          {c['name'] for c in companies}))
 
     note = None
     if sector and not col_sec:
@@ -257,12 +313,16 @@ def _fetch_statements(client, company, year, quarter, fs_div='CFS'):
 
 
 def get_financial_statements(client, companies, year, quarter='4Q', fs_div='CFS',
-                             statement=None, account_filter=None, max_rows=200):
+                             statement=None, account_filter=None, max_rows=200,
+                             summary=False):
     """여러 회사의 전체 계정 재무제표.
 
     statement      : 'BS'(재무상태표) | 'IS'(손익계산서) | 'CF'(현금흐름표) — 생략하면 전부
     account_filter : 계정명 키워드로 걸러내기 (예: '매출채권')
     """
+    if summary:
+        return _summary_statements(client, companies, year, quarter, max_rows)
+
     results = []
     for comp in companies:
         df, err = _fetch_statements(client, comp, year, quarter, fs_div)
@@ -428,10 +488,9 @@ def get_report_item(client, companies, item, years, quarter='4Q', max_rows=100):
                                 'note': '해당 연도에 공시된 내용이 없습니다.'})
                 continue
 
-            recs = df.head(max_rows).to_dict('records')
-            recs = [{k: v for k, v in r.items() if k not in ('rcept_no', 'corp_code')} for r in recs]
+            recs, total = _rows(df, max_rows)
             results.append({'company': comp, 'year': year, 'rows': recs,
-                            'total_rows': int(len(df)), 'truncated': int(len(df)) > max_rows})
+                            'total_rows': total, 'truncated': total > max_rows})
     return {'item': item, 'results': results}
 
 
@@ -536,3 +595,181 @@ def get_filing_document(client, rcept_no, section=None, max_chars=12000):
         'content': chunk[:max_chars],
         'truncated': len(chunk) > max_chars,
     }
+
+
+# ---------------------------------------------------------------- 도구 7~13
+
+def get_company_profile(client, companies):
+    """기업개황 — 업종코드, 설립일, 대표자, 결산월, 주소, 홈페이지."""
+    out = []
+    for comp in companies:
+        corp = client.corp_code(comp)
+        if not corp:
+            out.append({'company': comp, 'error': f"'{comp}'의 DART 고유번호를 찾지 못했습니다."})
+            continue
+        info = client.cached(('company', corp), lambda: client._call(client.dart.company, corp))
+        if not info:
+            out.append({'company': comp, 'error': '기업개황을 가져오지 못했습니다.'})
+            continue
+        d = dict(info) if isinstance(info, dict) else info
+        d.pop('status', None)
+        d.pop('message', None)
+        out.append({'company': comp, 'profile': d})
+    return {'results': out}
+
+
+def get_major_events(client, companies, keyword, start=None, end=None, limit=50):
+    """주요사항보고서 — 부도·회생절차·소송·합병·분할·영업양수도·전환사채발행 등 36종.
+
+    수시공시라 정기보고서에는 없는 사건들이다. 딜 실사와 감사 위험평가에서 쓴다.
+    """
+    if keyword not in EVENT_KEYWORDS:
+        return {'error': f"'{keyword}'은(는) 지원하지 않습니다.", 'available': EVENT_KEYWORDS}
+
+    out = []
+    for comp in companies:
+        corp = client.corp_code(comp)
+        if not corp:
+            out.append({'company': comp, 'error': f"'{comp}'의 DART 고유번호를 찾지 못했습니다."})
+            continue
+        df, err = client._call(client.dart.event, corp, keyword, start, end)
+        if err is not None:
+            out.append({'company': comp, 'error': f'조회에 실패했습니다: {err}'})
+            continue
+        rows, total = _rows(df, limit)
+        out.append({'company': comp, 'rows': rows, 'total': total,
+                    'truncated': total > limit,
+                    'note': None if rows else '해당 기간에 공시된 내용이 없습니다.'})
+    return {'event': keyword, 'results': out}
+
+
+def get_registration_statements(client, companies, keyword, start=None, end=None, limit=50):
+    """증권신고서 — 지분증권·채무증권·증권예탁증권·합병·분할·주식의포괄적교환이전.
+
+    합병·분할 신고서에는 평가방법과 합병비율 산정근거가 들어 있다.
+    """
+    if keyword not in REGSTATE_KEYWORDS:
+        return {'error': f"'{keyword}'은(는) 지원하지 않습니다.", 'available': REGSTATE_KEYWORDS}
+
+    out = []
+    for comp in companies:
+        corp = client.corp_code(comp)
+        if not corp:
+            out.append({'company': comp, 'error': f"'{comp}'의 DART 고유번호를 찾지 못했습니다."})
+            continue
+        df, err = client._call(client.dart.regstate, corp, keyword, start, end)
+        if err is not None:
+            out.append({'company': comp, 'error': f'조회에 실패했습니다: {err}'})
+            continue
+        rows, total = _rows(df, limit)
+        out.append({'company': comp, 'rows': rows, 'total': total,
+                    'truncated': total > limit,
+                    'note': None if rows else '해당 기간에 공시된 내용이 없습니다.'})
+    return {'statement': keyword, 'results': out}
+
+
+def get_shareholding_reports(client, companies, kind='대량보유', limit=100):
+    """지분공시.
+
+    kind='대량보유' : 5% 이상 대량보유상황보고 (주식등의 대량보유상황보고서)
+    kind='임원주요주주' : 임원·주요주주 특정증권등 소유상황보고
+    """
+    fn_map = {'대량보유': client.dart.major_shareholders,
+              '임원주요주주': client.dart.major_shareholders_exec}
+    if kind not in fn_map:
+        return {'error': f"'{kind}'은(는) 지원하지 않습니다.", 'available': list(fn_map)}
+
+    out = []
+    for comp in companies:
+        corp = client.corp_code(comp)
+        if not corp:
+            out.append({'company': comp, 'error': f"'{comp}'의 DART 고유번호를 찾지 못했습니다."})
+            continue
+        df, err = client._call(fn_map[kind], corp)
+        if err is not None:
+            out.append({'company': comp, 'error': f'조회에 실패했습니다: {err}'})
+            continue
+        rows, total = _rows(df, limit)
+        out.append({'company': comp, 'rows': rows, 'total': total, 'truncated': total > limit,
+                    'note': None if rows else '공시된 내용이 없습니다.'})
+    return {'kind': kind, 'results': out}
+
+
+def list_filings_by_date(client, date=None, limit=100, keyword=None):
+    """특정 날짜에 접수된 공시 전체. 날짜를 비우면 오늘.
+
+    '어제 감사보고서 낸 회사들' 같은 전수 조회에 쓴다.
+    """
+    df, err = client._call(client.dart.list_date_ex, date)
+    if err is not None:
+        return {'error': f'조회에 실패했습니다: {err}'}
+    if df is None or not hasattr(df, 'empty') or df.empty:
+        return {'filings': [], 'note': '해당 날짜에 접수된 공시가 없습니다.'}
+    if keyword:
+        col = 'report_nm' if 'report_nm' in df.columns else df.columns[0]
+        df = df[df[col].astype(str).str.contains(keyword, na=False)]
+    rows, total = _rows(df, limit)
+    return {'date': date or '오늘', 'filings': rows, 'total': total, 'truncated': total > limit}
+
+
+def get_filing_attachments(client, rcept_no, match=None):
+    """공시에 딸린 하위문서와 첨부파일 목록.
+
+    사업보고서 안의 감사보고서, 감사보고서에 붙은 재무제표처럼
+    본문과 별개로 붙어 있는 문서를 찾을 때 쓴다.
+    """
+    subs, err1 = client._call(client.dart.sub_docs, str(rcept_no), match=match)
+    files, err2 = client._call(client.dart.attach_files, str(rcept_no))
+
+    def to_list(df):
+        if df is None or not hasattr(df, 'empty') or df.empty:
+            return []
+        return df.head(50).to_dict('records')
+
+    result = {'rcept_no': str(rcept_no),
+              'sub_documents': to_list(subs),
+              'attached_files': to_list(files)}
+    if err1 is not None and err2 is not None:
+        return {'error': f'첨부문서를 가져오지 못했습니다: {err1}'}
+    if not result['sub_documents'] and not result['attached_files']:
+        result['note'] = '하위문서나 첨부파일이 없습니다.'
+    return result
+
+
+def get_xbrl_taxonomy(client, sj_div):
+    """XBRL 표준계정 체계. 계정과목 표준명을 확인할 때 쓴다.
+
+    sj_div 예: 'BS1'(재무상태표) 'IS1'(손익계산서) 'CIS1'(포괄손익) 'CF1'(현금흐름표)
+    """
+    df, err = client._call(client.dart.xbrl_taxonomy, sj_div)
+    if err is not None:
+        return {'error': f'조회에 실패했습니다: {err}'}
+    rows, total = _rows(df, 300)
+    return {'sj_div': sj_div, 'accounts': rows, 'total': total}
+
+
+def _summary_statements(client, companies, year, quarter, max_rows):
+    """요약 재무제표(주요계정). 전체 계정보다 훨씬 가벼워 여러 회사 비교에 적합하다."""
+    if not is_period_filed(year, quarter):
+        ly, lq = latest_filed_period()
+        return {'error': f'{year}년 {quarter}는 아직 공시 전입니다. '
+                         f'조회 가능한 최근 기간은 {ly}년 {lq}입니다.'}
+
+    results = []
+    for comp in companies:
+        corp = client.corp_code(comp)
+        if not corp:
+            results.append({'company': comp, 'error': f"'{comp}'의 DART 고유번호를 찾지 못했습니다."})
+            continue
+        rcode = RCODE_MAP[quarter]
+        df = client.cached(('finstate', corp, year, rcode),
+                           lambda: client._call(client.dart.finstate, corp, year, rcode))
+        rows, total = _rows(df, max_rows)
+        clean = [{'statement': r.get('sj_nm'), 'account': r.get('account_nm'),
+                  'amount': _parse_amount(r.get('thstrm_amount', '')),
+                  'amount_prior': _parse_amount(r.get('frmtrm_amount', ''))}
+                 for r in rows]
+        results.append({'company': comp, 'year': year, 'quarter': quarter,
+                        'rows': clean, 'total_rows': total,
+                        'note': None if clean else '요약 재무제표를 찾지 못했습니다.'})
+    return {'unit': '원', 'summary': True, 'results': results}
