@@ -144,6 +144,7 @@ class DartClient:
     """OpenDartReader 래퍼. 재시도와 캐시를 담당한다."""
 
     def __init__(self, api_key, reader=None):
+        self.api_key = api_key          # OpenDartReader가 지원하지 않는 API 직접 호출용
         if reader is not None:
             self.dart = reader
         else:
@@ -773,3 +774,107 @@ def _summary_statements(client, companies, year, quarter, max_rows):
                         'rows': clean, 'total_rows': total,
                         'note': None if clean else '요약 재무제표를 찾지 못했습니다.'})
     return {'unit': '원', 'summary': True, 'results': results}
+
+
+# ---------------------------------------------------------------- 도구 14
+
+# OpenDartReader가 지원하지 않는 API는 직접 호출한다.
+# (gpcm_kr.py가 주식수 조회를 같은 방식으로 처리한다)
+DART_API_BASE = "https://opendart.fss.or.kr/api/"
+
+# 지표 분류 코드. 공식 문서 접근이 막혀 있어 두 개의 독립 구현체를 대조해 정했다.
+# 코드가 틀려도 결과는 어긋나지 않는다 — 분류명은 응답에 담겨 오는 idx_cl_nm을 그대로 쓴다.
+INDICATOR_CATEGORIES = {
+    '수익성': 'M210000',
+    '안정성': 'M220000',
+    '성장성': 'M230000',
+    '활동성': 'M240000',
+}
+
+
+def _dart_get(api_key, endpoint, params, timeout=10):
+    """OpenDART API 직접 호출."""
+    import requests
+    try:
+        p = dict(params)
+        p['crtfc_key'] = api_key
+        r = requests.get(DART_API_BASE + endpoint, params=p, timeout=timeout)
+        r.raise_for_status()
+        js = r.json()
+        status = js.get('status')
+        if status == '013':                       # 조회된 데이터 없음
+            return [], None
+        if status != '000':
+            return None, f"DART 응답 {status}: {js.get('message', '')}"
+        return js.get('list', []), None
+    except Exception as e:
+        return None, str(e)
+
+
+def get_financial_indicators(client, companies, years, quarter='4Q', categories=None):
+    """DART가 직접 산출한 주요 재무지표 (수익성·안정성·성장성·활동성).
+
+    compute_ratios가 재무제표에서 직접 계산하는 것과 달리, 이쪽은 DART 공식 산출값이다.
+    둘을 나란히 놓고 교차검증할 수 있다.
+
+    회사가 여러 곳이면 다중회사 API(fnlttCmpnyIndx)를, 한 곳이면 단일회사
+    API(fnlttSinglIndx)를 쓴다.
+    """
+    if not client.api_key:
+        return {'error': 'API 키가 없어 이 기능을 쓸 수 없습니다.'}
+
+    wanted = categories or list(INDICATOR_CATEGORIES)
+    unknown = [c for c in wanted if c not in INDICATOR_CATEGORIES]
+    wanted = [c for c in wanted if c in INDICATOR_CATEGORIES]
+    if not wanted:
+        return {'error': f"모르는 분류입니다: {', '.join(unknown)}",
+                'available': list(INDICATOR_CATEGORIES)}
+
+    corp_codes, unresolved = [], []
+    for comp in companies:
+        code = client.corp_code(comp)
+        (corp_codes.append((comp, code)) if code else unresolved.append(comp))
+
+    results = []
+    for year in years:
+        if not is_period_filed(year, quarter):
+            ly, lq = latest_filed_period()
+            results.append({'year': year,
+                            'error': f'{year}년 {quarter}는 아직 공시 전입니다. '
+                                     f'조회 가능한 최근 기간은 {ly}년 {lq}입니다.'})
+            continue
+
+        rcode = RCODE_MAP[quarter]
+        multi = len(corp_codes) > 1
+        endpoint = 'fnlttCmpnyIndx.json' if multi else 'fnlttSinglIndx.json'
+        corp_param = ','.join(c for _, c in corp_codes)
+
+        rows, errors = [], []
+        for cat in wanted:
+            key = ('indx', endpoint, corp_param, year, rcode, cat)
+            got = client.cached(key, lambda: _dart_get(
+                client.api_key, endpoint,
+                {'corp_code': corp_param, 'bsns_year': str(year),
+                 'reprt_code': rcode, 'idx_cl_code': INDICATOR_CATEGORIES[cat]}))
+            if got is None:
+                errors.append(f'{cat} 조회 실패')
+                continue
+            for r in got:
+                rows.append({
+                    'company': r.get('corp_name'),
+                    # 분류명은 DART 응답값을 그대로 쓴다 (코드 매핑이 틀려도 안전)
+                    'category': r.get('idx_cl_nm') or cat,
+                    'indicator': r.get('idx_nm'),
+                    'value': r.get('idx_val'),
+                })
+
+        results.append({'year': year, 'quarter': quarter, 'rows': rows,
+                        'errors': errors or None,
+                        'note': None if rows else '공시된 지표가 없습니다.'})
+
+    out = {'source': 'DART 공식 산출 재무지표', 'results': results}
+    if unresolved:
+        out['not_found'] = f"DART 고유번호를 찾지 못한 회사: {', '.join(unresolved)}"
+    if unknown:
+        out['ignored'] = f"모르는 분류는 건너뛰었습니다: {', '.join(unknown)}"
+    return out

@@ -193,6 +193,17 @@ def get_xbrl_taxonomy(sj_div: str) -> dict:
     return T.get_xbrl_taxonomy(client(), sj_div)
 
 
+@server.tool(description=(
+    "DART가 직접 산출한 주요 재무지표를 조회합니다.\n"
+    "categories: '수익성', '안정성', '성장성', '활동성' (생략하면 전부)\n\n"
+    "compute_ratios와의 차이: compute_ratios는 재무제표에서 직접 계산하고 "
+    "쓴 계정과목을 알려줍니다. 이 도구는 DART 공식 산출값입니다. "
+    "둘을 나란히 놓고 교차검증하면 좋습니다."
+))
+def get_financial_indicators(companies: list[str], years: list[int],
+                             quarter: str = "4Q", categories: list[str] = None) -> dict:
+    return T.get_financial_indicators(client(), companies, years, quarter, categories)
+
 if __name__ == "__main__":
     if "--http" in sys.argv:
         server.run(transport="streamable-http")

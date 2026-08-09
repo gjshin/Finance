@@ -322,6 +322,59 @@ check_true('상장사 검색', names.get('테스트전자') is True, f"→ {list
 check_true('비상장사도 함께 검색', names.get('테스트비상장') is False)
 
 
+print("\n=== 11-2. DART 공식 재무지표 (라이브러리 미지원 → 직접 호출) ===")
+import dart_tools as _T
+
+_calls = []
+
+
+def _fake_get(api_key, endpoint, params, timeout=10):
+    _calls.append((endpoint, params.get('idx_cl_code')))
+    return [{'corp_name': '테스트', 'idx_cl_nm': '수익성지표',
+             'idx_nm': '영업이익률', 'idx_val': '15.0'}], None
+
+
+_real_get = _T._dart_get
+_T._dart_get = _fake_get
+try:
+    c = T.DartClient(api_key='KEY', reader=FakeReader())
+    r = T.get_financial_indicators(c, ['테스트'], [LAST_Y], categories=['수익성'])
+    row = r['results'][0]['rows'][0]
+    check_true('재무지표 조회', row['indicator'] == '영업이익률' and row['value'] == '15.0')
+    check_true('분류명은 DART 응답값 사용', row['category'] == '수익성지표',
+               '(내 코드 매핑이 틀려도 안전)')
+    check_true('단일회사는 fnlttSinglIndx', _calls[0][0] == 'fnlttSinglIndx.json')
+
+    _calls.clear()
+    T.get_financial_indicators(c, ['테스트', '테스트2'], [LAST_Y], categories=['수익성'])
+    check_true('여러 회사는 fnlttCmpnyIndx', _calls[0][0] == 'fnlttCmpnyIndx.json')
+
+    # 새 클라이언트로 재야 앞 테스트의 캐시에 영향받지 않는다
+    _calls.clear()
+    c2 = T.DartClient(api_key='KEY', reader=FakeReader())
+    r2 = T.get_financial_indicators(c2, ['테스트'], [LAST_Y])
+    check_true('분류 생략 시 4종 모두 조회', len(_calls) == 4,
+               f"({[x[1] for x in _calls]})")
+    check_true('4종 결과가 다 담김', len(r2['results'][0]['rows']) == 4)
+
+    _calls.clear()
+    T.get_financial_indicators(c2, ['테스트'], [LAST_Y])
+    check_true('같은 조회 반복 시 통신 없음(캐시)', len(_calls) == 0)
+
+    bad = T.get_financial_indicators(c, ['테스트'], [LAST_Y], categories=['없는분류'])
+    check_true('모르는 분류 → 가능한 목록 안내', 'available' in bad)
+
+    fut = T.get_financial_indicators(c, ['테스트'], [datetime.now().year + 1])
+    check_true('미공시 기간 차단', 'error' in fut['results'][0])
+
+    # 키가 없으면 이 기능만 막히고 나머지는 계속 동작해야 한다
+    nokey = T.get_financial_indicators(T.DartClient(api_key=None, reader=FakeReader()),
+                                       ['테스트'], [LAST_Y])
+    check_true('API 키 없으면 이 기능만 차단', 'error' in nokey)
+finally:
+    _T._dart_get = _real_get
+
+
 print("\n=== 12. MCP 서버 계층 (Claude가 실제로 부르는 경로) ===")
 import asyncio
 import json
@@ -341,7 +394,7 @@ except RuntimeError as e:
 
 # 도구가 6개 다 등록됐는지
 tools = asyncio.run(M.server.list_tools())
-check_true('도구 13종 등록', len(tools) == 13, f"({len(tools)}개)")
+check_true('도구 14종 등록', len(tools) == 14, f"({len(tools)}개)")
 
 M._client = T.DartClient(api_key=None, reader=FakeReader())
 
