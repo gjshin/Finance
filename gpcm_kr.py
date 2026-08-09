@@ -62,6 +62,35 @@ def _to_price_series(df, col='Close'):
         s = s.iloc[:, 0]
     return s
 
+def _slice_from(df, start_date_str):
+    """이미 받아둔 넓은 구간 시계열에서 start_date 이후만 잘라낸다."""
+    if df is None or len(df) == 0:
+        return df
+    try:
+        idx = df.index
+        if not isinstance(idx, pd.DatetimeIndex):
+            idx = pd.to_datetime(idx)
+        start = pd.to_datetime(start_date_str)
+        if getattr(idx, 'tz', None) is not None:
+            start = start.tz_localize(idx.tz)
+        return df[idx >= start]
+    except Exception:
+        return df
+
+
+def _get_market_index_data(market_idx, start, end, cache):
+    """시장지수는 전 종목 공통이므로 (지수, 시작, 종료) 기준으로 1회만 조회한다."""
+    key = (market_idx, start, end)
+    if key in cache:
+        return cache[key]
+    if market_idx.startswith('^'):
+        data = yf.download(market_idx, start=start, end=end, progress=False)
+    else:
+        data = fdr.DataReader(market_idx, start, end)
+    cache[key] = data
+    return data
+
+
 def get_market_index(ticker):
     """
     티커 기반으로 거래소 및 시장지수 코드 반환 (한국 종목만 지원)
@@ -230,7 +259,25 @@ def _to_int(x):
 # --- DART 유통주식수 ---
 DART_STOCKTOTQY_URL = "https://opendart.fss.or.kr/api/stockTotqySttus.json"
 
-def fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code: str):
+# 매 호출마다 새 TLS 연결을 맺지 않도록 세션 재사용
+_DART_SESSION = requests.Session()
+
+def fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code: str, cache=None):
+    """같은 (회사, 연도, 보고서)를 기간별로 반복 조회하므로 결과를 캐시한다.
+    '데이터 없음' 응답도 캐시해야 fallback 탐색의 재조회가 사라진다.
+    다만 네트워크 오류(ERR)는 캐시하지 않아 일시적 실패가 고정되지 않도록 한다."""
+    ck = ('shares', corp_code, int(bsns_year), str(reprt_code))
+    if cache is not None and ck in cache:
+        return cache[ck]
+
+    shares, meta = _fetch_dart_distb_shares(api_key, corp_code, bsns_year, reprt_code)
+
+    if cache is not None and meta.get('status') != 'ERR':
+        cache[ck] = (shares, meta)
+    return shares, meta
+
+
+def _fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code: str):
     meta = {'shares': None, 'rcept_no': None, 'stlm_dt': None, 'se': None, 'status': None, 'message': None}
     try:
         params = {
@@ -239,7 +286,7 @@ def fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code:
             'bsns_year': str(bsns_year),
             'reprt_code': str(reprt_code),
         }
-        resp = requests.get(DART_STOCKTOTQY_URL, params=params, timeout=10)
+        resp = _DART_SESSION.get(DART_STOCKTOTQY_URL, params=params, timeout=10)
         resp.raise_for_status()
         js = resp.json()
 
@@ -280,9 +327,9 @@ def fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code:
         meta['message'] = str(e)
         return None, meta
 
-def get_outstanding_shares(api_key, corp_code: str, ticker: str, bsns_year: int, reprt_code: str, df_krx: pd.DataFrame):
+def get_outstanding_shares(api_key, corp_code: str, ticker: str, bsns_year: int, reprt_code: str, df_krx: pd.DataFrame, cache=None):
     # 1. DART API 조회 (요청한 기준년도/분기)
-    shares, meta = fetch_dart_distb_shares(api_key, corp_code, bsns_year, reprt_code)
+    shares, meta = fetch_dart_distb_shares(api_key, corp_code, bsns_year, reprt_code, cache=cache)
     if shares is not None and shares > 0:
         return shares, f"DART({reprt_code})", meta
 
@@ -304,7 +351,7 @@ def get_outstanding_shares(api_key, corp_code: str, ticker: str, bsns_year: int,
             ci = 3
         
         fb_code = order[ci]
-        fb_shares, fb_meta = fetch_dart_distb_shares(api_key, corp_code, cy, fb_code)
+        fb_shares, fb_meta = fetch_dart_distb_shares(api_key, corp_code, cy, fb_code, cache=cache)
         
         if fb_shares is not None and fb_shares > 0:
             # 과거 분기 정보를 찾았을 경우, 해당 출처(년도와 보고서 코드) 명시하여 반환
@@ -979,6 +1026,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
 
     total_tickers = len(target_code_list)
     dart_fs_cache = {}  # DART API Call 최소화를 위한 캐시 (ticker 포함 키로 충돌 방지)
+    market_idx_cache = {}  # 시장지수 시계열 캐시 (전 종목 공통)
 
     for idx, ticker in enumerate(target_code_list):
         status_container.write(f"Processing [{ticker}] ({idx+1}/{total_tickers})...")
@@ -1018,7 +1066,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                 # 1) Market Cap (기준시점만)
                 if role in ('current_cum', 'annual'):
                     price, price_date = get_stock_price(ticker, bds)
-                    shares, shares_src, sh_meta = get_outstanding_shares(api_key_input, corp_code, ticker, year, r_code, df_krx)
+                    shares, shares_src, sh_meta = get_outstanding_shares(api_key_input, corp_code, ticker, year, r_code, df_krx, cache=dart_fs_cache)
 
                     mkt_100m = 0
                     if price is not None and shares is not None and shares > 0:
@@ -1142,11 +1190,9 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
             start_2y = (pd.to_datetime(base_date_str) - timedelta(days=BETA_2Y_DAYS)).strftime('%Y-%m-%d')
 
             # 5년 월간 베타 데이터
+            # 시장지수는 모든 종목이 동일하므로 종목마다 다시 받지 않고 캐시에서 재사용
             stock_data_5y = fdr.DataReader(ticker, start_5y, end_date)
-            if market_idx.startswith('^'):
-                market_data_5y = yf.download(market_idx, start=start_5y, end=end_date, progress=False)
-            else:
-                market_data_5y = fdr.DataReader(market_idx, start_5y, end_date)
+            market_data_5y = _get_market_index_data(market_idx, start_5y, end_date, market_idx_cache)
 
             if stock_data_5y is not None and not stock_data_5y.empty and market_data_5y is not None and not market_data_5y.empty:
                 stock_prices_5y = _to_price_series(stock_data_5y)
@@ -1169,11 +1215,9 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                     temp_metrics['Market_Monthly_Prices_5Y'] = market_monthly_prices
 
             # 2년 주간 베타 데이터
-            stock_data_2y = fdr.DataReader(ticker, start_2y, end_date)
-            if market_idx.startswith('^'):
-                market_data_2y = yf.download(market_idx, start=start_2y, end=end_date, progress=False)
-            else:
-                market_data_2y = fdr.DataReader(market_idx, start_2y, end_date)
+            # 2년 구간은 위에서 받은 5년 구간의 부분집합이므로 잘라 쓴다 (재조회 불필요)
+            stock_data_2y = _slice_from(stock_data_5y, start_2y)
+            market_data_2y = _slice_from(market_data_5y, start_2y)
 
             if stock_data_2y is not None and not stock_data_2y.empty and market_data_2y is not None and not market_data_2y.empty:
                 stock_prices_2y = _to_price_series(stock_data_2y)
