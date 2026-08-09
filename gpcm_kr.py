@@ -577,8 +577,6 @@ def fetch_historical_financials(api_key, target_code_list, periods_to_fetch, dar
     cnt = 0
     hist_summary = []
     hist_details = []
-    
-    QTR_TO_CODE = {'1Q': '11011', '2Q': '11012', '3Q': '11014', '4Q': '11013'}
 
     for ticker in target_code_list:
         corp_code, _ = resolve_company_info(dart, ticker)
@@ -610,7 +608,7 @@ def fetch_historical_financials(api_key, target_code_list, periods_to_fetch, dar
             df_fs_current = None
             
             for req_year, req_qtr, role in req_periods:
-                primary = QTR_TO_CODE.get(req_qtr, '11013')
+                primary = RCODE_MAP.get(req_qtr, '11013')
                 fallbacks = [c for c in ['11013', '11014', '11012', '11011'] if c != primary]
                 target_qtrs = [primary] + fallbacks
                 
