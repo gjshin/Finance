@@ -49,3 +49,6 @@ Thumbs.db
 
 # Secret files
 secret/
+
+# MCP 서버 전용 환경
+.venv-mcp/
