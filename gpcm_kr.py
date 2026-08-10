@@ -17,6 +17,15 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.workbook.defined_name import DefinedName
 
+import dart_relay  # 해외 서버에서 DART 접속이 막힐 때 서울 리전 중계를 경유
+
+# 중계 주소가 설정돼 있으면 DART 요청을 그쪽으로 돌린다.
+# 설정이 없으면(국내 PC) 아무것도 하지 않으므로 직접 호출 그대로다.
+_RELAY_URL, _RELAY_TOKEN = dart_relay.relay_config(
+    getattr(st, 'secrets', None))
+if _RELAY_URL:
+    dart_relay.install(_RELAY_URL, _RELAY_TOKEN)
+
 # 최신 수정: 2026-02-17 15:00 KST
 # 주요 변경사항:
 # - Beta 계산 기능 추가 (5Y Monthly, 2Y Weekly) - FinanceDataReader 사용
@@ -2350,11 +2359,19 @@ if run_btn:
                 if not ok:
                     st.error(
                         "**DART 서버에 접속할 수 없습니다.**\n\n"
-                        "API 키 문제가 아니라 네트워크에서 차단된 상태입니다 "
-                        "(DART 는 해외 클라우드 IP 접속을 제한합니다).\n\n"
-                        "- Streamlit Cloud 등 해외 서버에서 실행 중이라면 **국내 환경(개인 PC 또는 국내 리전)** 에서 실행해주세요.\n"
-                        "- 사내망이라면 방화벽에서 `opendart.fss.or.kr` 을 허용해야 합니다.\n\n"
-                        f"(원인: {reason})"
+                        + (
+                            "중계 서버를 경유하도록 설정돼 있는데도 실패했습니다. "
+                            f"중계 주소(`{_RELAY_URL}`)가 살아 있는지, "
+                            "리전이 서울(icn1)인지 확인해주세요.\n\n"
+                            if dart_relay.is_installed() else
+                            "API 키 문제가 아니라 네트워크에서 차단된 상태입니다 "
+                            "(DART 는 해외 클라우드 IP 접속을 제한합니다).\n\n"
+                            "- **해외 서버(Streamlit Cloud 등)에서 쓰시려면** 서울 리전에 중계 서버를 두고 "
+                            "`DART_RELAY_URL` 을 설정하세요. 방법은 `vercel_relay/README.md` 참고.\n"
+                            "- 또는 **국내 환경(개인 PC)** 에서 실행해주세요.\n"
+                            "- 사내망이라면 방화벽에서 `opendart.fss.or.kr` 을 허용해야 합니다.\n\n"
+                        )
+                        + f"(원인: {reason})"
                     )
                     st.stop()
 
@@ -2439,11 +2456,19 @@ if run_btn:
                 if not ok:
                     st.error(
                         "**DART 서버에 접속할 수 없습니다.**\n\n"
-                        "API 키 문제가 아니라 네트워크에서 차단된 상태입니다 "
-                        "(DART 는 해외 클라우드 IP 접속을 제한합니다).\n\n"
-                        "- Streamlit Cloud 등 해외 서버에서 실행 중이라면 **국내 환경(개인 PC 또는 국내 리전)** 에서 실행해주세요.\n"
-                        "- 사내망이라면 방화벽에서 `opendart.fss.or.kr` 을 허용해야 합니다.\n\n"
-                        f"(원인: {reason})"
+                        + (
+                            "중계 서버를 경유하도록 설정돼 있는데도 실패했습니다. "
+                            f"중계 주소(`{_RELAY_URL}`)가 살아 있는지, "
+                            "리전이 서울(icn1)인지 확인해주세요.\n\n"
+                            if dart_relay.is_installed() else
+                            "API 키 문제가 아니라 네트워크에서 차단된 상태입니다 "
+                            "(DART 는 해외 클라우드 IP 접속을 제한합니다).\n\n"
+                            "- **해외 서버(Streamlit Cloud 등)에서 쓰시려면** 서울 리전에 중계 서버를 두고 "
+                            "`DART_RELAY_URL` 을 설정하세요. 방법은 `vercel_relay/README.md` 참고.\n"
+                            "- 또는 **국내 환경(개인 PC)** 에서 실행해주세요.\n"
+                            "- 사내망이라면 방화벽에서 `opendart.fss.or.kr` 을 허용해야 합니다.\n\n"
+                        )
+                        + f"(원인: {reason})"
                     )
                     st.stop()
 
