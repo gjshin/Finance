@@ -449,6 +449,10 @@ def _empty_gpcm(company_name, ticker, currency, exchange, market_idx, base_date_
     return {
         'Company': company_name, 'Ticker': ticker, 'Currency': currency,
         'Base_Date': base_date_str,
+        # 손익은 기준일과 다른 시점의 것이 쓰일 수 있다. 회사 결산월이 기준일과
+        # 어긋나면 '기준일 이전 최신 회계연도'로 대체되고, LTM이면 최근 분기말이
+        # 끝점이 된다. 라벨을 기준일로 두면 3월 데이터에 6월이 찍힌다.
+        'PL_Date': base_date_str,
         'BS_Date': None,
         'Cash': 0, 'IBD': 0, 'NCI': 0, 'Preferred': 0, 'NOA(Option)': 0, 'NOA': 0, 'Equity': 0,
         'Revenue': 0, 'EBIT': 0, 'EBITDA': 0, 'DA': 0, 'NI_Parent': 0,
@@ -661,6 +665,7 @@ def fetch_ticker_bundle(ticker, base_period_str, lookback, force_annual, include
                              f'기준일({f_dt_str}) 회계연도 없음 → 기준일 이전 최신 연간({f_pl_lookup.strftime("%Y-%m-%d")}) 사용')
 
             if f_pl_lookup is not None and f_pl_lookup in a_is.columns:
+                gpcm['PL_Date'] = f_pl_lookup.strftime('%Y-%m-%d')
                 for acct in a_is.index:
                     acct_str = str(acct)
                     hl_tag = PL_HIGHLIGHT_MAP.get(acct_str, '')
@@ -890,7 +895,7 @@ def _apply_ltm(gpcm, bundle, q_is, base_dt, ticker, company_name, currency,
         gpcm['EBITDA'] = calc_sums_ltm['OpIncome'] + da_amount
         gpcm['NI_Parent'] = calc_sums_ltm['NI_Parent']
         gpcm['PL_Source'] = f'LTM (4Q Sum, {span_days}일)'
-        gpcm['Base_Date'] = recent_q_dt.strftime('%Y-%m-%d')
+        gpcm['PL_Date'] = recent_q_dt.strftime('%Y-%m-%d')
 
         if 'Pretax Income' in ltm_sum_vals.index and pd.notna(ltm_sum_vals.loc['Pretax Income']):
             gpcm['Pretax_Income'] = float(ltm_sum_vals.loc['Pretax Income']) / 1e6
@@ -1363,7 +1368,7 @@ def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_a
             gpcm = all_period_data[label].get(ticker)
             if not gpcm: continue
 
-            p_dt = gpcm.get('Base_Date', '-')
+            p_dt = gpcm.get('PL_Date') or gpcm.get('Base_Date', '-')
             row_fi = pW if ticker_idx % 2 == 0 else pST
 
             ws_trend.cell(tr_r, 1, name); sc(ws_trend.cell(tr_r, 1), fo=fA, fi=row_fi, al=aL, bd=BD)
@@ -1769,7 +1774,8 @@ def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_a
         # --- Company Info ---
         info_vals = {
             'Company': gpcm['Company'], 'Ticker': ticker,
-            'PLDate': gpcm['Base_Date'], 'BSDate': gpcm.get('BS_Date') or '-',
+            'PLDate': gpcm.get('PL_Date') or gpcm['Base_Date'],
+            'BSDate': gpcm.get('BS_Date') or '-',
             'Curr': gpcm['Currency'], 'PLSource': gpcm['PL_Source'],
             'Exchange': gpcm.get('Exchange', ''), 'MktIndex': gpcm.get('Market_Index', ''),
         }
@@ -2648,7 +2654,7 @@ def export_historical_excel_global_v2(all_period_data, raw_bs_rows, raw_pl_rows,
                 if m_type == 'Formula_Date':
                     # Get actual fiscal date for this peer and label
                     gpcm_p = all_period_data[label].get(ticker)
-                    v = gpcm_p.get('Base_Date', '-') if gpcm_p else "-"
+                    v = (gpcm_p.get('PL_Date') or gpcm_p.get('Base_Date', '-')) if gpcm_p else "-"
                 elif m_type == 'BS_Tag':
                     v = f'=SUMIFS(\'{bs_sn}\'!G:G, \'{bs_sn}\'!B:B, $B{r}, \'{bs_sn}\'!F:F, "{m_key}")'
                 elif m_type == 'BS_Acc':
@@ -3122,7 +3128,8 @@ if btn_run:
                 ev = eq_val + g['IBD'] - g['Cash'] + g['NCI'] - g.get('NOA', 0)
                 summary_list.append({
                     'Ticker': t, 'Company': g['Company'],
-                    'PL 기준일': g['Base_Date'], 'PL Source': g['PL_Source'],
+                    'PL 기준일': g.get('PL_Date') or g['Base_Date'],
+                    'PL Source': g['PL_Source'],
                     'EV/Sales': ev / g['Revenue'] if g['Revenue'] > 0 else None,
                     'EV/EBITDA': ev / g['EBITDA'] if g['EBITDA'] > 0 else None,
                     'EV/EBIT': ev / g['EBIT'] if g['EBIT'] > 0 else None,
