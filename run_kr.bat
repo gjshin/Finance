@@ -9,77 +9,66 @@ echo    GPCM Calculator (DART) - 국내 상장사용
 echo  ================================================
 echo.
 
-REM ---------- 1. 파이썬 찾기 ----------
-set "PY="
-py -3 --version >nul 2>&1
-if %errorlevel%==0 set "PY=py -3"
-if defined PY goto HAVE_PY
+REM 임시 파일을 %TEMP% 대신 여기에 만든다. 회사 PC의 보안 프로그램이
+REM %TEMP% 에 새 실행 파일 만드는 걸 막는 경우가 있어서다.
+set "GPCM_HOME=%LOCALAPPDATA%\gpcm"
+if not exist "%GPCM_HOME%\tmp" mkdir "%GPCM_HOME%\tmp" >nul 2>&1
+set "TMP=%GPCM_HOME%\tmp"
+set "TEMP=%GPCM_HOME%\tmp"
 
-python --version >nul 2>&1
-if %errorlevel%==0 set "PY=python"
-if defined PY goto HAVE_PY
+REM ---------- 1. uv 찾기 ----------
+REM uv가 파이썬까지 알아서 준비한다. 파이썬을 따로 설치할 필요가 없다.
+set "UV=%USERPROFILE%\.local\bin\uv.exe"
+if exist "%UV%" goto HAVE_UV
 
-echo  [오류] 파이썬이 설치되어 있지 않습니다.
-echo.
-echo   1) https://www.python.org/downloads/  접속
-echo   2) 노란색 "Download Python" 버튼 클릭
-echo   3) 설치 화면 맨 아래 "Add python.exe to PATH" 체크  ^<-- 중요!
-echo   4) 설치가 끝나면 이 파일을 다시 더블클릭
-echo.
-pause
-exit /b 1
+for /f "delims=" %%i in ('where uv 2^>nul') do set "UV=%%i"
+if exist "%UV%" goto HAVE_UV
 
-:HAVE_PY
-echo  [1/3] 파이썬 확인 완료
+echo  [1/2] 처음 실행이라 준비 도구를 설치합니다 (1분 내외)...
 echo.
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex" >nul 2>&1
+set "UV=%USERPROFILE%\.local\bin\uv.exe"
+if not exist "%UV%" goto UV_FAIL
 
-REM ---------- 2. 실행 환경 준비 ----------
-if exist ".venv\Scripts\python.exe" goto HAVE_VENV
-
-echo  [2/3] 최초 실행입니다. 준비하는 데 2~5분 걸립니다.
-echo        (다음부터는 이 과정을 건너뜁니다)
-echo.
-%PY% -m venv .venv
-if errorlevel 1 goto VENV_FAIL
-
-:HAVE_VENV
-echo  [2/3] 필요한 프로그램을 확인/설치합니다...
-echo.
-echo        * WARNING 으로 시작하는 문구가 보여도 정상입니다. 무시하세요.
-echo        * 처음에는 몇 분 걸립니다. 창을 닫지 말고 기다려주세요.
-echo.
-".venv\Scripts\python.exe" -m pip install --upgrade pip --quiet --disable-pip-version-check
-".venv\Scripts\python.exe" -m pip install -r requirements.txt --disable-pip-version-check
-if errorlevel 1 goto PIP_FAIL
-echo.
-echo        설치 완료
+:HAVE_UV
+echo  [1/2] 준비 도구 확인 완료
 echo.
 
-REM ---------- 3. 앱 실행 ----------
-echo  [3/3] 앱을 실행합니다. 잠시 후 브라우저가 자동으로 열립니다.
+REM ---------- 2. 앱 실행 ----------
+echo  [2/2] 앱을 실행합니다.
+echo.
+echo        * 처음에는 파이썬과 필요한 프로그램을 받느라 3~5분 걸립니다.
+echo          창을 닫지 말고 기다려주세요. 다음부터는 바로 뜹니다.
+echo        * WARNING 으로 시작하는 문구가 보여도 정상입니다.
 echo.
 echo  ------------------------------------------------
+echo   준비가 끝나면 브라우저가 자동으로 열립니다.
 echo   종료하려면 이 검은 창을 그냥 닫으세요.
 echo  ------------------------------------------------
 echo.
-".venv\Scripts\python.exe" -m streamlit run gpcm_kr.py
+
+"%UV%" run --no-project --python 3.12 --with-requirements requirements.txt python -m streamlit run gpcm_kr.py
+if errorlevel 1 goto RUN_FAIL
 pause
 exit /b 0
 
-:VENV_FAIL
+:UV_FAIL
 echo.
-echo  [오류] 실행 환경을 만들지 못했습니다.
-echo         이 폴더가 OneDrive/바탕화면 동기화 폴더 안에 있으면
-echo         C:\GPCM 같은 단순한 경로로 옮긴 뒤 다시 시도해주세요.
+echo  [오류] 준비 도구(uv)를 설치하지 못했습니다.
+echo.
+echo         회사망이라면 방화벽이 astral.sh 를 막고 있을 수 있습니다.
+echo         전산팀에 문의하시거나 다른 네트워크에서 한 번 실행해보세요.
 echo.
 pause
 exit /b 1
 
-:PIP_FAIL
+:RUN_FAIL
 echo.
-echo  [오류] 필요한 프로그램 설치에 실패했습니다.
-echo         인터넷 연결을 확인한 뒤 다시 실행해주세요.
-echo         회사망이라면 방화벽이 pypi.org 를 막고 있을 수 있습니다.
+echo  [오류] 앱을 실행하지 못했습니다.
+echo.
+echo         - 인터넷 연결을 확인해주세요
+echo         - 회사망이라면 방화벽이 pypi.org 를 막고 있을 수 있습니다
+echo         - 위에 빨간 글씨가 있으면 그 부분을 캡처해서 문의해주세요
 echo.
 pause
 exit /b 1
