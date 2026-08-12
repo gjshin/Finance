@@ -1,3 +1,7 @@
 # cmd.exe는 CRLF가 아니면 줄을 제대로 나누지 못한다. echo가 떨어져 나가고
-# 뒷부분을 명령으로 실행해 버려서, 배치 파일은 반드시 CRLF로 유지한다.
-*.bat text eol=crlf
+# 뒷부분을 명령으로 실행해 버린다.
+#
+# `text eol=crlf`는 저장소에 LF로 담고 체크아웃할 때 CRLF로 바꿔 주는데,
+# 사용자는 git이 아니라 Code → Download ZIP으로 받는다. ZIP은 저장된 바이트를
+# 그대로 주므로 그 방식으로는 안 된다. 변환을 끄고 CRLF를 그대로 저장한다.
+*.bat -text
