@@ -46,6 +46,33 @@ BETA_2Y_DAYS = 365 * 2 + 20
 MIN_MONTHLY_PTS = 12
 MIN_WEEKLY_PTS = 50
 
+# Data_Quality 시트 심각도
+SEV_ERROR = 'ERROR'   # 그 값을 쓰면 안 된다
+SEV_WARN = 'WARN'     # 값은 나왔지만 왜곡됐을 수 있다
+SEV_INFO = 'INFO'     # 알아두면 되는 것
+
+
+class QualityLog:
+    """자동 수집이 실패하거나 값을 채우지 못한 지점을 모은다.
+
+    DART 조회는 회사·기간별로 조용히 실패한다. 지금까지는 실패한 자리에 0이 남고
+    나머지가 계속 돌아, 엑셀만 봐서는 그 0이 '정말 0'인지 '못 가져온 것'인지
+    구분할 수 없었다. 특히 LTM은 (당기누계 + 전기연간 - 전년동기)라서 셋 중
+    하나만 빠져도 숫자가 그럴듯하게 틀린다.
+    """
+
+    def __init__(self):
+        self.rows = []
+
+    def add(self, level, ticker, company, item, message):
+        self.rows.append({
+            'Level': level, 'Ticker': ticker, 'Company': company,
+            'Item': item, 'Message': message,
+        })
+
+    def has(self, level):
+        return any(r['Level'] == level for r in self.rows)
+
 # ==========================================
 # 1. Helper Functions
 # ==========================================
@@ -226,6 +253,49 @@ def get_krx_listing():
 
     # 최후 fallback: 빈 DataFrame 반환 (코드만으로 진행 가능하도록)
     return pd.DataFrame(columns=['Code', 'Name', 'Stocks'])
+
+@st.cache_resource(ttl=3600)
+def get_krx_industry_listing():
+    """업종·주요제품이 붙은 상장사 목록 (KRX 상장회사목록).
+
+    get_krx_listing()이 쓰는 'KRX'는 가격·시총 목록이라 업종이 없다. 업종으로
+    Peer 후보를 추리려면 이쪽이 필요하다. 인증키는 필요 없다.
+
+    반환: Code, Name, Market, Sector(업종), Industry(주요제품), SettleMonth(결산월)
+    실패하면 빈 DataFrame — 호출부는 종목코드 직접 입력으로 되돌아간다.
+    """
+    for attempt in range(2):
+        try:
+            df = fdr.StockListing('KRX-DESC')
+            if df is not None and not df.empty and 'Sector' in df.columns:
+                return df
+        except Exception:
+            if attempt < 1:
+                time.sleep(1.0)
+    return pd.DataFrame(columns=['Code', 'Name', 'Market', 'Sector', 'Industry', 'SettleMonth'])
+
+
+def peer_candidate_rows(df_ind, sector: str):
+    """업종 하나에 속한 상장사를 종목코드 순으로 정리한다.
+
+    결산월이 12월이 아니면 비교기간이 어긋나므로 골라내기 전에 보이게 표시한다.
+    """
+    if df_ind is None or df_ind.empty or not sector:
+        return []
+    sub = df_ind[df_ind['Sector'] == sector].sort_values('Code')
+    rows = []
+    for _, r in sub.iterrows():
+        settle = str(r.get('SettleMonth') or '').strip()
+        rows.append({
+            'Code': str(r.get('Code') or '').zfill(6),
+            'Name': str(r.get('Name') or ''),
+            'Market': str(r.get('Market') or ''),
+            'Product': str(r.get('Industry') or '').strip(),
+            'SettleMonth': settle,
+            'FiscalNot12': bool(settle) and '12' not in settle,
+        })
+    return rows
+
 
 def resolve_company_info(dart_instance, ticker: str):
     df_krx = get_krx_listing()
@@ -1043,6 +1113,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
 
     screen_summary_data = []
     all_multiples = []
+    quality = QualityLog()
 
     total_tickers = len(target_code_list)
     dart_fs_cache = {}  # DART API Call 최소화를 위한 캐시 (ticker 포함 키로 충돌 방지)
@@ -1055,6 +1126,9 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
         corp_code, krx_name = resolve_company_info(dart, ticker)
         if not corp_code:
             status_container.write(f"❌ [{ticker}] DART 고유번호 조회 실패")
+            quality.add(SEV_ERROR, ticker, '', '회사 조회',
+                        'DART 고유번호를 찾지 못해 이 회사는 분석에서 통째로 빠졌습니다. '
+                        '종목코드 6자리가 맞는지, 상장사가 맞는지 확인하세요.')
             continue
 
         display_name = krx_name if krx_name else f"Company_{ticker}"
@@ -1091,6 +1165,17 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                     mkt_100m = 0
                     if price is not None and shares is not None and shares > 0:
                         mkt_100m = round((price * shares) / 1e8, 1)
+                    else:
+                        # 시가총액이 0이면 EV·자본구조·베타가 한꺼번에 무너진다
+                        missing = []
+                        if price is None:
+                            missing.append(f'{bds} 종가')
+                        if not shares:
+                            missing.append('발행주식수')
+                        quality.add(SEV_ERROR, ticker, display_name, f'시가총액 {tp}',
+                                    f"{' · '.join(missing)}를 못 가져와 시가총액이 0입니다. "
+                                    f"EV와 자본구조가 왜곡되니 Market_Cap 시트에서 사유를 확인하세요."
+                                    + (f" (DART: {sh_meta.get('message')})" if sh_meta.get('message') else ''))
 
                     period_metrics['Market_Cap'] = mkt_100m
 
@@ -1145,6 +1230,11 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                                 'sj_nm': row.get('sj_nm', ''), 'account_nm': acct, 'account_id': aid,
                                 'EV_Component': ev_comp or '', 'Amount_100M': amt / 1e8,
                             })
+                    else:
+                        # 재무상태표를 못 받으면 현금·차입금·자본이 전부 0으로 남는다
+                        quality.add(SEV_ERROR, ticker, display_name, f'재무상태표 {tp}',
+                                    f'{year}년 {qtr} 재무상태표를 연결·별도 모두 가져오지 못했습니다. '
+                                    f'현금·이자부부채·비지배지분·자본이 0으로 처리됩니다.')
 
                 # 3) PL Fetch
                 df_is = None
@@ -1157,7 +1247,19 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                         df_is = filter_income_statement(df_pl_raw)
                         dart_fs_cache[cache_key_pl] = (df_is, pl_src)
                     
-                if df_is is None or df_is.empty: continue
+                # LTM = 당기누계 + 전기연간 - 전년동기. 셋 중 하나만 빠져도 합계가
+                # 그럴듯하게 틀리므로, 어느 조각이 빠졌는지 남긴다.
+                ltm_part = {'current_cum': '당기누계', 'prior_annual': '전기연간',
+                            'prior_same_q': '전년동기'}.get(role)
+                if df_is is None or df_is.empty:
+                    if ltm_part:
+                        quality.add(SEV_ERROR, ticker, display_name, f'LTM {tp}',
+                                    f'{ltm_part}({year} {qtr}) 손익계산서를 못 가져왔습니다. '
+                                    f'이 조각을 뺀 채로 합산되어 매출·영업이익이 실제와 다릅니다.')
+                    else:
+                        quality.add(SEV_ERROR, ticker, display_name, f'손익계산서 {tp}',
+                                    f'{year}년 {qtr} 손익계산서를 가져오지 못해 매출·영업이익이 0입니다.')
+                    continue
 
                 wanted = {'Revenue', 'EBIT', 'NI', 'Pretax_Income'}
                 picked = set()
@@ -1188,6 +1290,17 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
 
                     picked.add(calc_key)
                     if picked == wanted: break
+
+                # 계정과목 표기가 회사마다 달라 매칭에서 빠질 수 있다. 그 계정만 0이 된다.
+                unmatched = wanted - picked
+                if unmatched:
+                    label = {'Revenue': '매출액', 'EBIT': '영업이익',
+                             'NI': '당기순이익', 'Pretax_Income': '법인세비용차감전순이익'}
+                    quality.add(SEV_WARN, ticker, display_name, f'계정 매칭 {tp}',
+                                f"{year} {qtr} 손익계산서에서 "
+                                f"{', '.join(label[k] for k in sorted(unmatched))}을(를) "
+                                f"찾지 못했습니다. 해당 계정은 0으로 집계됩니다 — "
+                                f"PL_Data 시트에서 실제 계정과목명을 확인하세요.")
 
             # Period loop ends, append to all_multiples
             all_multiples.append({
@@ -1259,8 +1372,22 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                     temp_metrics['Stock_Weekly_Prices_2Y'] = stock_weekly_prices
                     temp_metrics['Market_Weekly_Prices_2Y'] = market_weekly_prices
 
-        except Exception:
-            pass  # Beta 데이터 수집 실패 시 계속 진행
+        except Exception as e:
+            beta_failed = True
+            quality.add(SEV_WARN, ticker, display_name, '베타',
+                        f'주가 시계열을 받지 못해 베타를 계산할 수 없습니다 ({type(e).__name__}). '
+                        f'이 회사는 WACC 평균에서 빠집니다.')
+        else:
+            beta_failed = False
+
+        # 조회는 됐지만 관측치가 모자라 시계열을 담지 못한 경우도 조용히 넘어간다
+        if not beta_failed and temp_metrics['Stock_Monthly_Prices_5Y'] is None:
+            quality.add(SEV_WARN, ticker, display_name, '베타 5Y',
+                        f'월간 관측치가 {MIN_MONTHLY_PTS}개에 못 미쳐 5년 월간 베타를 산출하지 않았습니다. '
+                        f'상장한 지 얼마 안 된 회사에서 주로 발생합니다.')
+        if not beta_failed and temp_metrics['Stock_Weekly_Prices_2Y'] is None:
+            quality.add(SEV_WARN, ticker, display_name, '베타 2Y',
+                        f'주간 관측치가 {MIN_WEEKLY_PTS}개에 못 미쳐 2년 주간 베타를 산출하지 않았습니다.')
 
         screen_summary_data.append(temp_metrics)
         time.sleep(0.5) # API 호출 간격 조절
@@ -1270,7 +1397,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
 
     # --- 결과 처리 및 엑셀 생성 ---
 
-    return raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name, screen_summary_data, base_year, base_qtr, base_date_str, all_multiples
+    return raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name, screen_summary_data, base_year, base_qtr, base_date_str, all_multiples, quality
 
 def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_rate_input, rf_input, mrp_input, size_premium_input, kd_pretax_input, beta_type_input, fiscal_year=None):
     # 1.5. WACC Calculation (Target 기업용)
@@ -1403,7 +1530,7 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
     }
     return target_wacc_data, avg_debt_ratio
 
-def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summary_data, raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name, target_wacc_data, beta_type_input, notes_list, avg_debt_ratio, base_date_str, df_screen, target_periods):
+def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summary_data, raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name, target_wacc_data, beta_type_input, notes_list, avg_debt_ratio, base_date_str, df_screen, target_periods, quality, peer_selection=None):
     # 2. 엑셀 생성 (메모리)
     output = io.BytesIO()
     wb = Workbook()
@@ -2112,6 +2239,92 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
     ws_trend.auto_filter.ref = f"A{header_row_t}:M{rt-1}"
     ws_trend.freeze_panes = f"D{header_row_t+1}" # Scroll from Market_Cap
 
+    # === Data_Quality Sheet — 자동 수집이 채우지 못한 자리 ===
+    # 못 가져온 값은 0으로 남고 나머지 계산은 계속 돌아간다. 파일만 받아 본 사람이
+    # 그 0을 '정말 0'으로 읽지 않도록, 어디가 비었는지 여기에 모아 둔다.
+    ws_dq = wb.create_sheet('Data_Quality')
+    ws_dq.sheet_properties.tabColor = 'EF6C00'
+
+    ws_dq.merge_cells('A1:E1'); sc(ws_dq.cell(1, 1, 'Data Quality Check (확인 필요 항목)'), fo=fT)
+    ws_dq.merge_cells('A2:E2')
+    sc(ws_dq.cell(2, 1,
+                  'ERROR = 그 값을 쓰면 안 됨 / WARN = 값은 나왔으나 왜곡 가능 / INFO = 참고. '
+                  '자동 수집의 한계를 표시한 것이므로 공시자료와 대조 검증하십시오.'), fo=fS)
+
+    dq_cols = [('Level', 10), ('Ticker', 12), ('Company', 20), ('Item', 20), ('Message', 100)]
+    dq_hdr = 4
+    for ci, (h, w) in enumerate(dq_cols, 1):
+        ws_dq.column_dimensions[get_column_letter(ci)].width = w
+        sc(ws_dq.cell(dq_hdr, ci, h), fo=fH, fi=pH, al=aC, bd=BD)
+
+    level_fill = {SEV_ERROR: PatternFill('solid', fgColor='FFCDD2'),
+                  SEV_WARN: PatternFill('solid', fgColor='FFE0B2'),
+                  SEV_INFO: PatternFill('solid', fgColor='E3F2FD')}
+    level_order = {SEV_ERROR: 0, SEV_WARN: 1, SEV_INFO: 2}
+    dq_rows = sorted(quality.rows,
+                     key=lambda x: (level_order.get(x.get('Level'), 9),
+                                    str(x.get('Ticker', '')), str(x.get('Item', ''))))
+
+    r_dq = dq_hdr + 1
+    if dq_rows:
+        for fl in dq_rows:
+            lv = fl.get('Level', SEV_INFO)
+            vals = [lv, fl.get('Ticker', ''), fl.get('Company', ''),
+                    fl.get('Item', ''), fl.get('Message', '')]
+            for ci, v in enumerate(vals, 1):
+                sc(ws_dq.cell(r_dq, ci, v), fo=fA, fi=level_fill.get(lv, pW), bd=BD,
+                   al=aC if ci == 1 else aL)
+            r_dq += 1
+    else:
+        ws_dq.merge_cells(start_row=r_dq, start_column=1, end_row=r_dq, end_column=5)
+        sc(ws_dq.cell(r_dq, 1, '✅ 자동 점검에서 특이사항이 발견되지 않았습니다. '
+                               '점검 대상이 아닌 항목은 여전히 직접 확인이 필요합니다.'), fo=fA)
+        r_dq += 1
+
+    ws_dq.auto_filter.ref = f"A{dq_hdr}:E{r_dq-1}"
+    ws_dq.freeze_panes = f'A{dq_hdr+1}'
+    # GPCM 바로 뒤 — 숫자를 보기 전에 눈에 걸리도록 맨 앞쪽에 둔다
+    wb.move_sheet('Data_Quality', offset=1 - wb.sheetnames.index('Data_Quality'))
+
+    # === Peer_Selection Sheet — 업종에서 고른 경우, 무엇을 보고 골랐는지 ===
+    # 후보 목록은 실행 시점의 상장 현황이라 나중에 다시 만들 수 없다. "Peer 를 왜
+    # 이 회사들로 했나"에 답하려면 그때 무엇이 떠 있었는지가 파일에 남아 있어야 한다.
+    if peer_selection:
+        ws_ps = wb.create_sheet('Peer_Selection')
+        ws_ps.sheet_properties.tabColor = '00695C'
+        picked_set = set(peer_selection.get('picked') or [])
+
+        ws_ps.merge_cells('A1:F1'); sc(ws_ps.cell(1, 1, 'Peer Selection (모집단과 선택 근거)'), fo=fT)
+        ws_ps.merge_cells('A2:F2')
+        sc(ws_ps.cell(2, 1,
+                      f"업종: {peer_selection.get('sector', '')} | "
+                      f"후보 {len(peer_selection.get('candidates') or [])}개 중 {len(picked_set)}개 선택 | "
+                      f"조회 시점: {datetime.now().strftime('%Y-%m-%d %H:%M')} — "
+                      f"상장·폐지에 따라 후보 목록은 시점마다 달라집니다."), fo=fS)
+
+        ps_cols = [('선택', 8), ('Code', 12), ('Name', 24), ('Market', 10),
+                   ('주요제품', 60), ('결산월', 10)]
+        ps_hdr = 4
+        for ci, (h, w) in enumerate(ps_cols, 1):
+            ws_ps.column_dimensions[get_column_letter(ci)].width = w
+            sc(ws_ps.cell(ps_hdr, ci, h), fo=fH, fi=pH, al=aC, bd=BD)
+
+        pPICK = PatternFill('solid', fgColor='C8E6C9')
+        r_ps = ps_hdr + 1
+        for c in (peer_selection.get('candidates') or []):
+            chosen = c['Code'] in picked_set
+            vals = ['●' if chosen else '', c['Code'], c['Name'], c['Market'],
+                    c['Product'], c['SettleMonth']]
+            for ci, v in enumerate(vals, 1):
+                sc(ws_ps.cell(r_ps, ci, v), fo=fA,
+                   fi=pPICK if chosen else (PatternFill('solid', fgColor='FFE0B2') if c['FiscalNot12'] else pW),
+                   al=aC if ci in (1, 2, 4, 6) else aL, bd=BD)
+            r_ps += 1
+
+        ws_ps.auto_filter.ref = f"A{ps_hdr}:F{r_ps-1}"
+        ws_ps.freeze_panes = f'A{ps_hdr+1}'
+        wb.move_sheet('Peer_Selection', offset=2 - wb.sheetnames.index('Peer_Selection'))
+
     wb.save(output)
     output.seek(0)
 
@@ -2193,7 +2406,39 @@ with st.sidebar:
         st.info(f"Target WACC 기준일 (최신기간 적용): {base_date_display} (말일)")
 
         st.subheader("Target Companies")
-        tickers_input = st.text_area("대상회사의 종목코드를 한줄씩 입력하세요", value="000250\n039030\n005290", height=150)
+        # 종목코드를 손으로 치면 오타 난 회사가 조용히 빠지고, 어느 회사를 왜 골랐는지도
+        # 남지 않는다. 업종으로 후보를 띄우고 고르게 해, 그 선택을 엑셀에 기록한다.
+        df_ind = get_krx_industry_listing()
+        peer_selection = None
+
+        if df_ind.empty:
+            st.caption("업종 목록을 받지 못했습니다. 종목코드를 직접 입력하세요.")
+            pick_mode = "종목코드 직접 입력"
+        else:
+            pick_mode = st.radio("종목 선택 방식", ["업종에서 고르기", "종목코드 직접 입력"],
+                                 horizontal=True, label_visibility="collapsed")
+
+        if pick_mode == "업종에서 고르기":
+            sectors = sorted(s for s in df_ind['Sector'].dropna().unique() if str(s).strip())
+            sector = st.selectbox("업종", sectors,
+                                  help="KRX 상장회사목록의 업종 구분입니다. 같은 업종 안에서도 "
+                                       "사업이 다를 수 있으니 주요제품을 보고 판단하세요.")
+            candidates = peer_candidate_rows(df_ind, sector)
+            label_of = {
+                c['Code']: f"{c['Code']} {c['Name']}"
+                          + (f" — {c['Product']}" if c['Product'] else "")
+                          + (f"  ⚠️{c['SettleMonth']} 결산" if c['FiscalNot12'] else "")
+                for c in candidates
+            }
+            picked = st.multiselect(f"비교 대상 ({len(candidates)}개 후보)",
+                                    options=[c['Code'] for c in candidates],
+                                    format_func=lambda c: label_of.get(c, c))
+            tickers_input = "\n".join(picked)
+            peer_selection = {'sector': sector, 'candidates': candidates, 'picked': picked}
+            if not picked:
+                st.caption("후보 중에서 비교할 회사를 고르세요.")
+        else:
+            tickers_input = st.text_area("대상회사의 종목코드를 한줄씩 입력하세요", value="000250\n039030\n005290", height=150)
 
         st.subheader("Target WACC Parameters")
         rf_input = st.number_input("Rf - 무위험이자율 (%)", min_value=0.0, max_value=10.0, value=3.3, step=0.1, format="%.2f") / 100
@@ -2391,7 +2636,7 @@ if run_btn:
                     st.stop()
 
                 # 변수 초기화 및 데이터 수집
-                raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name, screen_summary_data, base_year, base_qtr, base_date_str, all_multiples = fetch_financial_data(
+                raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name, screen_summary_data, base_year, base_qtr, base_date_str, all_multiples, quality = fetch_financial_data(
                     api_key_input, target_code_list, target_periods, dart, status_container, progress_bar)
 
                 # 1. 화면 출력용 DataFrame 구성
@@ -2411,6 +2656,17 @@ if run_btn:
                         "⚠️ **아래 항목을 수집하지 못했습니다. 배수·WACC 결과가 왜곡됩니다.**\n\n"
                         + "\n".join(f"- {p}" for p in problems)
                         + "\n\n대부분 아직 공시되지 않은 기간을 조회했을 때 발생합니다."
+                    )
+                    for p in problems:
+                        quality.add(SEV_ERROR, '', '', f'기준기간 {base_period_str}', p)
+
+                # 화면 경고는 창을 닫으면 사라진다. 파일만 남았을 때도 알 수 있게 개수를 알린다.
+                n_err = sum(1 for r in quality.rows if r['Level'] == SEV_ERROR)
+                n_warn = sum(1 for r in quality.rows if r['Level'] == SEV_WARN)
+                if n_err or n_warn:
+                    st.info(
+                        f"📋 자동 점검 결과 **ERROR {n_err}건 · WARN {n_warn}건**을 "
+                        f"엑셀 **Data_Quality** 시트에 기록했습니다. 숫자를 쓰기 전에 먼저 보십시오."
                     )
 
                 if not df_screen.empty:
@@ -2446,7 +2702,7 @@ if run_btn:
                 # 2. 엑셀 생성 (메모리)
                 output = export_gpcm_excel(
                     base_period_str, base_qtr, target_code_list, screen_summary_data, raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name,
-                    target_wacc_data, beta_type_input, notes_list, avg_debt_ratio, base_date_str, df_screen, target_periods)
+                    target_wacc_data, beta_type_input, notes_list, avg_debt_ratio, base_date_str, df_screen, target_periods, quality, peer_selection)
                 st.success("분석 완료! 아래 버튼을 눌러 리포트를 다운로드하세요.")
                 st.download_button(
                     label="📥 Report Download (Excel)",
