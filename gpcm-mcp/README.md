@@ -107,6 +107,27 @@ Claude Code CLI 를 쓴다면 저장소 맨 위의 `.mcp.json` 을 읽는다 (`.
 
 도구 인자로는 절대 받지 않는다 — 그러면 키가 대화 기록과 세션 로그에 영구히 남는다.
 
+> ### ⚠️ 설정 파일에는 키가 들어 있다
+>
+> `claude_desktop_config.json` 을 **통째로 복사해 남에게 보내거나 채팅에 붙여넣지 말 것.**
+> `register_claude.ps1` 이 남기는 `claude_desktop_config.json.bak` 에도 이전 키가 남는다.
+>
+> 등록 상태를 확인할 때는 키를 가리는 아래 명령을 쓴다. 등록 여부·경로·키 설정 여부는
+> 이것으로 다 판단할 수 있다.
+>
+> ```powershell
+> $p = "$env:APPDATA\Claude\claude_desktop_config.json"
+> (Get-Content $p -Raw) -replace '("OPENDART_API_KEY"\s*:\s*")[^"]*', '$1***가림***'
+> ```
+
+### 키가 노출됐다면
+
+<https://opendart.fss.or.kr> 에서 **재발급**받는다. 무료이고 즉시 된다. 그다음
+`run_mcp_setup.bat` 을 다시 돌려 새 키를 넣고, 앱을 완전히 껐다 켠다.
+
+노출된 키는 재발급하면 그만이므로 망설일 이유가 없다. 하루 조회 한도가 키마다
+주어지므로, 남의 손에 있는 키는 한도만 갉아먹는다.
+
 ---
 
 ## 국내에서만 동작한다

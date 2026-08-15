@@ -20,7 +20,13 @@ claude mcp add gpcm-kr -- <경로>\.venv-mcp\Scripts\python.exe -m gpcm_mcp.serv
 - [ ] **Claude 가 이 PC 에서 돌고 있는가** — Claude 에게 작업 폴더를 물어 `C:\...` 로
       시작하면 로컬, `/home/...` 이면 클라우드다. 클라우드면 이 PC 의 서버를 볼 수 없고
       DART 도 막힌다. (데스크톱 앱에서 열어도 클라우드 세션일 수 있으니 반드시 확인)
-- [ ] 새 창에서 `echo %OPENDART_API_KEY%` → 키가 찍히는가 (설치 직후 창을 껐다 켰는가)
+- [ ] 등록됐는가 — 아래로 확인한다. **키가 가려진 채로** 등록 여부와 경로가 보인다.
+      설정 파일을 그냥 출력하면 DART 키가 그대로 찍히니 통째로 붙여넣지 말 것.
+
+      ```powershell
+      $p = "$env:APPDATA\Claude\claude_desktop_config.json"
+      (Get-Content $p -Raw) -replace '("OPENDART_API_KEY"\s*:\s*")[^"]*', '$1***가림***'
+      ```
 - [ ] `check_dart_access` → `reachable: true`, `api_key_configured: true`
 
 여기서 막히면 방화벽에서 `opendart.fss.or.kr` 을 열어야 한다.

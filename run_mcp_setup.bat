@@ -152,6 +152,12 @@ echo   엑셀은 문서 폴더의 GPCM_Reports 안에 저장됩니다.
 echo.
 echo   [주의] 국내에서만 됩니다. DART 가 해외 접속을 막습니다.
 echo.
+echo   [주의] 방금 만든 설정 파일에는 DART 키가 들어 있습니다.
+echo          claude_desktop_config.json 을 통째로 복사해서
+echo          남에게 보내거나 채팅에 붙여넣지 마세요.
+echo          키를 가리고 확인하는 방법은 gpcm-mcp\README.md 에 있습니다.
+echo          키가 노출됐다면 opendart.fss.or.kr 에서 재발급받으세요.
+echo.
 echo   설치된 곳: %INSTALLDIR%
 echo.
 pause
