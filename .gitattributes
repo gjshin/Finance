@@ -8,3 +8,4 @@
 
 # .mcpb 는 zip 이다. 줄바꿈 변환이 닿으면 깨진다.
 *.mcpb binary
+*.dxt binary
