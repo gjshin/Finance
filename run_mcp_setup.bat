@@ -114,54 +114,45 @@ if "%INSTALLDIR:~-1%"=="\" set "INSTALLDIR=%INSTALLDIR:~0,-1%"
 >>".mcp.json" echo   }
 >>".mcp.json" echo }
 
-echo        .mcp.json 을 만들었습니다.
+REM 클로드 데스크톱 앱 설정에 등록한다. 기존 서버 설정은 건드리지 않는다.
+REM (JSON 병합은 배치로 못 하니 PowerShell 로 뺐다)
+set "REGOK="
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0gpcm-mcp\register_claude.ps1" -PythonPath "%~dp0gpcm-mcp\.venv-mcp\Scripts\python.exe" -ApiKey "%DARTKEY%" >nul 2>&1
+if not errorlevel 1 set "REGOK=1"
+
+if defined REGOK (
+    echo        클로드 데스크톱 앱에 등록했습니다.
+) else (
+    echo        [알림] 데스크톱 앱 자동 등록에 실패했습니다.
+    echo               앱이 설치돼 있지 않으면 정상입니다.
+)
 echo.
 echo  ================================================
 echo    설치가 끝났습니다
 echo  ================================================
 echo.
-echo   설치된 곳 ^(이 경로를 적어두세요^):
-echo.
-echo       %INSTALLDIR%
-echo.
-echo  ------------------------------------------------
-echo   [중요 1] 창을 껐다 켜야 합니다.
-echo  ------------------------------------------------
-echo.
-echo   지금 열려 있는 창들은 방금 저장한 키를 모릅니다.
-echo   이 창을 닫고, 명령 프롬프트를 새로 여세요.
-echo.
-echo   키가 저장됐는지는 새 창에서 이렇게 확인합니다.
-echo.
-echo       echo %%OPENDART_API_KEY%%
-echo.
-echo   키가 찍히면 정상입니다.
-echo.
-echo  ------------------------------------------------
-echo   [중요 2] 이 PC 에서 도는 Claude 여야 합니다.
-echo  ------------------------------------------------
-echo.
-echo   방금 설치한 것은 이 PC 안에만 있습니다.
-echo   브라우저의 claude.ai 나 클라우드에서 도는 Claude 는
-echo   이 PC 를 볼 수 없어서 도구를 찾지 못합니다.
-echo.
-echo   명령 프롬프트를 새로 열고 아래 두 줄을 그대로 실행하세요.
-echo.
-echo       cd /d "%INSTALLDIR%"
-echo       claude
-echo.
-echo   Claude 가 어디서 도는지 헷갈리면 이렇게 물어보세요.
-echo   "지금 작업 폴더가 어디야?"
-echo   C:\ 로 시작하면 이 PC 입니다. /home/ 으로 시작하면 클라우드라 안 됩니다.
+echo   남은 것은 하나뿐입니다.
 echo.
 echo  ------------------------------------------------
 echo.
-echo   처음 한 번 "gpcm-kr 서버를 쓰겠냐" 고 물으면 허용하세요.
-echo   그다음 "DART 접속 확인해줘" 라고 시켜보시면 됩니다.
+echo     1. 클로드 데스크톱 앱을 완전히 끕니다
+echo.
+echo        창만 닫으면 안 됩니다. 화면 오른쪽 아래 시계 옆에
+echo        클로드 아이콘이 남아 있으면 우클릭해서 종료하세요.
+echo.
+echo     2. 클로드 데스크톱 앱을 다시 켭니다
+echo.
+echo     3. 평소 쓰던 대화창에 이렇게 쳐보세요
+echo.
+echo            DART 접속 확인해줘
+echo.
+echo  ------------------------------------------------
 echo.
 echo   엑셀은 문서 폴더의 GPCM_Reports 안에 저장됩니다.
 echo.
 echo   [주의] 국내에서만 됩니다. DART 가 해외 접속을 막습니다.
+echo.
+echo   설치된 곳: %INSTALLDIR%
 echo.
 pause
 exit /b 0
