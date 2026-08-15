@@ -36,8 +36,17 @@ dcfpeer(peer 선정) → gpcm-mcp(계산) → mydart(보완 리서치)
 
 ## 설치
 
+### 윈도우 — `run_mcp_setup.bat` 더블클릭
+
+저장소 맨 위(`run_kr.bat` 옆)에 있다. 준비 도구·설치·키 저장·Claude 연결까지 한 번에 한다.
+브라우저 앱은 건드리지 않는다.
+
+**설치가 끝나면 창을 껐다 켜야 한다.** 저장한 키는 그 뒤에 열리는 창부터 적용된다.
+
+### 직접 설치할 때
+
 `mcp` 패키지가 요구하는 starlette 버전이 streamlit 과 충돌한다. **앱과 다른 환경**에
-설치해야 한다.
+설치해야 한다. 같은 곳에 넣으면 브라우저 앱이 깨진다.
 
 ```bash
 cd gpcm-mcp
@@ -48,8 +57,8 @@ uv pip install --python .venv-mcp -e .
 DART 인증키를 환경변수로 설정한다. <https://opendart.fss.or.kr> 에서 무료로 발급받는다.
 
 ```bash
-# Windows
-set OPENDART_API_KEY=발급받은키
+# Windows (영구 저장 — 새 창부터 적용)
+setx OPENDART_API_KEY 발급받은키
 
 # macOS / Linux
 export OPENDART_API_KEY=발급받은키
@@ -57,13 +66,26 @@ export OPENDART_API_KEY=발급받은키
 
 **키는 환경변수로만 받는다.** 도구 인자로 받으면 대화 기록과 세션 로그에 영구히 남는다.
 
-### Claude Code 에 등록
+### Claude 에 등록
 
-```bash
-claude mcp add gpcm-kr -- /경로/gpcm-mcp/.venv-mcp/bin/python -m gpcm_mcp.server
+저장소 맨 위에 `.mcp.json` 을 만든다 (`.mcp.json.example` 참고). `run_mcp_setup.bat` 은
+이 파일을 알아서 만든다.
+
+```json
+{
+  "mcpServers": {
+    "gpcm-kr": {
+      "command": "C:/GPCM/gpcm-mcp/.venv-mcp/Scripts/python.exe",
+      "args": ["-m", "gpcm_mcp.server"]
+    }
+  }
+}
 ```
 
-또는 `.mcp.json.example` 을 참고해 `.mcp.json` 을 만든다.
+경로는 본인 PC 것으로 바꾼다. **JSON 에서는 역슬래시 대신 슬래시(`/`)를 쓴다.**
+macOS·Linux 는 `.venv-mcp/bin/python` 이다.
+
+키를 이 파일에 적지 않는다 — 환경변수로 둬야 파일이 새어 나가도 키는 남지 않는다.
 
 ---
 

@@ -1,12 +1,8 @@
 {
   "mcpServers": {
     "gpcm-kr": {
-      "command": ".venv-mcp/bin/python",
-      "args": ["-m", "gpcm_mcp.server"],
-      "env": {
-        "OPENDART_API_KEY": "여기에_발급받은_키",
-        "GPCM_MCP_OUTPUT_DIR": ""
-      }
+      "command": "C:/GPCM/gpcm-mcp/.venv-mcp/Scripts/python.exe",
+      "args": ["-m", "gpcm_mcp.server"]
     }
   }
 }

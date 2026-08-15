@@ -58,3 +58,6 @@ secret/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# 설치 스크립트가 만드는 로컬 설정 (PC 마다 경로가 다름)
+.mcp.json
