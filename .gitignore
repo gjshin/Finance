@@ -61,3 +61,6 @@ __pycache__/
 
 # 설치 스크립트가 만드는 로컬 설정 (PC 마다 경로가 다름)
 .mcp.json
+
+# mcpb 빌드 중간 산출물
+gpcm-mcp/build/
