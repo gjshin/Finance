@@ -144,7 +144,17 @@ echo     2. 클로드 데스크톱 앱을 다시 켭니다
 echo.
 echo     3. 평소 쓰던 대화창에 이렇게 쳐보세요
 echo.
-echo            DART 접속 확인해줘
+echo            gpcm-kr 서버의 latest_filed_period 도구를 실행해줘
+echo.
+echo        이렇게 나오면 제대로 붙은 것입니다.
+echo.
+echo            {'year': 2026, 'quarter': '2Q', ... }
+echo.
+echo        서버 이름을 찍어서 물어보는 이유가 있습니다.
+echo        DART 를 다루는 다른 도구^(mydart, dcfpeer 등^)를 이미 쓰고
+echo        계시면, 그냥 "DART 확인해줘" 라고 하면 Claude 가 그쪽을
+echo        쓸 수 있어서 이게 깔렸는지 알 수가 없습니다.
+echo        latest_filed_period 는 이 서버에만 있는 이름입니다.
 echo.
 echo  ------------------------------------------------
 echo.

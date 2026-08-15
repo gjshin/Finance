@@ -27,7 +27,17 @@ claude mcp add gpcm-kr -- <경로>\.venv-mcp\Scripts\python.exe -m gpcm_mcp.serv
       $p = "$env:APPDATA\Claude\claude_desktop_config.json"
       (Get-Content $p -Raw) -replace '("OPENDART_API_KEY"\s*:\s*")[^"]*', '$1***가림***'
       ```
-- [ ] `check_dart_access` → `reachable: true`, `api_key_configured: true`
+- [ ] **gpcm-kr 이 실제로 붙었는가** — 대화창에 아래를 친다.
+
+      ```
+      gpcm-kr 서버의 latest_filed_period 도구를 실행해줘
+      ```
+
+      **반드시 서버 이름을 찍어서 물어본다.** mydart·dcfpeer 처럼 DART 를 다루는 다른
+      MCP 가 함께 깔려 있으면 그냥 "DART 확인해줘" 는 그쪽으로 갈 수 있어서,
+      이 서버가 붙었는지 판별되지 않는다. `latest_filed_period` 는 여기에만 있다.
+- [ ] `gpcm-kr 서버의 check_dart_access 도구를 실행해줘`
+      → `reachable: true`, `api_key_configured: true`
 
 여기서 막히면 방화벽에서 `opendart.fss.or.kr` 을 열어야 한다.
 
