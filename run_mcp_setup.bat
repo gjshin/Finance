@@ -100,6 +100,11 @@ REM JSON 에 역슬래시를 넣으면 이스케이프가 필요하다. 슬래�
 set "PYPATH=%~dp0gpcm-mcp\.venv-mcp\Scripts\python.exe"
 set "PYPATH=%PYPATH:\=/%"
 
+REM %~dp0 는 끝에 역슬래시가 붙는다. 따옴표 바로 앞의 역슬래시는 따옴표를 먹는
+REM 경우가 있어서, 안내문에 넣기 전에 떼어낸다.
+set "INSTALLDIR=%~dp0"
+if "%INSTALLDIR:~-1%"=="\" set "INSTALLDIR=%INSTALLDIR:~0,-1%"
+
 > ".mcp.json" echo {
 >>".mcp.json" echo   "mcpServers": {
 >>".mcp.json" echo     "gpcm-kr": {
@@ -109,20 +114,50 @@ set "PYPATH=%PYPATH:\=/%"
 >>".mcp.json" echo   }
 >>".mcp.json" echo }
 
-echo        이 폴더에 .mcp.json 을 만들었습니다.
+echo        .mcp.json 을 만들었습니다.
 echo.
 echo  ================================================
 echo    설치가 끝났습니다
 echo  ================================================
 echo.
-echo   [중요] 지금 열려 있는 창들은 저장한 키를 모릅니다.
-echo          Claude 를 쓰시기 전에 한 번 껐다 켜주세요.
+echo   설치된 곳 ^(이 경로를 적어두세요^):
 echo.
-echo   쓰는 방법:
+echo       %INSTALLDIR%
 echo.
-echo     1. 이 폴더에서 Claude Code 를 엽니다
-echo     2. 처음 한 번 "gpcm-kr 서버를 쓰겠냐" 고 물으면 허용합니다
-echo     3. "DART 접속 확인해줘" 라고 먼저 시켜보세요
+echo  ------------------------------------------------
+echo   [중요 1] 창을 껐다 켜야 합니다.
+echo  ------------------------------------------------
+echo.
+echo   지금 열려 있는 창들은 방금 저장한 키를 모릅니다.
+echo   이 창을 닫고, 명령 프롬프트를 새로 여세요.
+echo.
+echo   키가 저장됐는지는 새 창에서 이렇게 확인합니다.
+echo.
+echo       echo %%OPENDART_API_KEY%%
+echo.
+echo   키가 찍히면 정상입니다.
+echo.
+echo  ------------------------------------------------
+echo   [중요 2] 이 PC 에서 도는 Claude 여야 합니다.
+echo  ------------------------------------------------
+echo.
+echo   방금 설치한 것은 이 PC 안에만 있습니다.
+echo   브라우저의 claude.ai 나 클라우드에서 도는 Claude 는
+echo   이 PC 를 볼 수 없어서 도구를 찾지 못합니다.
+echo.
+echo   명령 프롬프트를 새로 열고 아래 두 줄을 그대로 실행하세요.
+echo.
+echo       cd /d "%INSTALLDIR%"
+echo       claude
+echo.
+echo   Claude 가 어디서 도는지 헷갈리면 이렇게 물어보세요.
+echo   "지금 작업 폴더가 어디야?"
+echo   C:\ 로 시작하면 이 PC 입니다. /home/ 으로 시작하면 클라우드라 안 됩니다.
+echo.
+echo  ------------------------------------------------
+echo.
+echo   처음 한 번 "gpcm-kr 서버를 쓰겠냐" 고 물으면 허용하세요.
+echo   그다음 "DART 접속 확인해줘" 라고 시켜보시면 됩니다.
 echo.
 echo   엑셀은 문서 폴더의 GPCM_Reports 안에 저장됩니다.
 echo.

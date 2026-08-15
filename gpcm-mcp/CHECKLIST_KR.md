@@ -17,6 +17,10 @@ set OPENDART_API_KEY=발급받은키
 claude mcp add gpcm-kr -- <경로>\.venv-mcp\Scripts\python.exe -m gpcm_mcp.server
 ```
 
+- [ ] **Claude 가 이 PC 에서 돌고 있는가** — Claude 에게 작업 폴더를 물어 `C:\...` 로
+      시작하면 로컬, `/home/...` 이면 클라우드다. 클라우드면 이 PC 의 서버를 볼 수 없고
+      DART 도 막힌다. (데스크톱 앱에서 열어도 클라우드 세션일 수 있으니 반드시 확인)
+- [ ] 새 창에서 `echo %OPENDART_API_KEY%` → 키가 찍히는가 (설치 직후 창을 껐다 켰는가)
 - [ ] `check_dart_access` → `reachable: true`, `api_key_configured: true`
 
 여기서 막히면 방화벽에서 `opendart.fss.or.kr` 을 열어야 한다.
