@@ -180,12 +180,9 @@ MANIFEST = {
         {'name': 'gpcm_job_status', 'description': '조회 진행 상황과 결과'},
         {'name': 'gpcm_job_cancel', 'description': '조회 중단'},
     ],
-    # 앱이 띄우는 python 은 부트스트랩만 돌린다. 진짜 런타임은 uv 가 준비하므로
-    # 여기 범위는 넉넉해도 된다.
-    'compatibility': {
-        'platforms': ['win32', 'darwin', 'linux'],
-        'runtimes': {'python': '>=3.8,<4.0'},
-    },
+    # compatibility 는 일부러 넣지 않는다. 앱이 이 블록을 그대로 "요구 사항" 으로
+    # 띄우는데, runtimes.python 을 적으면 앱 업데이트까지 요구 목록에 붙어 설치가
+    # 막힌다. 실제로 필요한 파이썬은 uv 가 준비하므로 여기서 선언할 이유가 없다.
 }
 
 
