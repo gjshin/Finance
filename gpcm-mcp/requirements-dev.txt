@@ -1,0 +1,13 @@
+# 테스트용. beautifulsoup4 는 이 패키지가 쓰지 않지만, 패리티 테스트가 불러오는
+# 원본 gpcm_kr.py 가 import 하므로 필요하다 (원본에서도 쓰이지 않는 죽은 import).
+mcp==2.0.0
+pandas==3.0.5
+numpy==2.4.6
+requests==2.33.1
+openpyxl==3.1.5
+OpenDartReader==0.2.2
+finance-datareader==0.9.202
+yfinance==1.5.2
+lxml==6.1.1
+beautifulsoup4==4.15.0
+pytest==8.4.2

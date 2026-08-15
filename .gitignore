@@ -53,3 +53,8 @@ secret/
 
 # MCP 서버 전용 환경
 .venv-mcp/
+
+# 파이썬 캐시
+__pycache__/
+*.py[cod]
+.pytest_cache/

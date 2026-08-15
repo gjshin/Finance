@@ -7,13 +7,23 @@ from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
 from .styles import *  # noqa: F401,F403  (원본이 모듈 전역 스타일에 의존한다)
+from .sheetnames import quote_for_formula, unique_sheet_names
 from .styles import NB, aC, aL, aR, fA, fFRM, fHARD, fS, fT, pSEC1, pSEC2, sc
 
 
 def export_historical_excel(df_summ, df_details, periods_to_fetch):
     output = io.BytesIO()
     wb = Workbook()
-    
+
+    # 회사명 -> 시트명 매핑을 한 번만 만든다. 시트를 만들 때와 Summary 의 SUMIFS
+    # 수식에 박을 때가 반드시 같은 이름이어야 한다. (excel/sheetnames.py 참조)
+    _all_companies = list(dict.fromkeys(
+        list(df_summ['Company'].unique() if not df_summ.empty else [])
+        + list(df_details['Company'].unique() if not df_details.empty else [])
+    ))
+    sheet_of = unique_sheet_names(_all_companies)
+
+
     # ---------------------------------------------------------
     # 1. Summary 시트 생성 (Layout A안: 회사 세로, 연도/지표 가로)
     # ---------------------------------------------------------
@@ -74,7 +84,7 @@ def export_historical_excel(df_summ, df_details, periods_to_fetch):
         for comp in companies:
             df_comp = df_summ[df_summ['Company'] == comp]
             ticker = df_comp['Ticker'].iloc[0] if not df_comp.empty else ""
-            comp_sht = comp[:31] # 엑셀 시트 참조용 이름
+            comp_sht = quote_for_formula(sheet_of[comp]) # 엑셀 시트 참조용 이름
             
             ws_summ.cell(row=r, column=1, value=comp); sc(ws_summ.cell(row=r, column=1), fo=fA, bd=BD)
             ws_summ.cell(row=r, column=2, value=ticker); sc(ws_summ.cell(row=r, column=2), fo=fA, al=aC, bd=BD)
@@ -121,7 +131,7 @@ def export_historical_excel(df_summ, df_details, periods_to_fetch):
     if not df_details.empty:
         companies = df_details['Company'].unique()
         for comp in companies:
-            ws_dtl = wb.create_sheet(title=comp[:31]) # 시트명 제한 31자
+            ws_dtl = wb.create_sheet(title=sheet_of[comp]) # 시트명 제한 31자
             df_c = df_details[df_details['Company'] == comp].copy()
             
             # 헤더 2줄 그리미 (Simplified)

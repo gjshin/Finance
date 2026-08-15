@@ -10,11 +10,32 @@ from openpyxl.utils import get_column_letter
 from openpyxl.workbook.defined_name import DefinedName
 
 from ..constants import SEV_ERROR, SEV_INFO, SEV_WARN
+from ..periods import parse_period
+from ..tax import get_korean_tax_brackets
 from .styles import *  # noqa: F401,F403  (원본이 모듈 전역 스타일에 의존한다)
 from .styles import (BD, NB, NB1, NF_X, NI_FMT, NP, aC, aL, aR,
                      add_gpcm_section_row, ev_fills, fA, fFRM, fH, fHL, fLINK,
                      fMUL, fNOTE, fS, fSEC, fSTAT, fT, pH, pST, pSTAT, pSEC1,
                      pSEC2, pSEC3, pSEC4, pSEC5, pSEC6, pW, sc, style_range)
+
+
+def _tax_rate_formula(cell_ref, base_period_str):
+    """세전이익(억원) 셀을 받아 한계세율을 내는 중첩 IF 수식을 만든다.
+
+    구간표는 파이썬이 WACC 를 계산할 때 쓰는 것과 같은 것을 쓴다 —
+    tax.get_korean_tax_brackets(사업연도).
+    """
+    try:
+        fiscal_year = parse_period(base_period_str)[0]
+    except Exception:
+        fiscal_year = None
+    brackets = get_korean_tax_brackets(fiscal_year)
+
+    *bounded, (_, top_rate) = brackets
+    formula = f'{top_rate}'
+    for limit, rate in reversed(bounded):
+        formula = f'IF({cell_ref}<={limit}, {rate}, {formula})'
+    return '=' + formula
 
 
 def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summary_data, raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name, target_wacc_data, beta_type_input, notes_list, avg_debt_ratio, base_date_str, df_screen, target_periods, quality, peer_selection=None):
@@ -628,7 +649,13 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
         # 컬럼 31: Tax Rate (한국 법인세 한계세율, 사업연도별 세율표, 지방소득세 포함)
         # FY2023~2025: 2억 이하 9.9% / 2~200억 20.9% / 200~3000억 23.1% / 3000억 초과 26.4%
         # FY2026~    : 2억 이하 11.0% / 2~200억 22.0% / 200~3000억 24.2% / 3000억 초과 27.5%
-        ws.cell(r,31).value = f'=IF(AD{r}<=2, 0.099, IF(AD{r}<=200, 0.209, IF(AD{r}<=3000, 0.231, 0.264)))'
+        #
+        # [원본과 다른 곳] gpcm_kr.py 는 여기에 FY2023~2025 세율을 그대로 박아 두었다.
+        # 파이썬 쪽 get_korean_marginal_tax_rate 는 사업연도별 세율표를 쓰므로,
+        # FY2026 이후 기준일로 돌리면 엑셀의 세율 열과 파이썬이 계산한 WACC 의 세율이
+        # 서로 다른 값이 된다 (Unlevered Beta 열도 함께 어긋난다). 기준일의 사업연도에
+        # 맞는 세율표로 수식을 만들어 그 모순을 없앤다.
+        ws.cell(r,31).value = _tax_rate_formula(f'AD{r}', base_period_str)
         sc(ws.cell(r,31), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
 
         # 컬럼 32: D/E Ratio = IBD / (Mkt Cap + 우선주 + NCI)

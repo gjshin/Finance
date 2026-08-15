@@ -116,19 +116,109 @@ def _cells(book):
     return wb.sheetnames, out
 
 
+def _reference_orphans(original, all_multiples, base_period_str, quality):
+    """원본 UI 블록 안에 있는 계산을 그대로 재현한다 (L2549-2676).
+
+    잘라낸 뒤쪽이라 reference.load() 로는 안 딸려온다. 이식본의 orphans.py 가
+    이것과 같은 것을 만드는지 보려면 여기에 원본 코드를 그대로 두어야 한다.
+    """
+    import numpy as np
+
+    base_year, base_qtr = original.parse_period(base_period_str)
+    base_date_display = original.get_base_date_str(base_year, base_qtr)
+    notes_list = [
+        f'• Base Date: {base_period_str} ({base_date_display}) | Unit: 억원 (KRW 100M)',
+        '• 공통: 연결재무제표 작성 시 CFS 우선, 미존재 시 OFS 기준으로 수집',
+        '• PL: 요약 손익계산서에서 매출액/영업이익/당기순이익 3개 계정만 엄격 추출',
+        '• PL Fetch: finstate(요약) → finstate_all(CFS/OFS) fallback',
+        '• Shares: DART(stockTotqySttus) 유통주식수(distb_stock_co) 우선, 미공시 시 DART 과거보고서 fallback',
+        '• EV = Market Cap + 우선주(장부) + IBD − Cash + NCI − NOA',
+        '• Net Debt = IBD − Cash − NOA',
+        '• IBD(Option): CB/EB/BW 등 메자닌은 기본적으로 IBD(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
+        '• NOA(Option): 투자자산/관계기업 등은 기본적으로 NOA(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
+        '• LTM = Current Cumulative + Prior Annual − Prior Same Quarter Cumulative (단, 4Q는 Annual)',
+        '• Beta: 5년 월간 & 2년 주간 수익률 기준 (FinanceDataReader 사용)',
+        '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1',
+        '• D/E Ratio = IBD / (Market Cap + 우선주 + NCI)',
+        '• Debt Ratio (D/V) = IBD / (Market Cap + 우선주 + IBD + NCI)',
+        '• 우선주: BS의 우선주자본금(액면) 기준. 시가총액은 보통주만 반영하므로 자기자본가치에 가산',
+        '• Unlevered Beta = Levered Beta / (1 + (1 - Tax Rate) × D/E Ratio)',
+        '• Tax Rate: 한국 법인세 한계세율 (지방소득세 포함, 세전순이익 기준, 사업연도별 세율표 적용)',
+        '   - FY2023~2025: 2억 이하 9.9% | 2~200억 20.9% | 200~3,000억 23.1% | 3,000억 초과 26.4%',
+        '   - FY2026~    : 2억 이하 11.0% | 2~200억 22.0% | 200~3,000억 24.2% | 3,000억 초과 27.5% (2025년 세법개정)',
+    ]
+
+    df_screen = pd.DataFrame(all_multiples)
+
+    problems = []
+    base_rows = [m for m in all_multiples if m['Period'] == base_period_str]
+    if not base_rows:
+        problems.append(f"기준 기간({base_period_str}) 데이터를 한 건도 수집하지 못했습니다.")
+    for m in base_rows:
+        empty_fields = [k for k in ('Market_Cap', 'Revenue', 'Equity') if not m.get(k)]
+        if empty_fields:
+            problems.append(f"[{m['Company']}] {base_period_str} — {', '.join(empty_fields)} 값이 없습니다.")
+    if problems:
+        for p in problems:
+            quality.add(original.SEV_ERROR, '', '', f'기준기간 {base_period_str}', p)
+
+    if not df_screen.empty:
+        df_screen['EV'] = df_screen['Market_Cap'] + df_screen['Preferred'] + df_screen['IBD'] - df_screen['Cash'] + df_screen['NCI'] - df_screen['NOA']
+        df_screen['EV/EBIT'] = np.where(df_screen['EBIT'] > 0, df_screen['EV'] / df_screen['EBIT'], np.nan)
+        df_screen['PER'] = np.where(df_screen['NI'] > 0, df_screen['Market_Cap'] / df_screen['NI'], np.nan)
+        df_screen['PSR'] = np.where(df_screen['Revenue'] > 0, df_screen['Market_Cap'] / df_screen['Revenue'], np.nan)
+
+    return notes_list, df_screen
+
+
+def test_ui_block_orphans_match(original):
+    """화면 코드 안에 있던 네 토막이 orphans.py 와 같은 것을 만드는가."""
+    import gpcm_mcp.orphans as orphans
+
+    ref_out, _, _ = _run_mode1(original, None)
+    all_multiples, ref_quality = ref_out[8], ref_out[9]
+    base = PERIODS[-1]
+
+    ref_notes, ref_screen = _reference_orphans(
+        original, all_multiples, base, ref_quality)
+
+    port_quality = port_gpcm.QualityLog()
+    port_notes = orphans.build_notes(base)
+    port_screen = orphans.build_screen_frame(all_multiples)
+    port_problems = orphans.diagnose_base_period(all_multiples, base, port_quality)
+
+    assert ref_notes == port_notes, '방법론 주석이 다르다'
+    pd.testing.assert_frame_equal(ref_screen, port_screen)
+    # 원본은 진단 결과를 quality 에 붙이기만 하고 목록을 남기지 않으므로,
+    # 붙은 행으로 비교한다.
+    ref_added = [r for r in ref_quality.rows if r['Item'].startswith('기준기간')]
+    assert [r['Message'] for r in ref_added] == port_problems
+    assert [r['Message'] for r in port_quality.rows] == port_problems
+
+
 def test_mode1_workbook_matches(original):
     ref_out, ref_wacc, ref_adr = _run_mode1(original, None)
     port_out, port_wacc, port_adr = _run_mode1(port_gpcm, port_listings)
 
-    def build(module, out, wacc, adr):
+    import gpcm_mcp.orphans as orphans
+
+    base = PERIODS[-1]
+    ref_notes, ref_screen = _reference_orphans(
+        original, ref_out[8], base, ref_out[9])
+    port_notes = orphans.build_notes(base)
+    port_screen = orphans.build_screen_frame(port_out[8])
+    orphans.diagnose_base_period(port_out[8], base, port_out[9])
+
+    def build(module, out, wacc, adr, notes, screen):
         (bs, pl, mkt, names, summary, year, qtr, date, mult, quality) = out
         return module.export_gpcm_excel(
-            PERIODS[-1], qtr, TICKERS, summary, bs, pl, mkt, names, wacc,
-            '5Y', ['• 메모'], adr, date, pd.DataFrame(mult), PERIODS, quality)
+            base, qtr, TICKERS, summary, bs, pl, mkt, names, wacc,
+            '5Y', notes, adr, date, screen, PERIODS, quality)
 
-    ref_sheets, ref_cells = _cells(build(original, ref_out, ref_wacc, ref_adr))
+    ref_sheets, ref_cells = _cells(
+        build(original, ref_out, ref_wacc, ref_adr, ref_notes, ref_screen))
     port_sheets, port_cells = _cells(
-        build(port_gpcm_book, port_out, port_wacc, port_adr))
+        build(port_gpcm_book, port_out, port_wacc, port_adr, port_notes, port_screen))
 
     assert ref_sheets == port_sheets, '시트 구성이 다르다'
 
