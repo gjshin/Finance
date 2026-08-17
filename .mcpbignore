@@ -1,0 +1,22 @@
+# .mcpb 번들에 넣지 않을 것들.
+# 서버가 돌아가는 데 필요한 것만 담는다:
+#   gpcm_mcp.py, gpcm_kr.py, requirements-mcp.txt,
+#   requirements.txt (requirements-mcp.txt가 -r 로 참조), manifest.json
+.git/
+.github/
+GPCM.py
+run_kr.bat
+run_global.bat
+install_mcp.ps1
+test_gpcm_kr.py
+test_gpcm_kr_quality.py
+test_gpcm_mcp.py
+README.md
+_먼저읽어보세요.md
+.gitattributes
+.uv-cache/
+.uv-tmp/
+*.mcpb
+__pycache__/
+.pytest_cache/
+.devcontainer/

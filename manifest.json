@@ -1,0 +1,65 @@
+{
+  "manifest_version": "0.4",
+  "name": "gpcm-mcp",
+  "display_name": "gpcm (GPCM 밸류에이션)",
+  "version": "0.1.0",
+  "description": "채팅에서 고른 종목코드로 GPCM 밸류에이션 엑셀을 바로 만든다",
+  "long_description": "GPCM Calculator(Streamlit 앱)의 계산 파이프라인을 Claude 데스크톱 대화에서 직접 실행합니다. 피어 스크리닝으로 고른 종목코드를 복사해 앱을 따로 켤 필요 없이, run_gpcm 한 번으로 DART 수집 → WACC → 엑셀까지 만들어 문서\\GPCM 폴더에 저장합니다. 시트 구성(GPCM·Data_Quality·WACC·Beta·BS_Full…)은 앱과 동일합니다. 실행은 백그라운드로 돌고 gpcm_status 로 확인합니다.",
+  "author": {
+    "name": "gjshin"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gjshin/Finance"
+  },
+  "server": {
+    "type": "uv",
+    "entry_point": "gpcm_mcp.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--no-project",
+        "--with-requirements",
+        "${__dirname}/requirements-mcp.txt",
+        "python",
+        "${__dirname}/gpcm_mcp.py"
+      ],
+      "env": {
+        "DART_API_KEY": "${user_config.dart_api_key}",
+        "UV_CACHE_DIR": "${__dirname}/.uv-cache",
+        "TMP": "${__dirname}/.uv-tmp",
+        "TEMP": "${__dirname}/.uv-tmp"
+      }
+    }
+  },
+  "user_config": {
+    "dart_api_key": {
+      "type": "string",
+      "title": "OpenDART 인증키",
+      "description": "mydart에 넣은 것과 같은 키입니다 (40자리). 없으면 https://opendart.fss.or.kr 에서 무료 발급.",
+      "sensitive": true,
+      "required": true
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "win32",
+      "darwin",
+      "linux"
+    ],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  },
+  "keywords": [
+    "valuation",
+    "gpcm",
+    "dart",
+    "wacc",
+    "korea",
+    "밸류에이션",
+    "가치평가"
+  ],
+  "license": "MIT"
+}

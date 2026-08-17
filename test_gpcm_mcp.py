@@ -88,7 +88,10 @@ expect_error('DART 불통이면 시작 전에 거부', lambda: W.run_gpcm(['0059
 M.check_dart_reachable = lambda timeout=10: (True, None)
 
 saved_key = os.environ.pop('DART_API_KEY')
-expect_error('인증키 없으면 거부', lambda: W.run_gpcm(['005930'], '2025.4Q'), 'DART_API_KEY')
+expect_error('인증키 없으면 거부', lambda: W.run_gpcm(['005930'], '2025.4Q'), '인증키가 없습니다')
+# 확장(.mcpb)에서 입력칸이 비면 플레이스홀더 리터럴이 그대로 온다 — 없음으로 취급해야 한다
+os.environ['DART_API_KEY'] = '${user_config.dart_api_key}'
+expect_error('플레이스홀더 리터럴도 없음 취급', lambda: W.run_gpcm(['005930'], '2025.4Q'), '인증키가 없습니다')
 os.environ['DART_API_KEY'] = saved_key
 
 # --- 3. 실행 → 완료 → 엑셀 ----------------------------------------------------

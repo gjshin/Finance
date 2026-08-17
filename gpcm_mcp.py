@@ -66,6 +66,17 @@ _NOTES_STATIC = [
 _PERIOD_RE = re.compile(r"^\d{4}\.[1-4]Q$")
 
 
+def _api_key() -> str:
+    """DART 인증키. 확장(.mcpb)으로 설치할 때 입력칸이 비면 환경변수에
+    `${user_config.dart_api_key}` 리터럴이 그대로 들어온다 — 없음으로 취급한다.
+    (mydart·myacc에서 실제로 겪은 함정과 같은 처방)
+    """
+    value = (os.environ.get("DART_API_KEY") or "").strip()
+    if value.startswith("${") and value.endswith("}"):
+        return ""
+    return value
+
+
 def _build_periods(start_period: str, end_period: str | None = None) -> list[str]:
     """UI 의 기간 조립 로직 그대로: 시작~끝 분기를 "YYYY.NQ" 목록으로 편다."""
     end_period = end_period or start_period
@@ -203,11 +214,11 @@ def run_gpcm(
 
     periods = _build_periods(start_period, end_period)
 
-    api_key = (os.environ.get("DART_API_KEY") or "").strip()
+    api_key = _api_key()
     if not api_key:
         raise RuntimeError(
-            "DART_API_KEY 환경변수가 없습니다. install_mcp.ps1 을 다시 실행해 "
-            "인증키를 등록하세요.")
+            "DART 인증키가 없습니다. 확장 설정에서 인증키를 입력하거나, "
+            "install_mcp.ps1 로 설치했다면 다시 실행해 등록하세요.")
 
     ok, reason = M.check_dart_reachable()
     if not ok:
@@ -297,7 +308,7 @@ def gpcm_status(job_id: str | None = None) -> dict[str, Any]:
 def _selftest() -> int:
     """설치 직후 Claude 없이 연결을 점검한다: install_mcp.ps1 이 부른다."""
     print("gpcm-mcp 자체점검")
-    key = (os.environ.get("DART_API_KEY") or "").strip()
+    key = _api_key()
     print(f"1. DART_API_KEY: {'있음 (' + str(len(key)) + '자)' if key else '없음 ← 실패'}")
     if not key:
         return 1

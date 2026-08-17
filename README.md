@@ -113,17 +113,29 @@
 대화 안에서 GPCM을 바로 실행**할 수 있다. Streamlit 앱과 별개의 통로일 뿐,
 앱은 그대로 쓸 수 있다.
 
-## 등록 (처음 한 번)
+## 등록 (처음 한 번) — 확장 파일로 설치
 
-이 폴더에서:
+`gpcm-mcp.mcpb` 파일을 받은 뒤 (Releases 또는 전달받은 파일):
+
+1. Claude Desktop → **설정 → 확장 프로그램** → 고급 설정에서 **파일로 설치**
+2. `gpcm-mcp.mcpb` 선택
+3. **OpenDART 인증키** 입력 — mydart에 넣은 것과 같은 키(40자리)
+4. 설정 → 개발자(또는 확장 목록)에 `gpcm`이 running이면 성공.
+   첫 기동은 파이썬·패키지를 내려받아 몇 분 걸린다.
+
+mydart·myacc를 설치했던 것과 같은 방식이다. `.mcpb`는 이 폴더에서
+`npx -y @anthropic-ai/mcpb pack . gpcm-mcp.mcpb` 로 다시 만들 수 있다.
+
+### 대안 — 설정 파일 방식
+
+확장 설치가 안 되는 환경이면 이 폴더에서:
 
 ```
 powershell -ExecutionPolicy Bypass -File .\install_mcp.ps1
 ```
 
-- DART 인증키를 물어본다. **mydart를 이미 설치했다면 그 키를 자동으로 찾아 쓴다.**
-- 끝나면 자체점검이 돌아 DART 연결까지 확인해준다 (첫 실행은 몇 분).
-- Claude Desktop을 켜고 설정 → 개발자에 `gpcm`이 보이면 성공.
+(단, Claude Desktop 버전에 따라 이 방식이 목록에 안 뜰 수 있다 — 그때는 위의
+확장 설치를 쓴다.)
 
 ## 사용
 
