@@ -1,4 +1,4 @@
-# GPCM을 Claude 데스크톱에 로컬 MCP로 등록하는 스크립트 (Windows)
+﻿# GPCM을 Claude 데스크톱에 로컬 MCP로 등록하는 스크립트 (Windows)
 #
 #   1) 이 파일이 있는 폴더에서 주소창에 powershell 입력 → 엔터
 #   2) 아래 한 줄 실행

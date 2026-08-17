@@ -5,3 +5,9 @@
 # 사용자는 git이 아니라 Code → Download ZIP으로 받는다. ZIP은 저장된 바이트를
 # 그대로 주므로 그 방식으로는 안 된다. 변환을 끄고 CRLF를 그대로 저장한다.
 *.bat -text
+
+# PowerShell도 같은 이유로 바이트 그대로 저장한다. 추가로 한글 Windows의
+# PowerShell 5는 BOM이 없으면 스크립트를 CP949로 읽어 한글이 깨지고, 깨진
+# 글자가 따옴표를 삼키면 구문 오류로 실행 자체가 안 된다. BOM+CRLF를 파일에
+# 박아 두고 변환을 끈다.
+*.ps1 -text
