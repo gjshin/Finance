@@ -1058,6 +1058,7 @@ ev_fills = {
     'IBD(Option)': PatternFill('solid',fgColor=C_YL), 'NOA(Option)': PatternFill('solid',fgColor=C_NOA),
     'NOA': PatternFill('solid',fgColor=C_NOA), 'NCI': PatternFill('solid',fgColor=C_PB),
     'Equity': PatternFill('solid',fgColor=C_LB), 'PL_HL': PatternFill('solid',fgColor=C_YL),
+    'Preferred': PatternFill('solid',fgColor='D1C4E9'),  # 우선주(장부) — 자기자본가치 가산 항목
 }
 
 aC=Alignment(horizontal='center',vertical='center',wrap_text=True)
@@ -1081,14 +1082,39 @@ def style_range(ws, r1, c1, r2, c2, fo=None, fi=None, al=None, bd=None, nf=None)
 
 
 
+# GPCM 시트 열 배치 — 이 목록의 순서가 곧 열이다. 열을 옮기거나 끼울 때 여기만 고친다.
+# 예전에는 열 번호·열 문자가 45곳에 흩어져 있어, 열 하나를 옮기면 수식 참조가
+# 조용히 어긋났다. 섹션·헤더·수식·통계가 전부 이 목록에서 파생된다.
+GPCM_COL_DEFS = [
+    ('Company', 'Company', 18), ('Ticker', 'Ticker', 10), ('BaseDate', 'Base Date', 11),
+    ('Curr', 'Curr', 6), ('PLSource', 'PL Source', 13),
+    ('Cash', 'Cash', 13), ('IBD', 'IBD', 13), ('NOA', 'NOA', 13), ('NetDebt', 'Net Debt', 13),
+    ('NCI', 'NCI', 12), ('Pref', '우선주(장부)', 13), ('Equity', 'Equity', 13), ('EV', 'EV', 15),
+    ('Revenue', 'Revenue', 13), ('EBIT', 'EBIT', 13), ('DA', 'D&A', 10),
+    ('EBITDA', 'EBITDA', 13), ('NI', 'NI', 13),
+    ('Price', 'Price', 12), ('Shares', 'Shares', 15), ('MktCap', 'Mkt Cap', 15),
+    ('EVEBITDA', 'EV/EBITDA', 12), ('EVEBIT', 'EV/EBIT', 12),
+    ('PER', 'PER', 10), ('PBR', 'PBR', 10), ('PSR', 'PSR', 10),
+    ('B5Raw', 'β 5Y Raw', 10), ('B5Adj', 'β 5Y Adj', 10),
+    ('B2Raw', 'β 2Y Raw', 10), ('B2Adj', 'β 2Y Adj', 10),
+    ('Pretax', 'Pretax Inc', 13), ('TaxRate', 'Tax Rate', 9), ('DERatio', 'D/E Ratio', 10),
+    ('DVRatio', 'Debt Ratio (D/V)', 10), ('UB5', 'Unlevered β 5Y', 12), ('UB2', 'Unlevered β 2Y', 12),
+]
+GPCM_CI = {key: i for i, (key, _, _) in enumerate(GPCM_COL_DEFS, 1)}            # 키 → 열 번호
+GPCM_CL = {key: get_column_letter(i) for key, i in GPCM_CI.items()}             # 키 → 열 문자
+
+
 def add_gpcm_section_row(ws):
     sec_row = 4
+    C = GPCM_CI
     sections = [
-        (1, 2,  "Company Info",       pSEC1), (3, 5,  "Other Info",         pSEC2),
-        (6, 12, "BS & EV Components", pSEC3), (13,17, "PL(Annual & LTM)",   pSEC4),
-        (18,20, "Market Data",        pSEC5), (21,25, "Valuation Multiples", pSEC6),
-        (26,35, "Beta & Risk Analysis", PatternFill('solid', fgColor='6A1B9A')),
-        (36,36, "Equity Adj",           pSEC3),
+        (C['Company'], C['Ticker'],  "Company Info",        pSEC1),
+        (C['BaseDate'], C['PLSource'], "Other Info",        pSEC2),
+        (C['Cash'], C['EV'],         "BS & EV Components",  pSEC3),
+        (C['Revenue'], C['NI'],      "PL(Annual & LTM)",    pSEC4),
+        (C['Price'], C['MktCap'],    "Market Data",         pSEC5),
+        (C['EVEBITDA'], C['PSR'],    "Valuation Multiples", pSEC6),
+        (C['B5Raw'], C['UB2'],       "Beta & Risk Analysis", PatternFill('solid', fgColor='6A1B9A')),
     ]
     for c1, c2, label, fill in sections:
         ws.merge_cells(start_row=sec_row, start_column=c1, end_row=sec_row, end_column=c2)
@@ -1895,7 +1921,7 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
     # Avg Unlevered Beta - 엑셀 수식으로 GPCM 시트 참조
     row_unlevered_beta = r_wacc
     beta_label = "5Y Monthly" if beta_type_input == "5Y" else "2Y Weekly"
-    beta_col = 'AH' if beta_type_input == "5Y" else 'AI'  # AH = 컬럼 34 (Unlevered Beta 5Y), AI = 컬럼 35 (Unlevered Beta 2Y)
+    beta_col = GPCM_CL['UB5'] if beta_type_input == "5Y" else GPCM_CL['UB2']
     ws_wacc.cell(r_wacc, 1, f'Avg Unlevered Beta ({beta_label})')
     ws_wacc.cell(r_wacc, 2).value = f'=GPCM!{beta_col}{mean_row}'
     ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Avg_Unlevered_Beta']:.4f}")
@@ -1909,7 +1935,7 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
     # Avg Debt Ratio - 엑셀 수식으로 GPCM 시트 참조
     row_debt_ratio = r_wacc
     ws_wacc.cell(r_wacc, 1, 'Avg Debt Ratio (D/V)')
-    ws_wacc.cell(r_wacc, 2).value = f'=GPCM!AG{mean_row}'  # 컬럼 33 (AG) = Debt Ratio (D/V)
+    ws_wacc.cell(r_wacc, 2).value = f'=GPCM!{GPCM_CL["DVRatio"]}{mean_row}'
     ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Avg_Debt_Ratio']*100:.1f}%")
     ws_wacc.cell(r_wacc, 4, '피어 평균 자본구조 (GPCM Mean)')
     sc(ws_wacc.cell(r_wacc, 1), fo=fA, bd=BD)
@@ -2066,129 +2092,97 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
     # 시트 순서: GPCM, WACC_Calculation, Beta_Calculation, BS_Full, PL_Data, Market_Cap, LTM_Calc
     wb.move_sheet('WACC_Calculation', offset=-4)  # GPCM 다음 (index 1)
     wb.move_sheet('Beta_Calculation', offset=-3)  # WACC 다음 (index 2)
-    TOTAL_COLS = 36
+    # 열 배치는 모듈 상단 GPCM_COL_DEFS 가 정한다 — 여기서는 이름으로만 참조한다.
+    C, L = GPCM_CI, GPCM_CL
+    TOTAL_COLS = len(GPCM_COL_DEFS)
     ws.merge_cells(f'A1:{get_column_letter(TOTAL_COLS)}1'); ws['A1'] = "GPCM Valuation Summary with Beta Analysis"; sc(ws['A1'], fo=fT)
     ws.merge_cells(f'A2:{get_column_letter(TOTAL_COLS)}2'); ws['A2'] = f"Base: {base_period_str} | Unit: 억원 | EV = MCap + 우선주 + IBD − Cash + NCI − NOA"; sc(ws['A2'], fo=fS)
     add_gpcm_section_row(ws)
-    headers = ['Company','Ticker','Base Date','Curr','PL Source','Cash','IBD','NOA','Net Debt','NCI','Equity','EV','Revenue','EBIT','D&A','EBITDA','NI','Price','Shares','Mkt Cap','EV/EBITDA','EV/EBIT','PER','PBR','PSR','β 5Y Raw','β 5Y Adj','β 2Y Raw','β 2Y Adj','Pretax Inc','Tax Rate','D/E Ratio','Debt Ratio (D/V)','Unlevered β 5Y','Unlevered β 2Y','우선주(장부)']
-    widths = [18, 10, 11, 6, 13, 13, 13, 13, 13, 12, 13, 15, 13, 13, 10, 13, 13, 12, 15, 15, 12, 12, 10, 10, 10, 10, 10, 10, 10, 13, 9, 10, 10, 12, 12, 13]
     header_row = 5
-    for i, (h, w) in enumerate(zip(headers, widths), 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-        sc(ws.cell(header_row, i, h), fo=fH, fi=pH, al=aC, bd=BD)
+    for i, (key, header, width) in enumerate(GPCM_COL_DEFS, 1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+        sc(ws.cell(header_row, i, header), fo=fH, fi=pH, al=aC, bd=BD)
+
+    pMULT = PatternFill('solid', fgColor=C_PB)
+    pBETA = PatternFill('solid', fgColor='E8F5E9')
+    pBETA2 = PatternFill('solid', fgColor='FFF9C4')
+    NF_BETA = '0.00;(0.00);"-"'
+    NF_PCT = '0.0%;(0.0%);"-"'
+
     r = header_row + 1
     for ticker in target_code_list:
         comp_name = ticker_to_name.get(ticker, ticker); bg = pST if (r % 2 == 0) else pW
-        ws.cell(r,1, comp_name); ws.cell(r,2, ticker); ws.cell(r,3, base_period_str); ws.cell(r,4, 'KRW'); ws.cell(r,5, 'LTM')
-        for c in range(1, 6): sc(ws.cell(r,c), fo=fA, fi=bg, al=aL, bd=BD)
-        ws.cell(r,6).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "Cash")'; sc(ws.cell(r,6), fo=fLINK, fi=ev_fills['Cash'], nf=NB, bd=BD)
-        ws.cell(r,7).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "IBD")'; sc(ws.cell(r,7), fo=fLINK, fi=ev_fills['IBD'], nf=NB, bd=BD)
-        ws.cell(r,8).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "NOA")'; sc(ws.cell(r,8), fo=fLINK, fi=ev_fills['NOA'], nf=NB, bd=BD)
-        ws.cell(r,9).value = f'=G{r}-F{r}-H{r}'; sc(ws.cell(r,9), fo=fFRM, fi=bg, nf=NB, bd=BD)
-        ws.cell(r,10).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "NCI")'; sc(ws.cell(r,10), fo=fLINK, fi=ev_fills['NCI'], nf=NB, bd=BD)
-        ws.cell(r,11).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "Equity_Total")'; sc(ws.cell(r,11), fo=fLINK, fi=ev_fills['Equity'], nf=NB, bd=BD)
-        ws.cell(r,12).value = f'=T{r}+AJ{r}+G{r}-F{r}+J{r}-H{r}'; sc(ws.cell(r,12), fo=fFRM, fi=bg, nf=NB, bd=BD)
-        ws.cell(r,13).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "Revenue")'; sc(ws.cell(r,13), fo=fLINK, fi=ev_fills['PL_HL'], nf=NB, bd=BD)
-        ws.cell(r,14).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "EBIT")'; sc(ws.cell(r,14), fo=fLINK, fi=ev_fills['PL_HL'], nf=NB, bd=BD)
-        sc(ws.cell(r,15), fi=PatternFill('solid', fgColor='FFFF00'), nf=NB, bd=BD) # D&A 수기
-        ws.cell(r,16).value = f'=N{r}+O{r}'; sc(ws.cell(r,16), fo=fFRM, fi=bg, nf=NB, bd=BD)
-        ws.cell(r,17).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "NI")'; sc(ws.cell(r,17), fo=fLINK, fi=ev_fills['PL_HL'], nf=NB, bd=BD)
-        ws.cell(r,18).value = f'=SUMIFS(Market_Cap!E:E, Market_Cap!B:B, B{r}, Market_Cap!C:C, C{r})'; sc(ws.cell(r,18), fo=fLINK, nf=NP, bd=BD)
-        ws.cell(r,19).value = f'=SUMIFS(Market_Cap!F:F, Market_Cap!B:B, B{r}, Market_Cap!C:C, C{r})'; sc(ws.cell(r,19), fo=fLINK, nf=NI_FMT, bd=BD)
-        ws.cell(r,20).value = f'=SUMIFS(Market_Cap!G:G, Market_Cap!B:B, B{r}, Market_Cap!C:C, C{r})'; sc(ws.cell(r,20), fo=fLINK, nf=NB1, bd=BD)
-        pMULT = PatternFill('solid', fgColor=C_PB)
-        ws.cell(r,21).value = f'=IF(P{r}>0, L{r}/P{r}, "N/M")'; sc(ws.cell(r,21), fo=fMUL, fi=pMULT, nf=NF_X, bd=BD)
-        ws.cell(r,22).value = f'=IF(N{r}>0, L{r}/N{r}, "N/M")'; sc(ws.cell(r,22), fo=fMUL, fi=pMULT, nf=NF_X, bd=BD)
-        ws.cell(r,23).value = f'=IF(Q{r}>0, T{r}/Q{r}, "N/M")'; sc(ws.cell(r,23), fo=fMUL, fi=pMULT, nf=NF_X, bd=BD)
-        ws.cell(r,24).value = f'=IF(K{r}>0, T{r}/K{r}, "N/M")'; sc(ws.cell(r,24), fo=fMUL, fi=pMULT, nf=NF_X, bd=BD)
-        ws.cell(r,25).value = f'=IF(M{r}>0, T{r}/M{r}, "N/M")'; sc(ws.cell(r,25), fo=fMUL, fi=pMULT, nf=NF_X, bd=BD)
-
-        # Z-AH: Beta & Risk Analysis (26-34번 컬럼)
-        pBETA = PatternFill('solid', fgColor='E8F5E9')
-        pBETA2 = PatternFill('solid', fgColor='FFF9C4')
-        NF_BETA = '0.00;(0.00);"-"'
-        NF_PCT = '0.0%;(0.0%);"-"'
+        ws.cell(r, C['Company'], comp_name); ws.cell(r, C['Ticker'], ticker); ws.cell(r, C['BaseDate'], base_period_str); ws.cell(r, C['Curr'], 'KRW'); ws.cell(r, C['PLSource'], 'LTM')
+        for c in range(C['Company'], C['PLSource'] + 1): sc(ws.cell(r,c), fo=fA, fi=bg, al=aL, bd=BD)
+        ws.cell(r, C['Cash']).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "Cash")'; sc(ws.cell(r, C['Cash']), fo=fLINK, fi=ev_fills['Cash'], nf=NB, bd=BD)
+        ws.cell(r, C['IBD']).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "IBD")'; sc(ws.cell(r, C['IBD']), fo=fLINK, fi=ev_fills['IBD'], nf=NB, bd=BD)
+        ws.cell(r, C['NOA']).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "NOA")'; sc(ws.cell(r, C['NOA']), fo=fLINK, fi=ev_fills['NOA'], nf=NB, bd=BD)
+        ws.cell(r, C['NetDebt']).value = f'={L["IBD"]}{r}-{L["Cash"]}{r}-{L["NOA"]}{r}'; sc(ws.cell(r, C['NetDebt']), fo=fFRM, fi=bg, nf=NB, bd=BD)
+        ws.cell(r, C['NCI']).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "NCI")'; sc(ws.cell(r, C['NCI']), fo=fLINK, fi=ev_fills['NCI'], nf=NB, bd=BD)
+        # 우선주 자본금: 시가총액은 보통주만 반영하므로 자기자본가치에 별도 가산 (EV 구성요소 옆에 둔다)
+        ws.cell(r, C['Pref']).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "Preferred")'; sc(ws.cell(r, C['Pref']), fo=fLINK, fi=ev_fills['Preferred'], nf=NB, bd=BD)
+        ws.cell(r, C['Equity']).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "Equity_Total")'; sc(ws.cell(r, C['Equity']), fo=fLINK, fi=ev_fills['Equity'], nf=NB, bd=BD)
+        ws.cell(r, C['EV']).value = f'={L["MktCap"]}{r}+{L["Pref"]}{r}+{L["IBD"]}{r}-{L["Cash"]}{r}+{L["NCI"]}{r}-{L["NOA"]}{r}'; sc(ws.cell(r, C['EV']), fo=fFRM, fi=bg, nf=NB, bd=BD)
+        ws.cell(r, C['Revenue']).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "Revenue")'; sc(ws.cell(r, C['Revenue']), fo=fLINK, fi=ev_fills['PL_HL'], nf=NB, bd=BD)
+        ws.cell(r, C['EBIT']).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "EBIT")'; sc(ws.cell(r, C['EBIT']), fo=fLINK, fi=ev_fills['PL_HL'], nf=NB, bd=BD)
+        sc(ws.cell(r, C['DA']), fi=PatternFill('solid', fgColor='FFFF00'), nf=NB, bd=BD) # D&A 수기
+        ws.cell(r, C['EBITDA']).value = f'={L["EBIT"]}{r}+{L["DA"]}{r}'; sc(ws.cell(r, C['EBITDA']), fo=fFRM, fi=bg, nf=NB, bd=BD)
+        ws.cell(r, C['NI']).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "NI")'; sc(ws.cell(r, C['NI']), fo=fLINK, fi=ev_fills['PL_HL'], nf=NB, bd=BD)
+        ws.cell(r, C['Price']).value = f'=SUMIFS(Market_Cap!E:E, Market_Cap!B:B, B{r}, Market_Cap!C:C, C{r})'; sc(ws.cell(r, C['Price']), fo=fLINK, nf=NP, bd=BD)
+        ws.cell(r, C['Shares']).value = f'=SUMIFS(Market_Cap!F:F, Market_Cap!B:B, B{r}, Market_Cap!C:C, C{r})'; sc(ws.cell(r, C['Shares']), fo=fLINK, nf=NI_FMT, bd=BD)
+        ws.cell(r, C['MktCap']).value = f'=SUMIFS(Market_Cap!G:G, Market_Cap!B:B, B{r}, Market_Cap!C:C, C{r})'; sc(ws.cell(r, C['MktCap']), fo=fLINK, nf=NB1, bd=BD)
+        ws.cell(r, C['EVEBITDA']).value = f'=IF({L["EBITDA"]}{r}>0, {L["EV"]}{r}/{L["EBITDA"]}{r}, "N/M")'; sc(ws.cell(r, C['EVEBITDA']), fo=fMUL, fi=pMULT, nf=NF_X, bd=BD)
+        ws.cell(r, C['EVEBIT']).value = f'=IF({L["EBIT"]}{r}>0, {L["EV"]}{r}/{L["EBIT"]}{r}, "N/M")'; sc(ws.cell(r, C['EVEBIT']), fo=fMUL, fi=pMULT, nf=NF_X, bd=BD)
+        ws.cell(r, C['PER']).value = f'=IF({L["NI"]}{r}>0, {L["MktCap"]}{r}/{L["NI"]}{r}, "N/M")'; sc(ws.cell(r, C['PER']), fo=fMUL, fi=pMULT, nf=NF_X, bd=BD)
+        ws.cell(r, C['PBR']).value = f'=IF({L["Equity"]}{r}>0, {L["MktCap"]}{r}/{L["Equity"]}{r}, "N/M")'; sc(ws.cell(r, C['PBR']), fo=fMUL, fi=pMULT, nf=NF_X, bd=BD)
+        ws.cell(r, C['PSR']).value = f'=IF({L["Revenue"]}{r}>0, {L["MktCap"]}{r}/{L["Revenue"]}{r}, "N/M")'; sc(ws.cell(r, C['PSR']), fo=fMUL, fi=pMULT, nf=NF_X, bd=BD)
 
         # Beta 값은 Beta_Calculation 시트에서 참조
         beta_rows = beta_result_rows.get(ticker, (None, None, None, None))
-        if beta_rows[0]:  # Raw 5Y
-            ws.cell(r,26).value = f'=Beta_Calculation!B{beta_rows[0]}'
-            sc(ws.cell(r,26), fo=fLINK, fi=pBETA, al=aR, nf=NF_BETA, bd=BD)
-        else:
-            ws.cell(r,26, ''); sc(ws.cell(r,26), fo=fA, fi=pBETA, al=aR, nf=NF_BETA, bd=BD)
+        for key, row_idx, fill in (('B5Raw', beta_rows[0], pBETA), ('B5Adj', beta_rows[1], pBETA),
+                                   ('B2Raw', beta_rows[2], pBETA2), ('B2Adj', beta_rows[3], pBETA2)):
+            if row_idx:
+                ws.cell(r, C[key]).value = f'=Beta_Calculation!B{row_idx}'
+                sc(ws.cell(r, C[key]), fo=fLINK, fi=fill, al=aR, nf=NF_BETA, bd=BD)
+            else:
+                ws.cell(r, C[key], ''); sc(ws.cell(r, C[key]), fo=fA, fi=fill, al=aR, nf=NF_BETA, bd=BD)
 
-        if beta_rows[1]:  # Adj 5Y
-            ws.cell(r,27).value = f'=Beta_Calculation!B{beta_rows[1]}'
-            sc(ws.cell(r,27), fo=fLINK, fi=pBETA, al=aR, nf=NF_BETA, bd=BD)
-        else:
-            ws.cell(r,27, ''); sc(ws.cell(r,27), fo=fA, fi=pBETA, al=aR, nf=NF_BETA, bd=BD)
+        ws.cell(r, C['Pretax']).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "Pretax_Income")'; sc(ws.cell(r, C['Pretax']), fo=fLINK, fi=bg, al=aR, nf=NB, bd=BD)
 
-        if beta_rows[2]:  # Raw 2Y
-            ws.cell(r,28).value = f'=Beta_Calculation!B{beta_rows[2]}'
-            sc(ws.cell(r,28), fo=fLINK, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
-        else:
-            ws.cell(r,28, ''); sc(ws.cell(r,28), fo=fA, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
-
-        if beta_rows[3]:  # Adj 2Y
-            ws.cell(r,29).value = f'=Beta_Calculation!B{beta_rows[3]}'
-            sc(ws.cell(r,29), fo=fLINK, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
-        else:
-            ws.cell(r,29, ''); sc(ws.cell(r,29), fo=fA, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
-
-        # 컬럼 30: Pretax Inc (LTM_Calc에서 참조)
-        ws.cell(r,30).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "Pretax_Income")'; sc(ws.cell(r,30), fo=fLINK, fi=bg, al=aR, nf=NB, bd=BD)
-
-        # 컬럼 31: Tax Rate (한국 법인세 한계세율, 사업연도별 세율표, 지방소득세 포함)
+        # Tax Rate (한국 법인세 한계세율, 사업연도별 세율표, 지방소득세 포함)
         # FY2023~2025: 2억 이하 9.9% / 2~200억 20.9% / 200~3000억 23.1% / 3000억 초과 26.4%
         # FY2026~    : 2억 이하 11.0% / 2~200억 22.0% / 200~3000억 24.2% / 3000억 초과 27.5%
-        ws.cell(r,31).value = f'=IF(AD{r}<=2, 0.099, IF(AD{r}<=200, 0.209, IF(AD{r}<=3000, 0.231, 0.264)))'
-        sc(ws.cell(r,31), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
+        ws.cell(r, C['TaxRate']).value = f'=IF({L["Pretax"]}{r}<=2, 0.099, IF({L["Pretax"]}{r}<=200, 0.209, IF({L["Pretax"]}{r}<=3000, 0.231, 0.264)))'
+        sc(ws.cell(r, C['TaxRate']), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
 
-        # 컬럼 32: D/E Ratio = IBD / (Mkt Cap + 우선주 + NCI)
-        ws.cell(r,32).value = f'=IF(T{r}+AJ{r}+J{r}>0, G{r}/(T{r}+AJ{r}+J{r}), 0)'; sc(ws.cell(r,32), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
+        # D/E Ratio = IBD / (Mkt Cap + 우선주 + NCI)
+        ws.cell(r, C['DERatio']).value = f'=IF({L["MktCap"]}{r}+{L["Pref"]}{r}+{L["NCI"]}{r}>0, {L["IBD"]}{r}/({L["MktCap"]}{r}+{L["Pref"]}{r}+{L["NCI"]}{r}), 0)'; sc(ws.cell(r, C['DERatio']), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
 
-        # 컬럼 33: Debt Ratio (D/V) = IBD / (Mkt Cap + 우선주 + IBD + NCI)
-        ws.cell(r,33).value = f'=IF(T{r}+AJ{r}+G{r}+J{r}>0, G{r}/(T{r}+AJ{r}+G{r}+J{r}), 0)'; sc(ws.cell(r,33), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
+        # Debt Ratio (D/V) = IBD / (Mkt Cap + 우선주 + IBD + NCI)
+        ws.cell(r, C['DVRatio']).value = f'=IF({L["MktCap"]}{r}+{L["Pref"]}{r}+{L["IBD"]}{r}+{L["NCI"]}{r}>0, {L["IBD"]}{r}/({L["MktCap"]}{r}+{L["Pref"]}{r}+{L["IBD"]}{r}+{L["NCI"]}{r}), 0)'; sc(ws.cell(r, C['DVRatio']), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
 
-        # 컬럼 34: Unlevered Beta 5Y = β 5Y Adj / (1 + (1 - Tax Rate) × D/E Ratio)
-        # 컬럼 27 (AA) = β 5Y Adj, 컬럼 31 (AE) = Tax Rate, 컬럼 32 (AF) = D/E Ratio
-        ws.cell(r,34).value = f'=IF(AA{r}>0, AA{r}/(1+(1-AE{r})*AF{r}), "")'; sc(ws.cell(r,34), fo=fFRM, fi=pBETA, al=aR, nf=NF_BETA, bd=BD)
-
-        # 컬럼 35: Unlevered Beta 2Y = β 2Y Adj / (1 + (1 - Tax Rate) × D/E Ratio)
-        # 컬럼 29 (AC) = β 2Y Adj, 컬럼 31 (AE) = Tax Rate, 컬럼 32 (AF) = D/E Ratio
-        ws.cell(r,35).value = f'=IF(AC{r}>0, AC{r}/(1+(1-AE{r})*AF{r}), "")'; sc(ws.cell(r,35), fo=fFRM, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
-
-        # 컬럼 36: 우선주 자본금 (시가총액은 보통주만 반영하므로 자기자본가치에 별도 가산)
-        ws.cell(r,36).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "Preferred")'
-        sc(ws.cell(r,36), fo=fLINK, fi=ev_fills['Equity'], nf=NB, bd=BD)
+        # Unlevered Beta = Adj Beta / (1 + (1 - Tax Rate) × D/E Ratio)
+        ws.cell(r, C['UB5']).value = f'=IF({L["B5Adj"]}{r}>0, {L["B5Adj"]}{r}/(1+(1-{L["TaxRate"]}{r})*{L["DERatio"]}{r}), "")'; sc(ws.cell(r, C['UB5']), fo=fFRM, fi=pBETA, al=aR, nf=NF_BETA, bd=BD)
+        ws.cell(r, C['UB2']).value = f'=IF({L["B2Adj"]}{r}>0, {L["B2Adj"]}{r}/(1+(1-{L["TaxRate"]}{r})*{L["DERatio"]}{r}), "")'; sc(ws.cell(r, C['UB2']), fo=fFRM, fi=pBETA2, al=aR, nf=NF_BETA, bd=BD)
         r += 1
     r_end = r - 1; r += 1
+    beta_stat_cols = {C[k] for k in ('B5Raw', 'B5Adj', 'B2Raw', 'B2Adj', 'UB5', 'UB2')}
+    pct_stat_cols = {C[k] for k in ('TaxRate', 'DERatio', 'DVRatio')}
     for stat, fn in [('Mean','AVERAGE'), ('Median','MEDIAN'), ('Max','MAX'), ('Min','MIN')]:
-        ws.cell(r, 20, stat); sc(ws.cell(r,20), fo=fSTAT, fi=pSTAT, al=aC, bd=BD)
-        # Valuation Multiples (21-25)
-        for c in range(21, 26):
+        ws.cell(r, C['MktCap'], stat); sc(ws.cell(r, C['MktCap']), fo=fSTAT, fi=pSTAT, al=aC, bd=BD)
+        for c in range(C['EVEBITDA'], C['PSR'] + 1):        # Valuation Multiples
             col = get_column_letter(c)
             ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "N/M")'
             sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NF_X, bd=BD)
-        # Beta & Risk (26-35)
-        for c in range(26, 36):
+        for c in range(C['B5Raw'], C['UB2'] + 1):           # Beta & Risk
             col = get_column_letter(c)
-            if c in [26, 27, 28, 29, 34, 35]:  # Beta 컬럼 (34=Unlevered β 5Y, 35=Unlevered β 2Y)
-                ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "")'
-                sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NF_BETA, bd=BD)
-            elif c == 31:  # Tax Rate
-                ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "")'
-                sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NF_PCT, bd=BD)
-            elif c in [32, 33]:  # D/E Ratio, Debt Ratio (D/V)
-                ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "")'
-                sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NF_PCT, bd=BD)
-            else:  # Pretax Inc (30)
-                ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "")'
-                sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=NB, bd=BD)
+            nf = NF_BETA if c in beta_stat_cols else (NF_PCT if c in pct_stat_cols else NB)
+            ws.cell(r, c).value = f'=IFERROR({fn}({col}{header_row+1}:{col}{r_end}), "")'
+            sc(ws.cell(r,c), fo=fSTAT, fi=pSTAT, nf=nf, bd=BD)
         r += 1
     r += 2
     for note in notes_list: ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=TOTAL_COLS); sc(ws.cell(r, 1, note), fo=fNOTE); r += 1
-    ws.freeze_panes = f"F{header_row+1}"  # Cash 컬럼부터 스크롤
+    ws.freeze_panes = f"{GPCM_CL['Cash']}{header_row+1}"  # Cash 컬럼부터 스크롤
 
     # === Multiples_Trend Sheet generation ===
     ws_trend = wb.create_sheet('Multiples_Trend')

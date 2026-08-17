@@ -118,6 +118,24 @@ check('GPCM·Data_Quality 시트 존재', {'GPCM', 'Data_Quality'} <= set(wb.she
 check('Notes 의 Base Date 가 요청 기간', any(
     '2024.1Q' in str(c.value) for row in wb['GPCM'].iter_rows() for c in row if c.value))
 
+# --- 3-b. GPCM 시트 열 배치 (우선주를 EV 구성요소로 옮긴 뒤의 등가성) ----------
+gp = wb['GPCM']
+hdr = [c.value for c in gp[5][:len(M.GPCM_COL_DEFS)]]
+check('헤더 순서가 열 정의와 일치', hdr == [h for _, h, _ in M.GPCM_COL_DEFS], hdr[:14])
+check('우선주(장부)가 11열(K) — NCI와 Equity 사이', hdr[10] == '우선주(장부)', hdr[8:13])
+check('BS & EV Components 섹션이 F4:M4', 'F4:M4' in {str(rng) for rng in gp.merged_cells.ranges}
+      and gp.cell(4, 6).value == 'BS & EV Components')
+check('Equity Adj 섹션은 사라짐', all(gp.cell(4, c).value != 'Equity Adj' for c in range(1, 40)))
+check('EV 수식이 새 열 문자를 참조 (U=MktCap, K=우선주)',
+      gp.cell(6, 13).value == '=U6+K6+G6-F6+J6-H6', gp.cell(6, 13).value)
+check('우선주 셀은 BS_Full의 Preferred 를 집계', 'Preferred' in (gp.cell(6, 11).value or ''), gp.cell(6, 11).value)
+check('D/E 수식이 우선주 새 위치(K) 참조', 'K6' in (gp.cell(6, 33).value or ''), gp.cell(6, 33).value)
+wacc_refs = {c.value for row in wb['WACC_Calculation'].iter_rows() for c in row
+             if isinstance(c.value, str) and c.value.startswith('=GPCM!')}
+check('WACC 시트의 GPCM 참조가 이동된 열(AI·AH)로', 
+      any('=GPCM!AI' in v for v in wacc_refs) and any('=GPCM!AH' in v for v in wacc_refs), wacc_refs)
+check('Cash 고정틀 유지', gp.freeze_panes == 'F6', gp.freeze_panes)
+
 check('job_id 생략 시 최근 작업', W.gpcm_status()['job_id'] == r['job_id'])
 expect_error('없는 job_id', lambda: W.gpcm_status('job-999'), '찾을 수 없습니다')
 
@@ -188,6 +206,33 @@ W._roster_memo.update(at=0.0, df=None)
 M.get_krx_industry_listing = lambda: pd.DataFrame()
 expect_error('KRX 실패는 명확한 에러 (조용한 폴백 없음)', lambda: W.list_krx_companies('반도체'), 'KRX')
 W._roster_memo.update(at=0.0, df=None)
+
+# --- 8. 거래정지 이력 점검 (fdr 응답을 흉내 내 검증) -----------------------------
+days = pd.bdate_range('2024-01-01', periods=100)
+def _px(idx): 
+    return pd.DataFrame({'Close': [100.0]*len(idx)}, index=idx)
+
+class FakeFdr:
+    def DataReader(self, symbol, start=None, end=None):
+        if symbol == 'KS11':                 return _px(days)
+        if symbol == '000001':               return _px(days)                          # 정상
+        if symbol == '000002':               return _px(days[:40].append(days[50:]))   # 중간 10거래일 결측
+        if symbol == '000003':               return _px(days[50:])                     # 늦은 상장
+        if symbol == '000004':               return _px(days[:-6])                     # 최근 6거래일 결측
+        if symbol == '000005':               return pd.DataFrame()                     # 조회 실패
+        raise RuntimeError(symbol)
+
+M.fdr = FakeFdr()
+g = W.check_trading_gaps(['000001', '000002', '000003', '000004', '000005'])
+by = {x['code']: x for x in g['results']}
+check('정상 종목은 무표시', by['000001']['flag'] is False and not by['000001']['suspectedHalts'])
+check('중간 10거래일 결측을 정지 의심으로 잡는다',
+      by['000002']['flag'] and by['000002']['suspectedHalts'][0]['tradingDays'] == 10, by['000002'])
+check('늦은 상장은 정지로 오인하지 않는다', by['000003']['flag'] is False
+      and by['000003']['observedFrom'] == days[50].strftime('%Y-%m-%d'), by['000003'])
+check('최근 결측은 현재 정지 중으로 표시', by['000004']['currentlySuspended'] is True, by['000004'])
+check('조회 실패는 failed 로 드러난다', g.get('failed') == ['000005'], g.get('failed'))
+check('자동 배제 금지 안내가 실린다', '자동 배제' in g['meta']['note'])
 
 print()
 print(f"잘못된 항목 {len(fails)}건")

@@ -203,6 +203,19 @@ def run_gpcm(
 ) -> dict[str, Any]:
     """GPCM 밸류에이션을 백그라운드로 실행해 엑셀 파일을 만든다.
 
+    [호출 전 확인 — 반드시 지킬 것]
+    사용자가 WACC 파라미터를 직접 말하지 않았다면, 호출하기 전에 아래 6개를
+    **하나씩 개별 질문**해 확정받는다. 각 질문에 기본값을 제시하고, 사용자가
+    "기본값" 또는 값으로 답하면 그것을 쓴다. 기본값을 임의로 적용하지 않는다.
+      1. 무위험이자율 rf (기본 3.3%)
+      2. 시장위험프리미엄 mrp (기본 8.0%)
+      3. 사이즈 프리미엄 size_premium — 시총 구간을 안내하며 묻는다
+         (2천억 미만 4.02% / 2천억~2조 1.37% / 2조 초과 -0.36% / 미적용 0)
+      4. 세전 타인자본비용 kd_pretax (기본 3.5%)
+      5. 타겟 법인세율 tax_rate (기본 26.4%)
+      6. 베타 종류 beta_type — 5Y(5년 월간) 또는 2Y(2년 주간)
+    사용자가 "전부 기본값으로"라고 하면 개별 질문을 생략해도 된다.
+
     티커당 수 초~수십 초 걸리므로 이 도구는 시작만 하고 바로 돌아온다.
     진행과 결과는 gpcm_status 로 확인한다. **결과를 사용자에게 전할 때는
     파일 경로와 함께 Data_Quality 요약을 반드시 같이 전한다.**
@@ -412,6 +425,103 @@ def list_krx_companies(query: str = "", december_only: bool = False) -> dict[str
             "fiscalMonthNot12": bool(settle) and "12" not in settle,
         })
     return {"meta": {**meta, "query": q, "count": len(companies)}, "companies": companies}
+
+
+# 지수 거래일 기준 연속 결측이 이 이상이면 거래정지 의심 구간으로 본다
+GAP_MIN_TRADING_DAYS = 5
+
+
+@mcp.tool()
+def check_trading_gaps(tickers: list[str], years: int = 5) -> dict[str, Any]:
+    """베타 관측기간 중 거래정지 이력이 있는지 종목별로 점검한다 — 판단 재료다.
+
+    KOSPI 지수 거래일을 기준으로, 종목 시세가 연속 5거래일 이상 비어 있는
+    구간을 거래정지 의심으로 보고한다. 거래정지 구간이 있으면 그 기간의
+    수익률이 빠져 베타 신뢰도가 떨어지므로, 피어 선정 때 표시하고 배제 여부는
+    사용자가 판단한다. **자동으로 배제하지 않는다.**
+
+    상장이 관측 창보다 늦은 회사(신규상장)는 정지와 구분해 observedFrom 으로
+    표시한다. 결측은 거래정지 외에 데이터 누락일 수도 있으니, 이력이 나온
+    회사는 공시(매매거래정지)로 확인하라고 안내한다.
+
+    Args:
+        tickers: 종목코드 6자리 목록. 최대 30개.
+        years: 점검 창(년). 기본 5 — Weekly-2Y만 쓰면 2로 줄여도 된다.
+    """
+    from datetime import timedelta
+
+    codes = [t.strip() for t in tickers if t and t.strip()]
+    if not codes:
+        raise RuntimeError("tickers가 비어 있습니다.")
+    bad = [t for t in codes if not re.match(r"^\d{6}$", t)]
+    if bad:
+        raise RuntimeError(f"종목코드는 6자리 숫자입니다: {', '.join(bad)}")
+    if len(codes) > MAX_TICKERS:
+        raise RuntimeError(f"{len(codes)}개는 너무 많습니다(상한 {MAX_TICKERS}).")
+
+    m = _load()
+    end = datetime.now()
+    start = end - timedelta(days=365 * max(1, int(years)) + 20)
+
+    market = m.fdr.DataReader("KS11", start, end)
+    if market is None or market.empty:
+        raise RuntimeError("KOSPI 지수 시계열을 받지 못해 거래일 기준을 만들 수 없습니다.")
+    market_days = sorted(d.normalize() for d in market.index)
+
+    results: list[dict[str, Any]] = []
+    failed: list[str] = []
+    for code in codes:
+        try:
+            px = m.fdr.DataReader(code, start, end)
+        except Exception:
+            px = None
+        if px is None or px.empty:
+            failed.append(code)
+            continue
+        stock_days = {d.normalize() for d in px.index}
+        first = min(stock_days)
+
+        gaps: list[dict[str, Any]] = []
+        run: list[Any] = []
+        for d in market_days:
+            if d < first:
+                continue  # 상장 전 — 정지가 아니다
+            if d in stock_days:
+                if len(run) >= GAP_MIN_TRADING_DAYS:
+                    gaps.append({"from": run[0].strftime("%Y-%m-%d"),
+                                 "to": run[-1].strftime("%Y-%m-%d"),
+                                 "tradingDays": len(run)})
+                run = []
+            else:
+                run.append(d)
+        currently_suspended = False
+        if len(run) >= GAP_MIN_TRADING_DAYS:  # 창 끝까지 이어진 결측 = 현재 정지 중
+            gaps.append({"from": run[0].strftime("%Y-%m-%d"),
+                         "to": run[-1].strftime("%Y-%m-%d"),
+                         "tradingDays": len(run)})
+            currently_suspended = True
+
+        results.append({
+            "code": code,
+            "observedFrom": first.strftime("%Y-%m-%d"),
+            "suspectedHalts": gaps,
+            "currentlySuspended": currently_suspended,
+            "flag": bool(gaps),
+        })
+
+    output: dict[str, Any] = {
+        "meta": {
+            "windowYears": int(years),
+            "threshold": f"KOSPI 지수 거래일 기준 연속 {GAP_MIN_TRADING_DAYS}일 이상 결측",
+            "note": "판단 재료다 — 자동 배제하지 말고 사용자에게 구간과 함께 표시하라. "
+                    "결측은 데이터 누락일 수도 있으니, 이력이 나온 회사는 매매거래정지 "
+                    "공시로 교차 확인하라.",
+        },
+        "results": results,
+    }
+    if failed:
+        output["failed"] = failed
+    return output
 
 
 def _selftest() -> int:
