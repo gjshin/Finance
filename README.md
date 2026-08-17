@@ -105,6 +105,43 @@
 
 ---
 
+---
+
+# Claude 데스크톱에서 GPCM 실행하기 — `install_mcp.ps1`
+
+채팅으로 피어를 고른 뒤 종목코드를 복사해 앱을 따로 켜는 대신, **Claude 데스크톱
+대화 안에서 GPCM을 바로 실행**할 수 있다. Streamlit 앱과 별개의 통로일 뿐,
+앱은 그대로 쓸 수 있다.
+
+## 등록 (처음 한 번)
+
+이 폴더에서:
+
+```
+powershell -ExecutionPolicy Bypass -File .\install_mcp.ps1
+```
+
+- DART 인증키를 물어본다. **mydart를 이미 설치했다면 그 키를 자동으로 찾아 쓴다.**
+- 끝나면 자체점검이 돌아 DART 연결까지 확인해준다 (첫 실행은 몇 분).
+- Claude Desktop을 켜고 설정 → 개발자에 `gpcm`이 보이면 성공.
+
+## 사용
+
+대화에서:
+
+```
+run_gpcm으로 005930, 000660, 042700 돌려줘. 기간은 2025.4Q
+```
+
+- 실행은 백그라운드로 돌고, 진행·결과는 Claude가 `gpcm_status`로 확인해 알려준다.
+- 결과 엑셀은 **문서\GPCM** 폴더에 저장된다. 시트 구성은 앱과 동일하다
+  (GPCM·Data_Quality·WACC·Beta·BS_Full·PL_Data·Market_Cap·LTM_Calc…).
+- **숫자를 쓰기 전에 Data_Quality 시트부터** — 앱과 같은 원칙이다.
+
+## 폴더를 옮기면
+
+등록된 경로가 어긋나므로 `install_mcp.ps1`을 새 위치에서 다시 실행한다.
+
 # 해외 상장사 — `run_global.bat`
 
 **인증키가 필요 없다.** Yahoo Finance에서 바로 받아온다.
@@ -227,7 +264,9 @@ Cash (현금성자산)         NCI (비지배지분)       발행주식수
 | `run_global.bat` | **해외 상장사 — 이것만 더블클릭** |
 | `gpcm_kr.py` / `GPCM.py` | 각 앱 본체 |
 | `requirements.txt` | 필요한 라이브러리 목록 — 실행 파일이 알아서 쓴다 |
-| `test_gpcm_kr.py` | 개발자용 검증 코드 |
+| `install_mcp.ps1` | **Claude 데스크톱에 GPCM 등록** — 위 절 참고 |
+| `gpcm_mcp.py` / `requirements-mcp.txt` | 데스크톱 연동 본체 — 직접 실행할 일 없음 |
+| `test_gpcm_kr.py` 등 `test_*.py` | 개발자용 검증 코드 |
 
 ---
 
@@ -237,6 +276,7 @@ Cash (현금성자산)         NCI (비지배지분)       발행주식수
 uv run --no-project --with-requirements requirements.txt python -m streamlit run gpcm_kr.py
 uv run --no-project --with-requirements requirements.txt python -m streamlit run GPCM.py
 uv run --no-project --with-requirements requirements.txt --with pytest python -m pytest test_gpcm_kr.py
+uv run --no-project --with-requirements requirements-mcp.txt python test_gpcm_mcp.py
 ```
 
 `requirements.txt`는 **버전을 고정해 두었다.** 고정하지 않으면 재실행 때마다 최신 버전이

@@ -1,0 +1,4 @@
+# gpcm_mcp.py (Claude 데스크톱용 로컬 MCP 서버) 실행에 쓰는 목록.
+# 앱 의존성 전체에 MCP SDK만 더한다 — Streamlit 배포용 requirements.txt는 건드리지 않는다.
+-r requirements.txt
+mcp>=2.0.0
