@@ -29,19 +29,29 @@ foreach ($f in @("gpcm_mcp.py", "gpcm_kr.py", "requirements-mcp.txt")) {
 }
 Ok "gpcm_mcp.py / gpcm_kr.py / requirements-mcp.txt"
 
-# --- 1. Microsoft Store 버전 Claude 확인 ---------------------------------------
+# --- 1. Claude 버전 확인 --------------------------------------------------------
 # Store 버전은 설정 파일을 격리된 폴더에서 읽어, 표준 위치에 넣어도 인식하지 못한다.
+# 단, 정식 버전이 함께 있으면 등록은 정식 버전에 적용되므로 막지 않고 경고만 한다.
 Step "Claude 버전 확인"
+$official = Test-Path (Join-Path $env:LOCALAPPDATA "AnthropicClaude")
+$store = $false
 if (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue) {
-    if (Get-AppxPackage *Claude* -ErrorAction SilentlyContinue) {
-        Warn "Microsoft Store 버전 Claude가 설치돼 있습니다."
-        Warn "이 상태로는 설정을 넣어도 Claude가 읽지 못합니다. 먼저 아래를 실행하세요:"
-        Warn "    Get-AppxPackage *Claude* | Remove-AppxPackage"
-        Warn "그다음 https://claude.ai/download 에서 정식 버전을 설치하고 다시 실행하세요."
-        exit 1
-    }
+    $store = [bool](Get-AppxPackage *Claude* -ErrorAction SilentlyContinue)
 }
-Ok "Store 버전 없음"
+if ($store -and -not $official) {
+    Warn "Microsoft Store 버전 Claude만 설치돼 있습니다."
+    Warn "이 상태로는 설정을 넣어도 Claude가 읽지 못합니다. 먼저 아래를 실행하세요:"
+    Warn "    Get-AppxPackage *Claude* | Remove-AppxPackage"
+    Warn "그다음 https://claude.ai/download 에서 정식 버전을 설치하고 다시 실행하세요."
+    exit 1
+}
+if ($store -and $official) {
+    Warn "정식 버전과 Microsoft Store 버전이 함께 설치돼 있습니다. 등록은 정식 버전에 적용됩니다."
+    Warn "혼동을 없애려면 Store 버전을 지우세요:  Get-AppxPackage *Claude* | Remove-AppxPackage"
+    Ok "정식 버전 확인 — 계속 진행합니다"
+} else {
+    Ok "정식 버전 확인"
+}
 
 # --- 2. 인증키 -----------------------------------------------------------------
 # mydart나 기존 gpcm 설정에 이미 있으면 그대로 쓴다. 재입력하지 않아도 된다.
