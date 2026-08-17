@@ -30,27 +30,35 @@ foreach ($f in @("gpcm_mcp.py", "gpcm_kr.py", "requirements-mcp.txt")) {
 Ok "gpcm_mcp.py / gpcm_kr.py / requirements-mcp.txt"
 
 # --- 1. Claude 버전 확인 --------------------------------------------------------
-# Store 버전은 설정 파일을 격리된 폴더에서 읽어, 표준 위치에 넣어도 인식하지 못한다.
-# 단, 정식 버전이 함께 있으면 등록은 정식 버전에 적용되므로 막지 않고 경고만 한다.
+# Store 버전은 설정을 격리된 폴더에서 읽어 이 등록을 못 본다. 그러나 정식 버전의
+# 설치 위치는 PC마다 달라 자동 감지가 빗나갈 수 있다. 실제로 정식 버전 사용자를
+# 잘못 막은 적이 있으므로, 여기서는 어떤 경우에도 멈추지 않는다 — 상황만 알려주고
+# 계속 진행한다. (표준 위치에 설정을 쓰는 것 자체는 해가 없다.)
 Step "Claude 버전 확인"
-$official = Test-Path (Join-Path $env:LOCALAPPDATA "AnthropicClaude")
+$officialPaths = @(
+    (Join-Path $env:LOCALAPPDATA "AnthropicClaude"),
+    (Join-Path $env:LOCALAPPDATA "Programs\Claude"),
+    (Join-Path $env:LOCALAPPDATA "Programs\claude-desktop"),
+    (Join-Path $env:APPDATA "Claude")
+)
+$official = $false
+foreach ($p in $officialPaths) { if (Test-Path $p) { $official = $true; break } }
 $store = $false
 if (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue) {
     $store = [bool](Get-AppxPackage *Claude* -ErrorAction SilentlyContinue)
 }
-if ($store -and -not $official) {
-    Warn "Microsoft Store 버전 Claude만 설치돼 있습니다."
-    Warn "이 상태로는 설정을 넣어도 Claude가 읽지 못합니다. 먼저 아래를 실행하세요:"
-    Warn "    Get-AppxPackage *Claude* | Remove-AppxPackage"
-    Warn "그다음 https://claude.ai/download 에서 정식 버전을 설치하고 다시 실행하세요."
-    exit 1
-}
-if ($store -and $official) {
-    Warn "정식 버전과 Microsoft Store 버전이 함께 설치돼 있습니다. 등록은 정식 버전에 적용됩니다."
-    Warn "혼동을 없애려면 Store 버전을 지우세요:  Get-AppxPackage *Claude* | Remove-AppxPackage"
-    Ok "정식 버전 확인 — 계속 진행합니다"
-} else {
+if ($official) {
+    if ($store) {
+        Warn "Microsoft Store 버전 흔적도 있습니다. Claude는 정식 버전으로 실행하세요."
+        Warn "(잔재 제거는 선택:  Get-AppxPackage *Claude* | Remove-AppxPackage)"
+    }
     Ok "정식 버전 확인"
+} else {
+    Warn "정식 버전 설치 흔적을 찾지 못했습니다 — 감지가 빗나갔을 수 있어 그대로 진행합니다."
+    if ($store) {
+        Warn "만약 Store 버전만 쓰고 계시다면 이 등록을 Claude가 읽지 못합니다."
+        Warn "그 경우 https://claude.ai/download 에서 정식 버전을 설치하세요."
+    }
 }
 
 # --- 2. 인증키 -----------------------------------------------------------------
