@@ -14,8 +14,6 @@ test_gpcm_mcp.py
 README.md
 _먼저읽어보세요.md
 .gitattributes
-.uv-cache/
-.uv-tmp/
 *.mcpb
 __pycache__/
 .pytest_cache/
