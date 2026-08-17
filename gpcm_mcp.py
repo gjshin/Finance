@@ -25,13 +25,29 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-# gpcm_kr 은 임포트만 해도 Streamlit 사이드바 블록이 실행된다(bare mode 경고 + KRX
-# 목록 1회 조회). MCP 는 stdout 이 프로토콜 통로라, 임포트 중 새는 출력이 한 글자만
-# 있어도 클라이언트 파서가 깨진다. stderr 로 돌려서 임포트한다.
-with contextlib.redirect_stdout(sys.stderr):
-    import gpcm_kr as M
-
 mcp = MCPServer("gpcm")
+
+# gpcm_kr 은 임포트가 무겁다: streamlit·pandas·scipy 를 끌고 오고, 사이드바 블록이
+# 실행되며 KRX 목록까지 조회한다 — 합쳐서 수십 초. Claude 는 initialize 응답을
+# 60초만 기다리므로, 서버 기동 시 이걸 먼저 하면 접속 자체가 끊긴다(실측 80초).
+# 그래서 기동은 빈손으로 즉시 하고, 모듈은 뒤에서(main 의 예열 스레드) 또는
+# 첫 도구 호출에서 로드한다. stdout 은 MCP 프로토콜 통로라 임포트 중 새는 출력을
+# stderr 로 돌린다.
+M = None
+_load_lock = threading.Lock()
+
+
+def _load():
+    """gpcm_kr 을 (한 번만) 로드하고 돌려준다. 끝날 때까지 막힌다."""
+    global M
+    with _load_lock:
+        if M is None:
+            print("gpcm-mcp: 계산 모듈 로드 중...", file=sys.stderr)
+            with contextlib.redirect_stdout(sys.stderr):
+                import gpcm_kr as _M
+            M = _M
+            print("gpcm-mcp: 계산 모듈 준비 완료", file=sys.stderr)
+    return M
 
 OUTPUT_DIR = Path.home() / "Documents" / "GPCM"
 
@@ -77,6 +93,12 @@ def _api_key() -> str:
     return value
 
 
+def _parse_period(p: str) -> tuple[int, str]:
+    # gpcm_kr.parse_period 와 동일 — 모듈 로드 전에도 입력 검증이 되도록 여기 둔다
+    year, qtr = p.strip().split(".")
+    return int(year), qtr
+
+
 def _build_periods(start_period: str, end_period: str | None = None) -> list[str]:
     """UI 의 기간 조립 로직 그대로: 시작~끝 분기를 "YYYY.NQ" 목록으로 편다."""
     end_period = end_period or start_period
@@ -84,8 +106,8 @@ def _build_periods(start_period: str, end_period: str | None = None) -> list[str
         if not _PERIOD_RE.match(p):
             raise ValueError(f'기간은 "2025.4Q" 형식입니다: {p}')
     qtrs = ["1Q", "2Q", "3Q", "4Q"]
-    sy, sq = M.parse_period(start_period)
-    ey, eq = M.parse_period(end_period)
+    sy, sq = _parse_period(start_period)
+    ey, eq = _parse_period(end_period)
     if (ey, qtrs.index(eq)) < (sy, qtrs.index(sq)):
         raise ValueError(f"종료 기간({end_period})이 시작 기간({start_period})보다 빠릅니다.")
     periods = []
@@ -220,6 +242,8 @@ def run_gpcm(
             "DART 인증키가 없습니다. 확장 설정에서 인증키를 입력하거나, "
             "install_mcp.ps1 로 설치했다면 다시 실행해 등록하세요.")
 
+    _load()  # 예열이 아직이면 여기서 마저 로드한다 (백그라운드 실행이라 도구 시간엔 여유가 있다)
+
     ok, reason = M.check_dart_reachable()
     if not ok:
         raise RuntimeError(
@@ -251,7 +275,7 @@ def run_gpcm(
         _jobs[job_id] = job
 
     unfiled = [p for p in periods
-               if not M.is_period_filed(*M.parse_period(p))]
+               if not M.is_period_filed(*_parse_period(p))]
 
     thread = threading.Thread(target=_work, args=(job,), daemon=True)
     job["thread"] = thread
@@ -305,9 +329,95 @@ def gpcm_status(job_id: str | None = None) -> dict[str, Any]:
     return result
 
 
+# 명단 메모이즈 — st.cache_resource 는 bare mode 에서 신뢰할 수 없어 자체로 든다
+_roster_memo: dict[str, Any] = {"at": 0.0, "df": None}
+_ROSTER_TTL_SEC = 600
+MAX_COMPANIES = 400
+
+
+def _roster():
+    import time as _time
+
+    now = _time.monotonic()
+    if _roster_memo["df"] is not None and now - _roster_memo["at"] < _ROSTER_TTL_SEC:
+        return _roster_memo["df"]
+    df = _load().get_krx_industry_listing()
+    if df is None or df.empty:
+        raise RuntimeError(
+            "KRX 상장회사목록을 받지 못했습니다. 잠시 후 다시 시도하세요 "
+            "(사내망이면 kind.krx.co.kr 차단 여부 확인).")
+    _roster_memo.update(at=now, df=df)
+    return df
+
+
+@mcp.tool()
+def list_krx_companies(query: str = "", december_only: bool = False) -> dict[str, Any]:
+    """오늘 상장돼 있는 회사 명단을 KRX 에서 직접 받아 업종·주요제품과 함께 준다.
+
+    이 PC 에서 KRX 에 바로 물어보므로 **상장폐지가 반영된 진짜 오늘 명단**이다.
+    dcfpeer 의 peergroup_get_population_latest 가 KRX 403 으로 폴백 중일 때
+    이 도구를 대신 쓴다. 역할 구분: **모집단 명단은 여기(실시간)**, 분기말 스냅샷
+    재현성·사업내용 요약은 dcfpeer, 재무·공시는 mydart.
+
+    재현되지 않는다 — 조서에 쓸 때는 조회일과 목록 자체를 기록한다.
+
+    Args:
+        query: 업종명·주요제품·회사명에 부분일치하는 검색어 (예: "반도체", "이차전지").
+            **비워서 부르면 업종별 종목수 집계만** 돌려준다 — 무엇으로 좁힐지 고르는 용도.
+        december_only: True면 12월 결산 회사만 (결산월이 다르면 비교기간이 어긋난다).
+    """
+    df = _roster()
+    meta: dict[str, Any] = {
+        "retrievedAt": datetime.now().strftime("%Y-%m-%d"),
+        "listedUniverse": int(len(df)),
+        "basis": "오늘 기준 KRX 상장회사목록 — 재현되지 않는다. 조회일과 목록을 기록할 것",
+    }
+
+    if december_only:
+        df = df[df["SettleMonth"].astype(str).str.contains("12", na=False)]
+
+    q = (query or "").strip()
+    if not q:
+        counts = df["Sector"].fillna("(업종 미상)").value_counts()
+        return {
+            "meta": meta,
+            "sectors": [{"sector": s, "count": int(n)} for s, n in counts.items()],
+            "note": "업종을 고른 뒤 query에 넣어 다시 부르면 회사 목록이 나온다.",
+        }
+
+    def _col(name):
+        return df[name].fillna("").astype(str) if name in df.columns else ""
+
+    hit = (
+        _col("Sector").str.contains(q, regex=False)
+        | _col("Industry").str.contains(q, regex=False)
+        | _col("Name").str.contains(q, regex=False)
+    )
+    sub = df[hit].sort_values("Code")
+    if len(sub) > MAX_COMPANIES:
+        raise RuntimeError(
+            f'"{q}" 매칭이 {len(sub)}개입니다(상한 {MAX_COMPANIES}). '
+            "업종명을 더 구체적으로 넣거나 december_only 로 좁히세요.")
+
+    companies = []
+    for _, r in sub.iterrows():
+        settle = str(r.get("SettleMonth") or "").strip()
+        companies.append({
+            "code": str(r.get("Code") or "").zfill(6),
+            "name": str(r.get("Name") or ""),
+            "market": str(r.get("Market") or ""),
+            "sector": str(r.get("Sector") or ""),
+            "product": str(r.get("Industry") or "").strip(),
+            "settleMonth": settle,
+            "fiscalMonthNot12": bool(settle) and "12" not in settle,
+        })
+    return {"meta": {**meta, "query": q, "count": len(companies)}, "companies": companies}
+
+
 def _selftest() -> int:
     """설치 직후 Claude 없이 연결을 점검한다: install_mcp.ps1 이 부른다."""
     print("gpcm-mcp 자체점검")
+    _load()
     key = _api_key()
     print(f"1. DART_API_KEY: {'있음 (' + str(len(key)) + '자)' if key else '없음 ← 실패'}")
     if not key:
@@ -350,6 +460,9 @@ def main() -> None:
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     _prepare_stdio()
+    # 접속(initialize)은 즉시 응답하고, 무거운 모듈은 뒤에서 예열한다.
+    # 보통 사용자가 첫 도구를 부를 때쯤엔 준비가 끝나 있다.
+    threading.Thread(target=_load, daemon=True).start()
     mcp.run()
 
 

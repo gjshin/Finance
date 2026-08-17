@@ -18,7 +18,7 @@ os.environ["DART_API_KEY"] = "TESTKEY-" + "0" * 32
 
 import gpcm_mcp as W
 
-M = W.M
+M = W._load()
 
 # --- 파이프라인 스텁 (test_gpcm_kr_quality.py 와 동일한 대역) -----------------
 
@@ -147,12 +147,47 @@ M.fetch_financial_data = M.fetch_financial_data_orig
 
 # --- 6. stdout 위생 (별도 프로세스에서 임포트만) --------------------------------
 proc = subprocess.run(
-    [sys.executable, '-c', 'import gpcm_mcp'],
+    [sys.executable, '-c', 'import gpcm_mcp; gpcm_mcp._load()'],
     cwd=os.path.dirname(os.path.abspath(__file__)),
     env={**os.environ, 'DART_API_KEY': 'x' * 40},
     capture_output=True, timeout=300)
-check('임포트가 stdout 에 아무것도 안 쓴다', proc.stdout == b'',
+check('임포트·로드가 stdout 에 아무것도 안 쓴다', proc.stdout == b'',
       proc.stdout[:200])
+
+# --- 7. 오늘 상장사 명단 (KRX 차단 환경 — 응답을 흉내 내 검증) --------------------
+IND = pd.DataFrame([
+    {'Code': '005930', 'Name': '삼성전자', 'Market': 'KOSPI', 'Sector': '반도체 제조업',
+     'Industry': 'DRAM, NAND Flash', 'SettleMonth': '12월'},
+    {'Code': '000660', 'Name': 'SK하이닉스', 'Market': 'KOSPI', 'Sector': '반도체 제조업',
+     'Industry': 'DRAM', 'SettleMonth': '12월'},
+    {'Code': '111111', 'Name': '삼월결산㈜', 'Market': 'KOSDAQ', 'Sector': '반도체 제조업',
+     'Industry': '반도체 장비', 'SettleMonth': '3월'},
+    {'Code': '222222', 'Name': '농심', 'Market': 'KOSPI', 'Sector': '음식료품',
+     'Industry': '라면', 'SettleMonth': '12월'},
+])
+M.get_krx_industry_listing = lambda: IND.copy()
+W._roster_memo.update(at=0.0, df=None)  # 메모 비우기
+
+r = W.list_krx_companies()
+check('빈 query 는 업종 집계만', 'sectors' in r and 'companies' not in r, r)
+check('업종별 종목수가 맞는다',
+      {s['sector']: s['count'] for s in r['sectors']} == {'반도체 제조업': 3, '음식료품': 1}, r['sectors'])
+
+r = W.list_krx_companies('반도체')
+check('업종명 매칭 3개 (장비 주요제품 포함)', r['meta']['count'] == 3, r['meta'])
+check('주요제품이 실린다', r['companies'][1]['product'] == 'DRAM, NAND Flash', r['companies'][1])
+check('3월 결산 플래그', [c['fiscalMonthNot12'] for c in r['companies']] == [False, False, True])
+
+r = W.list_krx_companies('반도체', december_only=True)
+check('12월 결산 필터', r['meta']['count'] == 2, r['meta'])
+
+r = W.list_krx_companies('라면')
+check('주요제품으로도 찾는다', r['meta']['count'] == 1 and r['companies'][0]['name'] == '농심', r)
+
+W._roster_memo.update(at=0.0, df=None)
+M.get_krx_industry_listing = lambda: pd.DataFrame()
+expect_error('KRX 실패는 명확한 에러 (조용한 폴백 없음)', lambda: W.list_krx_companies('반도체'), 'KRX')
+W._roster_memo.update(at=0.0, df=None)
 
 print()
 print(f"잘못된 항목 {len(fails)}건")
