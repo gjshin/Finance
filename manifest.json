@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "gpcm-mcp",
   "display_name": "gpcm (GPCM 밸류에이션)",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "채팅에서 고른 종목코드로 GPCM 밸류에이션 엑셀을 바로 만든다",
   "long_description": "GPCM Calculator(Streamlit 앱)의 계산 파이프라인을 Claude 데스크톱 대화에서 직접 실행합니다. 피어 스크리닝으로 고른 종목코드를 복사해 앱을 따로 켤 필요 없이, run_gpcm 한 번으로 DART 수집 → WACC → 엑셀까지 만들어 문서\\GPCM 폴더에 저장합니다. 시트 구성(GPCM·Data_Quality·WACC·Beta·BS_Full…)은 앱과 동일합니다. 실행은 백그라운드로 돌고 gpcm_status 로 확인합니다.",
   "author": {
@@ -27,6 +27,7 @@
       ],
       "env": {
         "DART_API_KEY": "${user_config.dart_api_key}",
+        "ECOS_API_KEY": "${user_config.ecos_api_key}",
         "UV_CACHE_DIR": "${__dirname}/.uv-cache",
         "TMP": "${__dirname}/.uv-tmp",
         "TEMP": "${__dirname}/.uv-tmp"
@@ -40,6 +41,13 @@
       "description": "mydart에 넣은 것과 같은 키입니다 (40자리). 없으면 https://opendart.fss.or.kr 에서 무료 발급.",
       "sensitive": true,
       "required": true
+    },
+    "ecos_api_key": {
+      "type": "string",
+      "title": "한국은행 ECOS 인증키 (선택)",
+      "description": "WACC 의 무위험이자율·회사채 금리를 기준일 기준으로 자동 조회할 때 씁니다. 비워도 나머지 기능은 그대로 동작합니다. 발급은 ecos.bok.or.kr (무료).",
+      "sensitive": true,
+      "required": false
     }
   },
   "compatibility": {

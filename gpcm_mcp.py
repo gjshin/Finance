@@ -19,7 +19,7 @@ import re
 import sys
 import threading
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -217,7 +217,11 @@ def _run_job(job: dict[str, Any], p: dict[str, Any]) -> None:
                         f"계산된 WACC({wacc_data['Target_WACC']*100:.2f}%)이 무위험이자율보다 "
                         "낮습니다. 시가총액 수집 실패 여부를 Data_Quality에서 확인하세요.")
 
-        notes = [f"• Base Date: {base_period} ({base_date_str}) | Unit: 억원 (KRW 100M)"] + _NOTES_STATIC
+        notes = [f"• Base Date: {base_period} ({base_date_str}) | Unit: 억원 (KRW 100M)"]
+        if p.get("rate_source"):
+            # 조서에서 "이 rf 는 어디서 왔나"에 답할 근거를 산출물 안에 남긴다
+            notes.append(f'• Rf/Kd 출처: {p["rate_source"]}')
+        notes += _NOTES_STATIC
         book: io.BytesIO = M.export_gpcm_excel(
             base_period, base_qtr, p["tickers"], summary, raw_bs, raw_pl, all_mkt,
             names, wacc_data, p["beta_type"], notes, avg_debt_ratio, base_date_str,
@@ -240,6 +244,183 @@ def _run_job(job: dict[str, Any], p: dict[str, Any]) -> None:
         job["error"] = traceback.format_exc(limit=3)
 
 
+# --- 시장금리 (WACC 입력값의 근거) ------------------------------------------
+# rf·Kd 는 판단이 아니라 기준일의 시장 관측치다. 값만 손으로 넣으면 나중에
+# "이 3.3%는 어디서 왔나"에 답할 근거가 산출물에 남지 않는다. 조회해서 값과 함께
+# 출처·금리기준일을 돌려주고, 그 문장을 그대로 엑셀 Notes 에 실을 수 있게 한다.
+# MRP·size premium 은 조회 대상이 아니다 — 시장에서 관측되지 않는 판단 항목이다.
+
+ECOS_MARKET_RATES = "817Y002"  # 한국은행 ECOS 통계표: 시장금리(일별)
+BOND_GRADES = ("AA-", "BBB-")
+# 항목코드는 하드코딩하지 않는다. ECOS 가 코드를 바꾸면 조용히 엉뚱한 금리를 물어오게
+# 되므로, 통계표의 항목 목록을 받아 이름으로 찾는다.
+RATE_KINDS = {
+    "rf": ("국고채", "5년"),
+    "kd": ("회사채", "3년"),
+}
+FDR_SYMBOLS = {"rf": "KR5YT=RR"}  # 무키 경로 — 회사채는 FDR 에 없어 rf 만 시도한다
+
+
+def _ecos_key() -> str:
+    """한국은행 ECOS 인증키(선택). 미입력 시 확장이 `${...}` 리터럴을 넘긴다."""
+    value = (os.environ.get("ECOS_API_KEY") or "").strip()
+    if value.startswith("${") and value.endswith("}"):
+        return ""
+    return value
+
+
+def _get_fdr():
+    """FinanceDataReader. gpcm_kr 이 이미 올라와 있으면 그것을 쓴다(테스트도 여기 문다)."""
+    if M is not None:
+        return M.fdr
+    with _muted_stdout():
+        import FinanceDataReader as fdr
+    return fdr
+
+
+def _rate_from_fdr(kind: str, asof: datetime) -> dict[str, Any] | None:
+    """무키 경로. 못 구하면 None — 여기서 조용히 기본값을 만들지 않는다."""
+    symbol = FDR_SYMBOLS.get(kind)
+    if symbol is None:
+        return None
+    try:
+        df = _get_fdr().DataReader(symbol, (asof - timedelta(days=30)).strftime("%Y-%m-%d"),
+                                   asof.strftime("%Y-%m-%d"))
+    except Exception:
+        return None
+    if df is None or len(df) == 0 or "Close" not in getattr(df, "columns", []):
+        return None
+    row = df.dropna(subset=["Close"]).tail(1)
+    if len(row) == 0:
+        return None
+    return {
+        "value": round(float(row["Close"].iloc[0]), 3),
+        "rateDate": str(row.index[0])[:10],
+        "source": f"FinanceDataReader {symbol}",
+    }
+
+
+def _ecos_get(path: str) -> Any:
+    import requests
+    response = requests.get(f"https://ecos.bok.or.kr/api/{path}", timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    if "RESULT" in payload:  # ECOS 는 오류도 200 으로 준다
+        raise RuntimeError(payload["RESULT"].get("MESSAGE", "ECOS 오류"))
+    return payload
+
+
+def _ecos_item_code(words: tuple[str, ...], grade: str | None) -> tuple[str, str]:
+    """통계표 항목 목록에서 이름으로 찾는다 — 코드를 박아두지 않는다."""
+    key = _ecos_key()
+    payload = _ecos_get(f"StatisticItemList/{key}/json/kr/1/500/{ECOS_MARKET_RATES}")
+    rows = payload.get("StatisticItemList", {}).get("row", [])
+    wanted = list(words) + ([grade] if grade else [])
+    hits = [r for r in rows if all(w in r.get("ITEM_NAME", "") for w in wanted)]
+    if not hits:
+        raise RuntimeError(
+            f"ECOS 통계표 {ECOS_MARKET_RATES} 에서 '{' '.join(wanted)}' 항목을 못 찾았습니다.")
+    hit = min(hits, key=lambda r: len(r.get("ITEM_NAME", "")))
+    return hit["ITEM_CODE"], hit["ITEM_NAME"]
+
+
+def _rate_from_ecos(kind: str, asof: datetime, grade: str | None) -> dict[str, Any] | None:
+    if not _ecos_key():
+        return None
+    code, name = _ecos_item_code(RATE_KINDS[kind], grade)
+    start = (asof - timedelta(days=30)).strftime("%Y%m%d")
+    payload = _ecos_get(
+        f"StatisticSearch/{_ecos_key()}/json/kr/1/100/{ECOS_MARKET_RATES}/D/"
+        f"{start}/{asof.strftime('%Y%m%d')}/{code}")
+    rows = [r for r in payload.get("StatisticSearch", {}).get("row", [])
+            if (r.get("DATA_VALUE") or "").strip()]
+    if not rows:
+        raise RuntimeError(f"ECOS 에 {start}~{asof:%Y%m%d} 구간 '{name}' 값이 없습니다.")
+    last = rows[-1]
+    return {
+        "value": round(float(last["DATA_VALUE"]), 3),
+        "rateDate": f'{last["TIME"][:4]}-{last["TIME"][4:6]}-{last["TIME"][6:8]}',
+        "source": f"한국은행 ECOS {ECOS_MARKET_RATES} {name}",
+    }
+
+
+def _fetch_rate(kind: str, asof: datetime, grade: str | None) -> tuple[dict[str, Any] | None, list[str]]:
+    """무키(FDR) → ECOS 순으로 시도하고, 실패한 경로를 그대로 남긴다."""
+    tried: list[str] = []
+    for label, getter in (("FinanceDataReader", lambda: _rate_from_fdr(kind, asof)),
+                          ("한국은행 ECOS", lambda: _rate_from_ecos(kind, asof, grade))):
+        try:
+            got = getter()
+        except Exception as exc:
+            tried.append(f"{label}: {exc}")
+            continue
+        if got:
+            return got, tried
+        tried.append(f"{label}: 값 없음"
+                     + ("" if label != "한국은행 ECOS" or _ecos_key() else " (인증키 미설정)"))
+    return None, tried
+
+
+@mcp.tool()
+def get_wacc_inputs(as_of: str = "", bond_grade: str = "AA-") -> dict[str, Any]:
+    """기준일 시장금리를 조회해 WACC 입력값(무위험이자율·타인자본비용)을 근거와 함께 제시한다.
+
+    run_gpcm 을 부르기 전에 이걸 먼저 불러 rf·kd_pretax 후보와 출처를 확인한다.
+
+    Args:
+        as_of: 기준일 YYYY-MM-DD. 비우면 오늘. 그 날짜 이전의 최근 고시치를 쓴다.
+        bond_grade: 회사채 신용등급 (AA- 또는 BBB-). 평가대상의 신용도에 맞춘다.
+
+    [쓰는 규칙]
+    - 여기서 나온 값을 **그대로 run_gpcm 에 넣지 않는다.** 사용자에게 값과 출처를
+      보여주고 확정을 받는다. 시장금리는 후보일 뿐 기준일·만기·등급 선택은 판단이다.
+    - mrp(시장위험프리미엄)·size_premium(규모프리미엄)은 여기서 안 나온다. 시장에서
+      관측되는 값이 아니라 판단 항목이라, 종전처럼 사용자에게 개별로 묻는다.
+    - 조회에 실패하면 값을 지어내지 않고 실패를 알린다. 그때는 사용자가 직접 넣는다.
+    - 확정 후 run_gpcm(rate_source=<citation>) 로 넘기면 엑셀 Notes 에 근거가 남는다.
+    """
+    grade = (bond_grade or "").strip().upper()
+    if grade not in BOND_GRADES:
+        raise ValueError(f"bond_grade 는 {' 또는 '.join(BOND_GRADES)} 입니다: {bond_grade!r}")
+    try:
+        asof = datetime.strptime(as_of.strip(), "%Y-%m-%d") if as_of.strip() else datetime.now()
+    except ValueError:
+        raise ValueError(f"as_of 는 YYYY-MM-DD 형식입니다: {as_of!r}")
+
+    rf, rf_tried = _fetch_rate("rf", asof, None)
+    kd, kd_tried = _fetch_rate("kd", asof, grade)
+    if rf is None and kd is None:
+        raise RuntimeError(
+            "시장금리를 한 곳에서도 못 받았습니다. rf·kd_pretax 를 직접 넣어야 합니다.\n"
+            "시도한 경로 — " + " / ".join(rf_tried + kd_tried)
+            + ("\n한국은행 ECOS 인증키(무료, ecos.bok.or.kr)를 확장 설정에 넣으면 "
+               "이 경로가 열립니다." if not _ecos_key() else ""))
+
+    parts: list[str] = []
+    result: dict[str, Any] = {
+        "asOf": asof.strftime("%Y-%m-%d"),
+        "fetchedAt": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    for key, got, label, tried in (("rf", rf, "국고채 5년", rf_tried),
+                                   ("kd_pretax", kd, f"회사채 3년 {grade}", kd_tried)):
+        if got:
+            result[key] = {"label": label, **got}
+            parts.append(f'{label} {got["value"]}% ({got["rateDate"]}, {got["source"]})')
+        else:
+            result[key] = {"label": label, "value": None,
+                           "failed": " / ".join(tried),
+                           "note": "못 구했습니다. 이 값은 사용자가 직접 넣어야 합니다."}
+    result["citation"] = " | ".join(parts)
+    result["judgment"] = {
+        "mrp": "시장위험프리미엄 — 관측치가 아니라 판단 항목이라 조회하지 않는다. 사용자에게 묻는다.",
+        "size_premium": "규모프리미엄 — 위와 같다. 참고 관행값은 있으나 대상 규모에 따라 달라진다.",
+        "tax_rate": "한계세율 — 사업연도 세율표에 따르되 대상의 과세표준 구간 판단이 필요하다.",
+    }
+    result["note"] = ("값을 그대로 쓰지 말고 사용자에게 확정을 받는다. "
+                      "확정 후 run_gpcm(rate_source=citation) 으로 넘기면 엑셀 Notes 에 근거가 남는다.")
+    return result
+
+
 @mcp.tool()
 def run_gpcm(
     tickers: list[str],
@@ -251,6 +432,7 @@ def run_gpcm(
     kd_pretax: float = 3.5,
     tax_rate: float = 26.4,
     beta_type: str = "5Y",
+    rate_source: str = "",
 ) -> dict[str, Any]:
     """GPCM 밸류에이션을 백그라운드로 실행해 엑셀 파일을 만든다.
 
@@ -258,6 +440,8 @@ def run_gpcm(
     사용자가 WACC 파라미터를 직접 말하지 않았다면, 호출하기 전에 아래 6개를
     **하나씩 개별 질문**해 확정받는다. 각 질문에 기본값을 제시하고, 사용자가
     "기본값" 또는 값으로 답하면 그것을 쓴다. 기본값을 임의로 적용하지 않는다.
+    rf·kd_pretax 는 먼저 get_wacc_inputs 로 기준일 시장금리를 조회해, 조회된
+    값과 출처를 보여주며 묻는다(조회값을 확정 없이 그대로 쓰지 않는다).
       1. 무위험이자율 rf (기본 3.3%)
       2. 시장위험프리미엄 mrp (기본 8.0%)
       3. 사이즈 프리미엄 size_premium — 시총 구간을 안내하며 묻는다
@@ -283,6 +467,9 @@ def run_gpcm(
         kd_pretax: 세전 타인자본비용 %. 기본 3.5
         tax_rate: 타겟 법인세율 %. 기본 26.4
         beta_type: WACC 에 쓸 베타. "5Y"(5년 월간) 또는 "2Y"(2년 주간).
+        rate_source: rf·kd 의 근거 문장. get_wacc_inputs 의 citation 을 그대로
+            넣으면 엑셀 Notes 에 출처·금리기준일이 남는다. 손으로 정한 값이면
+            그 근거를 적는다. 비우면 Notes 에 아무것도 안 붙는다.
     """
     global _counter
 
@@ -333,7 +520,7 @@ def run_gpcm(
                 "api_key": api_key, "tickers": codes, "periods": periods,
                 "rf": rf / 100, "mrp": mrp / 100, "size_premium": size_premium / 100,
                 "kd_pretax": kd_pretax / 100, "tax_rate": tax_rate / 100,
-                "beta_type": beta_type,
+                "beta_type": beta_type, "rate_source": rate_source.strip(),
             },
         }
         _jobs[job_id] = job

@@ -288,6 +288,86 @@ check('최근 결측은 현재 정지 중으로 표시', by['000004']['currently
 check('조회 실패는 failed 로 드러난다', g.get('failed') == ['000005'], g.get('failed'))
 check('자동 배제 금지 안내가 실린다', '자동 배제' in g['meta']['note'])
 
+# --- 8. 시장금리 조회 (WACC 입력값의 근거) -------------------------------------
+class FakeRateFdr:
+    """국고채만 답하는 FDR 대역 — 회사채는 FDR 에 없다."""
+    def __init__(self, rows=None): self.rows = rows
+    def DataReader(self, symbol, start=None, end=None):
+        if symbol != 'KR5YT=RR':
+            raise RuntimeError(symbol)
+        if self.rows is None:
+            return pd.DataFrame()
+        idx = pd.to_datetime(['2026-08-13', '2026-08-14'])
+        return pd.DataFrame({'Close': self.rows}, index=idx)
+
+M.fdr = FakeRateFdr([3.28, 3.31])
+os.environ.pop('ECOS_API_KEY', None)
+w = W.get_wacc_inputs(as_of='2026-08-18')
+check('rf 는 조회한 값과 금리기준일을 함께 준다',
+      w['rf']['value'] == 3.31 and w['rf']['rateDate'] == '2026-08-14', w['rf'])
+check('출처가 값에 붙어 나온다', 'FinanceDataReader' in w['rf']['source'], w['rf'])
+check('citation 한 줄로 Notes 에 넣을 수 있다', '3.31%' in w['citation'], w['citation'])
+check('못 구한 회사채는 value 를 지어내지 않는다',
+      w['kd_pretax']['value'] is None and 'failed' in w['kd_pretax'], w['kd_pretax'])
+check('키 미설정을 실패 사유에 밝힌다', '인증키 미설정' in w['kd_pretax']['failed'], w['kd_pretax'])
+check('mrp·size_premium 은 판단 항목이라 값이 안 나온다',
+      'mrp' in w['judgment'] and 'mrp' not in w, list(w))
+
+M.fdr = FakeRateFdr(None)          # 전부 실패 — 조용한 기본값이 있으면 안 된다
+try:
+    W.get_wacc_inputs()
+    check('전부 실패하면 값을 만들지 않고 실패를 알린다', False, '에러가 안 났다')
+except RuntimeError as exc:
+    check('전부 실패하면 값을 만들지 않고 실패를 알린다', '직접 넣어야' in str(exc), str(exc)[:80])
+
+os.environ['ECOS_API_KEY'] = '${user_config.ecos_api_key}'
+check('미입력 확장 리터럴은 키 없음으로 본다', W._ecos_key() == '', W._ecos_key())
+os.environ.pop('ECOS_API_KEY', None)
+
+try:
+    W.get_wacc_inputs(bond_grade='AAA')
+    check('없는 등급은 거절한다', False, '통과했다')
+except ValueError as exc:
+    check('없는 등급은 거절한다', 'AA-' in str(exc), str(exc)[:60])
+
+# ECOS 경로 — 항목코드를 박지 않고 이름으로 찾는지
+os.environ['ECOS_API_KEY'] = 'ECOSKEY'
+calls = []
+def fake_ecos(path):
+    calls.append(path)
+    if path.startswith('StatisticItemList'):
+        return {'StatisticItemList': {'row': [
+            {'ITEM_CODE': '010200000', 'ITEM_NAME': '국고채(5년)'},
+            {'ITEM_CODE': '010210000', 'ITEM_NAME': '회사채(3년, AA-)'},
+            {'ITEM_CODE': '010220000', 'ITEM_NAME': '회사채(3년, BBB-)'},
+        ]}}
+    return {'StatisticSearch': {'row': [
+        {'TIME': '20260813', 'DATA_VALUE': '4.10'},
+        {'TIME': '20260814', 'DATA_VALUE': '4.12'},
+    ]}}
+W._ecos_get = fake_ecos
+M.fdr = FakeRateFdr(None)          # 무키 경로 실패 → ECOS 로 넘어가야 한다
+w2 = W.get_wacc_inputs(as_of='2026-08-18', bond_grade='BBB-')
+check('무키 경로가 막히면 ECOS 로 넘어간다', w2['kd_pretax']['value'] == 4.12, w2['kd_pretax'])
+check('등급에 맞는 항목코드를 이름으로 찾는다',
+      any('010220000' in c for c in calls) and not any('010210000' in c for c in calls), calls)
+check('ECOS 출처와 항목명이 남는다', '회사채(3년, BBB-)' in w2['kd_pretax']['source'], w2['kd_pretax'])
+os.environ.pop('ECOS_API_KEY', None)
+
+# 근거 문장이 실제로 엑셀 Notes 에 실리는지
+seen = {}
+export_orig = M.export_gpcm_excel
+def spy_export(*a, **k):
+    seen['notes'] = a[10]
+    return export_orig(*a, **k)
+M.export_gpcm_excel = spy_export
+r4 = W.run_gpcm(['005930'], '2024.1Q', rate_source='국고채 5년 3.31% (2026-08-14, 한국은행 ECOS)')
+W._jobs[r4['job_id']]['thread'].join(timeout=60)
+M.export_gpcm_excel = export_orig
+check('Notes 에 Rf/Kd 출처 줄이 Base Date 바로 아래 붙는다',
+      seen.get('notes', ['', ''])[1].startswith('• Rf/Kd 출처: 국고채 5년 3.31%'),
+      seen.get('notes', [])[:2])
+
 print()
 print(f"잘못된 항목 {len(fails)}건")
 sys.exit(1 if fails else 0)
