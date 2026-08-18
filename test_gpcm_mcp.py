@@ -396,6 +396,22 @@ check('Notes 에 Rf/Kd 출처 줄이 Base Date 바로 아래 붙는다',
       seen.get('notes', ['', ''])[1].startswith('• Rf/Kd 출처: 국고채 5년 3.31%'),
       seen.get('notes', [])[:2])
 
+# --- 9. 확장 manifest — 파이썬 버전을 못 박았는지 ------------------------------
+# uv 는 지정이 없으면 시스템에서 제일 새 파이썬을 집는다. 실제로 Python 3.14 에서
+# pydantic 이 깨져(MCP SDK 모델 생성 실패) 도구가 1개만 등록되는 사고가 났다.
+# 데스크톱마다 다른 파이썬이 잡히지 않도록 manifest 가 버전을 지정해야 한다.
+manifest = json.loads(Path(__file__).with_name('manifest.json').read_text(encoding='utf-8'))
+args = manifest['server']['mcp_config']['args']
+check('manifest 가 파이썬 버전을 지정한다', '--python' in args, args)
+pinned = args[args.index('--python') + 1] if '--python' in args else ''
+check('지정한 버전이 검증된 범위(3.10~3.13)', pinned in ('3.10', '3.11', '3.12', '3.13'), pinned)
+check('선언한 호환 범위가 3.14 를 제외한다',
+      '<3.14' in manifest['compatibility']['runtimes']['python'],
+      manifest['compatibility']['runtimes']['python'])
+check('엔트리와 요구사항 경로가 args 에 그대로 있다',
+      any(a.endswith('gpcm_mcp.py') for a in args) and
+      any(a.endswith('requirements-mcp.txt') for a in args), args)
+
 print()
 print(f"잘못된 항목 {len(fails)}건")
 sys.exit(1 if fails else 0)
