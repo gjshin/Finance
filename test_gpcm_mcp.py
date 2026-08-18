@@ -408,6 +408,14 @@ check('지정한 버전이 검증된 범위(3.10~3.13)', pinned in ('3.10', '3.1
 check('선언한 호환 범위가 3.14 를 제외한다',
       '<3.14' in manifest['compatibility']['runtimes']['python'],
       manifest['compatibility']['runtimes']['python'])
+# uv 캐시를 확장 폴더 안에 두면 안 된다. 그 안에 만들어지는 가상환경의 .pyd 가
+# 실행 중 메모리에 매핑돼 잠기고, 재설치 때 설치 프로그램이 폴더를 못 지워
+# EBUSY 로 실패한다(실제로 세 번 겪었다). 기본 위치(%LOCALAPPDATA%)를 쓴다.
+env = manifest['server']['mcp_config'].get('env', {})
+check('uv 캐시·임시폴더를 확장 폴더로 돌리지 않는다',
+      not {'UV_CACHE_DIR', 'TMP', 'TEMP'} & set(env), list(env))
+check('필요한 환경변수만 남긴다', set(env) == {'DART_API_KEY', 'ECOS_API_KEY'}, list(env))
+
 check('엔트리와 요구사항 경로가 args 에 그대로 있다',
       any(a.endswith('gpcm_mcp.py') for a in args) and
       any(a.endswith('requirements-mcp.txt') for a in args), args)
