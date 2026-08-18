@@ -490,6 +490,55 @@ check('재검토 목록에 사유가 함께 나온다',
       {t['code'] for t in rv['toReview']} == {'B', 'C'}, rv['toReview'])
 check('자동 배제 금지 안내가 실린다', '배제 기준이 아닙니다' in rv['note'])
 
+# --- 11. 손익 계정 매칭 2단계 (파이프라인 수준) --------------------------------
+# 조이시티에서 2025.1Q·2Q 매출이 빈 사고: 손익계산서는 받았는데 계정을 못 골랐다.
+def run_with_pl(pl_df):
+    """주어진 손익계산서로 한 기간을 돌려 (수집값, 품질기록) 을 준다."""
+    M.fetch_pl_df = lambda d, c, y, r: (pl_df.copy(), 'CFS', 'OK')
+    res = M.fetch_financial_data(os.environ['DART_API_KEY'], ['005930'], ['2024.1Q'],
+                                 Dart(), Recorder(), Recorder())
+    summary, quality = res[4], res[9]
+    return summary[0], quality
+
+
+class Recorder:
+    def write(self, *a, **k): pass
+    def update(self, *a, **k): pass
+    def progress(self, *a, **k): pass
+
+
+def pl(rows):
+    return pd.DataFrame([{'sj_nm': '연결포괄손익계산서', 'sj_div': 'IS',
+                          'thstrm_amount': amt, 'thstrm_add_amount': amt,
+                          'account_nm': nm, 'account_id': aid} for nm, aid, amt in rows])
+
+
+# 번호가 붙은 표기 — 종전에는 0 이 되던 경우
+s, q = run_with_pl(pl([('Ⅰ. 영업수익', '', '500000000000'),
+                       ('Ⅱ. 영업이익', '', '50000000000'),
+                       ('당기순이익', '', '40000000000')]))
+check('번호 붙은 매출 표기를 2단계에서 줍는다', s['Revenue'] == 5000.0, s.get('Revenue'))
+check('영업이익도 함께 잡힌다', s['EBIT'] == 500.0, s.get('EBIT'))
+
+# 이름이 낯설어도 표준태그로
+s2, _ = run_with_pl(pl([('게임서비스수익', 'ifrs-full_Revenue', '300000000000'),
+                        ('당기순이익', '', '10000000000')]))
+check('표준태그만으로도 매출을 잡는다', s2['Revenue'] == 3000.0, s2.get('Revenue'))
+
+# 1단계 우선 — 완전 일치 행이 있으면 그것이 이긴다 (기존 회사 값이 밀리지 않음)
+s3, _ = run_with_pl(pl([('Ⅰ. 영업수익', '', '999000000000'),
+                        ('매출액', '', '100000000000'),
+                        ('당기순이익', '', '10000000000')]))
+check('완전 일치 행이 관대 매칭보다 먼저다', s3['Revenue'] == 1000.0, s3.get('Revenue'))
+
+# 못 찾으면 무엇을 봤는지 보여준다 (없는 시트를 가리키지 않는다)
+s4, q4 = run_with_pl(pl([('알수없는수익항목', '', '100000000000'),
+                         ('당기순이익', '', '10000000000')]))
+warn = [r for r in q4.rows if '계정 매칭' in r['Item']]
+check('매칭 실패는 경고로 남는다', bool(warn), [r['Item'] for r in q4.rows])
+check('경고에 실제 계정과목명이 실린다', '알수없는수익항목' in warn[0]['Message'], warn[0]['Message'][:120])
+check('없는 시트를 가리키지 않는다', 'PL_Data 시트에서' not in warn[0]['Message'], warn[0]['Message'][:120])
+
 print()
 print(f"잘못된 항목 {len(fails)}건")
 sys.exit(1 if fails else 0)

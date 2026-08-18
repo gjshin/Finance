@@ -563,6 +563,63 @@ PL_PRETAX_INCOME = {
 
 _norm_pl = _norm
 
+# DART 는 계정명과 함께 IFRS 표준태그(account_id)를 준다. 이름은 회사마다
+# "Ⅰ. 영업수익"·"1. 매출액"처럼 제각각이지만 태그는 같다.
+# 총액 태그만 넣는다 — 품목별 수익(RevenueFromSaleOfGoods 등)을 잡으면 매출이
+# 실제보다 작게 나오면서 조용히 틀린다. 그게 제일 위험한 실패다.
+PL_TAGS = {
+    'ifrs-full_Revenue': 'Revenue',
+    'ifrs-full_RevenueFromContractsWithCustomers': 'Revenue',
+    'dart_OperatingIncomeLoss': 'EBIT',
+    'ifrs-full_ProfitLossFromOperatingActivities': 'EBIT',
+    'ifrs-full_ProfitLoss': 'NI',
+    'ifrs-full_ProfitLossBeforeTax': 'Pretax_Income',
+}
+
+# 앞머리 번호("Ⅰ.", "1.", "(1)", "가.")와 꼬리 괄호("(주7)")를 떼기 위한 패턴
+_PL_PREFIX = re.compile(r'^[(\[]?[0-9ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVXivx가-힣]{1,3}[.)\]]')
+_PL_SUFFIX = re.compile(r'[(\[][^()\[\]]*[)\]]$')
+
+
+def _pl_name_forms(account_nm):
+    """계정명 표기 흔들림을 흡수한 후보들. 원문 형태가 항상 첫 번째다."""
+    base = _norm_pl(account_nm)
+    forms = [base]
+    stripped = base
+    for _ in range(2):  # "Ⅰ.1.매출액" 처럼 두 겹인 경우까지만
+        nxt = _PL_PREFIX.sub('', stripped)
+        if nxt == stripped:
+            break
+        stripped = nxt
+    if stripped != base:
+        forms.append(stripped)
+    for f in list(forms):
+        tail = _PL_SUFFIX.sub('', f)
+        if tail and tail != f:
+            forms.append(tail)
+    return forms
+
+
+def match_pl_lenient(account_nm, aid=None):
+    """2단계 매칭 — 1단계(match_pl_core_only)가 못 찾은 항목에만 쓴다.
+
+    표준태그를 먼저 보고, 없으면 표기 흔들림을 흡수한 이름으로 본다.
+    제외 규칙은 1단계와 같게 원문 기준으로 먼저 적용한다.
+    """
+    a = _norm_pl(account_nm)
+    if '지배' in a or '포괄' in a:
+        return None
+    tagged = PL_TAGS.get(str(aid or '').strip())
+    if tagged:
+        return tagged
+    for form in _pl_name_forms(account_nm):
+        if form in PL_REVENUE: return 'Revenue'
+        if form in PL_EBIT:    return 'EBIT'
+        if form in PL_NI:      return 'NI'
+        if form in PL_PRETAX_INCOME: return 'Pretax_Income'
+    return None
+
+
 def match_pl_core_only(account_nm, aid=None):
     if aid == 'ifrs-full_ProfitLoss': return 'NI'
     a = _norm_pl(account_nm)
@@ -1289,16 +1346,11 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
 
                 wanted = {'Revenue', 'EBIT', 'NI', 'Pretax_Income'}
                 picked = set()
+                seen_names = []
 
-                for _, row in df_is.iterrows():
-                    acct = str(row.get('account_nm', '')).strip()
-                    aid = str(row.get('account_id', '')).strip()
-                    calc_key = match_pl_core_only(acct, aid)
-                    if not calc_key or calc_key not in wanted: continue
-                    if calc_key in picked: continue
-
+                def take(row, acct, calc_key):
                     val = pick_pl_value(row, qtr)
-                    if val is None: continue
+                    if val is None: return False
 
                     amt_100m = val / 1e8
                     raw_pl_rows.append({
@@ -1315,18 +1367,44 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                         period_metrics[calc_key] -= amt_100m
 
                     picked.add(calc_key)
+                    return True
+
+                # 1단계 — 완전 일치. 여기서 잡히면 2단계는 돌지 않는다(기존 동작 보존).
+                for _, row in df_is.iterrows():
+                    acct = str(row.get('account_nm', '')).strip()
+                    aid = str(row.get('account_id', '')).strip()
+                    if acct: seen_names.append(acct)
+                    calc_key = match_pl_core_only(acct, aid)
+                    if not calc_key or calc_key not in wanted: continue
+                    if calc_key in picked: continue
+                    take(row, acct, calc_key)
                     if picked == wanted: break
 
-                # 계정과목 표기가 회사마다 달라 매칭에서 빠질 수 있다. 그 계정만 0이 된다.
+                # 2단계 — 못 찾은 것만. 표기가 "Ⅰ. 영업수익"·"매출액(주7)" 처럼
+                # 흔들리거나 표준태그로만 알 수 있는 경우를 여기서 줍는다.
+                if picked != wanted:
+                    for _, row in df_is.iterrows():
+                        acct = str(row.get('account_nm', '')).strip()
+                        aid = str(row.get('account_id', '')).strip()
+                        calc_key = match_pl_lenient(acct, aid)
+                        if not calc_key or calc_key not in wanted: continue
+                        if calc_key in picked: continue
+                        take(row, acct, calc_key)
+                        if picked == wanted: break
+
+                # 그래도 못 찾으면 그 계정만 0이 된다. 무엇을 봤는지 같이 남긴다 —
+                # 안 그러면 어느 표기 때문에 빠졌는지 확인할 방법이 없다.
                 unmatched = wanted - picked
                 if unmatched:
                     label = {'Revenue': '매출액', 'EBIT': '영업이익',
                              'NI': '당기순이익', 'Pretax_Income': '법인세비용차감전순이익'}
+                    shown = ', '.join(seen_names[:10]) or '(계정과목명이 비어 있습니다)'
+                    more = f' 외 {len(seen_names) - 10}개' if len(seen_names) > 10 else ''
                     quality.add(SEV_WARN, ticker, display_name, f'계정 매칭 {tp}',
                                 f"{year} {qtr} 손익계산서에서 "
                                 f"{', '.join(label[k] for k in sorted(unmatched))}을(를) "
-                                f"찾지 못했습니다. 해당 계정은 0으로 집계됩니다 — "
-                                f"PL_Data 시트에서 실제 계정과목명을 확인하세요.")
+                                f"찾지 못했습니다. 해당 계정은 0으로 집계됩니다. "
+                                f"읽은 계정과목: {shown}{more}")
 
             # Period loop ends, append to all_multiples
             all_multiples.append({

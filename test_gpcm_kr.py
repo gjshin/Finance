@@ -57,6 +57,41 @@ for label, periods, want in cases:
     mark = "OK" if ok else "잘못됨"
     print(f"{label:<20}{RCODE_NAME.get(got,got):<22}{RCODE_NAME[want]:<22}{mark}")
 
+# --- 손익 계정 매칭 (2단계: 완전일치 → 관대) -----------------------------------
+print()
+print("손익 계정 매칭")
+print("-" * 66)
+
+def chk(label, ok, detail=''):
+    global fails
+    if not ok: fails += 1
+    print(f"{label:<52}{'OK' if ok else '잘못됨 — ' + str(detail)}")
+
+# 1단계는 종전 그대로 — 완전 일치만 인정한다
+chk('1단계: 매출액 → Revenue', M.match_pl_core_only('매출액') == 'Revenue')
+chk('1단계: 번호 붙은 표기는 여전히 못 잡는다',
+    M.match_pl_core_only('Ⅰ. 영업수익') is None, M.match_pl_core_only('Ⅰ. 영업수익'))
+
+# 2단계가 표기 흔들림과 표준태그를 줍는다
+for name in ('Ⅰ. 영업수익', '1. 매출액', '매출액(주7)', '영업수익', '(1) 수익(매출액)'):
+    chk(f'2단계: {name!r} → Revenue', M.match_pl_lenient(name) == 'Revenue',
+        M.match_pl_lenient(name))
+chk('2단계: 이름이 낯설어도 표준태그로 잡는다',
+    M.match_pl_lenient('영업수익(게임)', 'ifrs-full_Revenue') == 'Revenue')
+chk('2단계: 영업이익 태그', M.match_pl_lenient('Ⅱ. 영업손익', 'dart_OperatingIncomeLoss') == 'EBIT')
+chk('2단계: 세전이익 태그',
+    M.match_pl_lenient('법인세차감전순손익', 'ifrs-full_ProfitLossBeforeTax') == 'Pretax_Income')
+chk('2단계: 괄호가 의미를 갖는 표기는 그대로', M.match_pl_lenient('당기순이익(손실)') == 'NI')
+
+# 오검출 방지 — 넓혔다고 엉뚱한 걸 잡으면 조용히 틀린다
+for bad in ('지배기업소유주지분순이익', '총포괄손익', '상품매출원가', '매출원가',
+            '영업외수익', '기타수익', '매출채권'):
+    chk(f'오검출 방지: {bad!r} 은 안 잡힌다', M.match_pl_lenient(bad) is None,
+        M.match_pl_lenient(bad))
+chk('오검출 방지: 품목별 수익 태그는 안 쓴다',
+    M.match_pl_lenient('상품매출', 'ifrs-full_RevenueFromSaleOfGoods') is None,
+    M.match_pl_lenient('상품매출', 'ifrs-full_RevenueFromSaleOfGoods'))
+
 print()
 print(f"잘못된 항목 {fails}건")
 sys.exit(1 if fails else 0)
