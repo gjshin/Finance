@@ -412,6 +412,84 @@ check('엔트리와 요구사항 경로가 args 에 그대로 있다',
       any(a.endswith('gpcm_mcp.py') for a in args) and
       any(a.endswith('requirements-mcp.txt') for a in args), args)
 
+# --- 10. 자가진단 · 베타 신뢰도 · 결과 검토 ------------------------------------
+d = W.gpcm_doctor()
+names = {c['항목']: c for c in d['점검']}
+check('점검에 파이썬·도구·키·출력폴더가 다 있다',
+      {'파이썬', '등록된 도구', 'DART 인증키', '출력 폴더'} <= set(names), list(names))
+check('선언한 도구가 전부 등록돼 있다', names['등록된 도구']['결과'] == '정상',
+      names['등록된 도구']['내용'])
+check('인증키는 값이 아니라 길이만 노출', 'TESTKEY' not in json.dumps(d, ensure_ascii=False),
+      names['DART 인증키']['내용'])
+check('실패 항목에는 조치가 붙는다',
+      all('조치' in c for c in d['점검'] if c['결과'] == '실패'),
+      [c for c in d['점검'] if c['결과'] == '실패'])
+
+saved = os.environ.pop('DART_API_KEY')
+d2 = W.gpcm_doctor()
+n2 = {c['항목']: c for c in d2['점검']}
+check('키가 없으면 실패로 잡고 발급처를 알려준다',
+      n2['DART 인증키']['결과'] == '실패' and 'opendart' in n2['DART 인증키']['조치'], n2['DART 인증키'])
+check('판정에 실패 건수가 실린다', '실패' in d2['판정'], d2['판정'])
+os.environ['DART_API_KEY'] = saved
+
+# 베타 신뢰도 — 시장과 정확히 2배로 움직이는 계열이면 beta=2, R²=1
+import numpy as np
+idx = pd.date_range('2020-01-31', periods=40, freq='ME')
+mkt = pd.Series(np.linspace(100, 200, 40) + np.sin(np.arange(40)) * 5, index=idx)
+mret = mkt.pct_change().dropna()
+stk = pd.Series([100.0] * 40, index=idx)
+for i in range(1, 40):
+    stk.iloc[i] = stk.iloc[i - 1] * (1 + 2 * mret.iloc[i - 1])
+summary = [{'Ticker': '005930', 'Company': '테스트', 'Market_Cap': 1000, 'IBD': 0, 'NCI': 0,
+            'Preferred': 0, 'Equity': 500, 'Pretax_Income': 100, 'Market_Index': 'KS11',
+            'Stock_Monthly_Prices_5Y': stk, 'Market_Monthly_Prices_5Y': mkt,
+            'Stock_Weekly_Prices_2Y': None, 'Market_Weekly_Prices_2Y': None}]
+q = M.QualityLog()
+wacc, dr = M.calculate_wacc_and_beta(['005930'], summary, 0.264, 0.033, 0.08, 0.0402,
+                                     0.035, '5Y', fiscal_year=2025, quality=q)
+check('R² 를 계산해 남긴다', round(summary[0]['Beta_5Y_R2'], 3) == 1.0, summary[0].get('Beta_5Y_R2'))
+check('관측치 수 n 을 남긴다', summary[0]['Beta_5Y_N'] == 39, summary[0].get('Beta_5Y_N'))
+check('Raw 베타는 종전 산식 그대로', abs(summary[0]['Beta_5Y_Raw'] - 2.0) < 1e-6, summary[0].get('Beta_5Y_Raw'))
+
+# 베타를 하나도 못 구하면 0.8 을 쓰되 반드시 기록한다
+q2 = M.QualityLog()
+bare = [{'Ticker': '005930', 'Company': '테스트', 'Market_Cap': 1000, 'IBD': 0, 'NCI': 0,
+         'Preferred': 0, 'Equity': 500, 'Pretax_Income': 100, 'Market_Index': 'KS11'}]
+w2, _ = M.calculate_wacc_and_beta(['005930'], bare, 0.264, 0.033, 0.08, 0.0402,
+                                  0.035, '5Y', fiscal_year=2025, quality=q2)
+msgs = ' '.join(r['Message'] for r in q2.rows)
+check('기본값 0.8 이 쓰이면 ERROR 로 남는다',
+      any(r['Level'] == M.SEV_ERROR and '0.8' in r['Message'] for r in q2.rows), msgs[:120])
+check('quality 를 안 넘겨도 종전처럼 동작한다',
+      M.calculate_wacc_and_beta(['005930'], bare, 0.264, 0.033, 0.08, 0.0402, 0.035, '5Y',
+                                fiscal_year=2025)[0]['Target_WACC'] == w2['Target_WACC'])
+
+# 결과 검토 — 이상치는 표시하되 배제하지 않는다
+mult = [
+    {'Ticker': 'A', 'Period': '2025.4Q', 'EV/EBITDA': 10.0, 'PER': 12.0},
+    {'Ticker': 'B', 'Period': '2025.4Q', 'EV/EBITDA': 11.0, 'PER': 13.0},
+    {'Ticker': 'C', 'Period': '2025.4Q', 'EV/EBITDA': 90.0, 'PER': -5.0},
+    {'Ticker': 'A', 'Period': '2024.4Q', 'EV/EBITDA': 99.0},
+]
+summ = [{'Ticker': 'A', 'Company': '가', 'Beta_5Y_R2': 0.45, 'Beta_5Y_N': 58},
+        {'Ticker': 'B', 'Company': '나', 'Beta_5Y_R2': 0.02, 'Beta_5Y_N': 55},
+        {'Ticker': 'C', 'Company': '다', 'Beta_5Y_R2': 0.50, 'Beta_5Y_N': 20}]
+rv = W._summarize(mult, summ, ['A', 'B', 'C'], '2025.4Q', '5Y')
+check('기준기간만 본다 (다른 분기 섞이지 않음)', rv['multiples']['EV/EBITDA']['n'] == 3,
+      rv['multiples']['EV/EBITDA'])
+check('중앙값에서 크게 벗어난 종목을 짚는다',
+      rv['multiples']['EV/EBITDA'].get('farFromMedian') == ['C'], rv['multiples']['EV/EBITDA'])
+check('0 이하 배수는 못 쓴다고 표시', rv['multiples']['PER'].get('nonPositive') == ['C'],
+      rv['multiples']['PER'])
+by_code = {b['code']: b for b in rv['beta']}
+check('R² 낮은 종목에 사유가 붙는다', any('설명력' in r for r in by_code['B']['caution']), by_code['B'])
+check('관측치 적은 종목에 사유가 붙는다', any('관측치' in r for r in by_code['C']['caution']), by_code['C'])
+check('R²·n 이 충분하면 주의가 없다', 'caution' not in by_code['A'], by_code['A'])
+check('재검토 목록에 사유가 함께 나온다',
+      {t['code'] for t in rv['toReview']} == {'B', 'C'}, rv['toReview'])
+check('자동 배제 금지 안내가 실린다', '배제 기준이 아닙니다' in rv['note'])
+
 print()
 print(f"잘못된 항목 {len(fails)}건")
 sys.exit(1 if fails else 0)

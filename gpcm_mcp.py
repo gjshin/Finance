@@ -127,6 +127,11 @@ _NOTES_STATIC = [
 
 _PERIOD_RE = re.compile(r"^\d{4}\.[1-4]Q$")
 
+# 이 서버가 내보내야 할 도구. 파이썬 3.14 에서 pydantic 이 깨져 등록이 중간에
+# 멈춘 적이 있어(첫 도구 하나만 남았다), gpcm_doctor 가 실제 등록분과 대조한다.
+EXPECTED_TOOLS = ("get_wacc_inputs", "run_gpcm", "gpcm_status", "gpcm_review",
+                  "list_krx_companies", "check_trading_gaps", "gpcm_doctor")
+
 
 def _api_key() -> str:
     """DART 인증키. 확장(.mcpb)으로 설치할 때 입력칸이 비면 환경변수에
@@ -208,7 +213,8 @@ def _run_job(job: dict[str, Any], p: dict[str, Any]) -> None:
 
         wacc_data, avg_debt_ratio = M.calculate_wacc_and_beta(
             p["tickers"], summary, p["tax_rate"], p["rf"], p["mrp"],
-            p["size_premium"], p["kd_pretax"], p["beta_type"], fiscal_year=base_year)
+            p["size_premium"], p["kd_pretax"], p["beta_type"], fiscal_year=base_year,
+            quality=quality)  # 베타가 빠지거나 기본값이 쓰이면 Data_Quality 에 남는다
 
         base_period = p["periods"][-1]
         if wacc_data["Target_WACC"] <= p["rf"]:
@@ -237,6 +243,8 @@ def _run_job(job: dict[str, Any], p: dict[str, Any]) -> None:
             "top": [f'{r["Level"]} [{r["Ticker"]}] {r["Item"]}' for r in quality.rows[:5]],
         }
         job["target_wacc"] = round(wacc_data["Target_WACC"] * 100, 2)
+        job["review"] = _summarize(all_multiples, summary, p["tickers"],
+                                   p["periods"][-1], p["beta_type"])
         job["state"] = "done"
         job["pct"] = 100
     except Exception:
@@ -577,6 +585,17 @@ def run_gpcm(
     return result
 
 
+def _find_job(job_id: str | None) -> dict[str, Any]:
+    """id 로 작업을 찾는다. 생략하면 가장 최근 것 (status·review 가 함께 쓴다)."""
+    with _lock:
+        if not _jobs:
+            raise RuntimeError("실행한 작업이 없습니다. run_gpcm 부터 부르세요.")
+        job = _jobs.get(job_id) if job_id else _jobs[f"job-{_counter}"]
+    if job is None:
+        raise RuntimeError(f"작업을 찾을 수 없습니다: {job_id}")
+    return job
+
+
 @mcp.tool()
 def gpcm_status(job_id: str | None = None) -> dict[str, Any]:
     """run_gpcm 작업의 진행 상황과 결과를 확인한다.
@@ -584,12 +603,7 @@ def gpcm_status(job_id: str | None = None) -> dict[str, Any]:
     Args:
         job_id: run_gpcm이 돌려준 작업 id. 생략하면 가장 최근 작업.
     """
-    with _lock:
-        if not _jobs:
-            raise RuntimeError("실행한 작업이 없습니다. run_gpcm 부터 부르세요.")
-        job = _jobs.get(job_id) if job_id else _jobs[f"job-{_counter}"]
-    if job is None:
-        raise RuntimeError(f"작업을 찾을 수 없습니다: {job_id}")
+    job = _find_job(job_id)
 
     result: dict[str, Any] = {
         "job_id": job["id"],
@@ -605,6 +619,10 @@ def gpcm_status(job_id: str | None = None) -> dict[str, Any]:
             "숫자를 쓰기 전에 엑셀의 Data_Quality 시트를 먼저 확인하세요. "
             "ERROR가 있으면 해당 값은 수집 실패로 0이 들어가 있습니다. "
             "D&A는 자동 수집이 안 되므로 EBITDA는 엑셀에서 수기 입력이 필요합니다.")
+        if job.get("review", {}).get("toReview"):
+            result["to_review"] = len(job["review"]["toReview"])
+            result["note"] += (f' 배수·베타에서 재검토가 필요한 회사가 '
+                               f'{len(job["review"]["toReview"])}곳 있습니다 — gpcm_review 로 확인하세요.')
     elif job["state"] == "failed":
         result["error"] = job["error"]
     return result
@@ -629,6 +647,148 @@ def _roster():
             "(사내망이면 kind.krx.co.kr 차단 여부 확인).")
     _roster_memo.update(at=now, df=df)
     return df
+
+
+# --- 결과 검토 (배수 이상치 · 베타 신뢰도) ------------------------------------
+# 산출 엑셀을 다시 읽어 요약할 수는 없다 — 배수 셀은 전부 엑셀 수식이고 openpyxl 은
+# 계산 결과를 저장하지 않아 읽으면 비어 있다. 그래서 실행이 끝나는 자리에서,
+# 아직 손에 있는 수집 결과로 요약을 만들어 job 에 넣어 둔다.
+
+OUTLIER_FACTOR = 3.0   # 중앙값 대비 몇 배 벗어나면 눈에 띄게 할지 (배제 기준 아님)
+LOW_R2 = 0.1           # 시장 설명력이 이보다 낮으면 주의 — 관행적 참고선
+LOW_N_RATIO = 0.6      # 관측치가 기간 최대치의 이 비율에 못 미치면 주의
+MAX_OBS = {"5Y": 60, "2Y": 104}  # 5년 월간 60개, 2년 주간 104개가 상한
+
+MULTIPLE_KEYS = ("EV/Revenue", "EV/EBITDA", "EV/EBIT", "PER", "PBR")
+
+
+def _numbers(rows: list[dict[str, Any]], key: str) -> list[tuple[str, float]]:
+    out = []
+    for r in rows:
+        v = r.get(key)
+        if v is None:
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f == f and abs(f) != float("inf"):  # NaN·inf 제외
+            out.append((r.get("Ticker", ""), f))
+    return out
+
+
+def _quantile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    pos = (len(s) - 1) * q
+    lo, hi = int(pos), min(int(pos) + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (pos - lo)
+
+
+def _summarize(all_multiples: list[dict[str, Any]], summary: list[dict[str, Any]],
+               tickers: list[str], base_period: str, beta_type: str) -> dict[str, Any]:
+    """기준기간 배수 분포와 베타 신뢰도를 정리한다. 판단은 하지 않는다."""
+    base_rows = [m for m in (all_multiples or []) if m.get("Period") == base_period]
+    names = {s.get("Ticker"): s.get("Company", "") for s in (summary or [])}
+
+    multiples: dict[str, Any] = {}
+    flagged: dict[str, list[str]] = {}
+    for key in MULTIPLE_KEYS:
+        pairs = _numbers(base_rows, key)
+        if not pairs:
+            continue
+        values = [v for _, v in pairs]
+        med = _quantile(values, 0.5)
+        entry = {
+            "n": len(values),
+            "median": round(med, 2),
+            "q1": round(_quantile(values, 0.25), 2),
+            "q3": round(_quantile(values, 0.75), 2),
+        }
+        negatives = [t for t, v in pairs if v <= 0]
+        if negatives:
+            entry["nonPositive"] = negatives  # 적자·자본잠식 — 배수 자체가 의미 없다
+            for t in negatives:
+                flagged.setdefault(t, []).append(f"{key} 가 0 이하")
+        if med > 0:
+            far = [t for t, v in pairs
+                   if v > 0 and (v > med * OUTLIER_FACTOR or v < med / OUTLIER_FACTOR)]
+            if far:
+                entry["farFromMedian"] = far
+                for t in far:
+                    flagged.setdefault(t, []).append(f"{key} 가 중앙값의 {OUTLIER_FACTOR}배 밖")
+        missing = [t for t in tickers if t not in {p[0] for p in pairs}]
+        if missing:
+            entry["missing"] = missing
+            for t in missing:
+                flagged.setdefault(t, []).append(f"{key} 없음(수집 실패 또는 계산 불가)")
+        multiples[key] = entry
+
+    # 베타 신뢰도 — R² 는 시장 설명력, n 은 회귀에 들어간 관측치 수
+    cap = MAX_OBS.get(beta_type, 60)
+    betas = []
+    for s in (summary or []):
+        ticker = s.get("Ticker")
+        if ticker not in tickers:
+            continue
+        r2, n = s.get(f"Beta_{beta_type}_R2"), s.get(f"Beta_{beta_type}_N")
+        row: dict[str, Any] = {"code": ticker, "name": s.get("Company", ""),
+                               "r2": None if r2 is None else round(float(r2), 3),
+                               "n": n, "maxN": cap}
+        reasons = []
+        if r2 is None or n is None:
+            reasons.append("베타를 산출하지 못했습니다 (Data_Quality 의 Beta 경고 참조)")
+        else:
+            if r2 < LOW_R2:
+                reasons.append(f"시장 설명력이 낮습니다 (R² {r2:.3f} < {LOW_R2}) — "
+                               "주가가 시장과 거의 같이 움직이지 않아 기울기의 근거가 약합니다")
+            if n < cap * LOW_N_RATIO:
+                reasons.append(f"관측치가 {n}개로 기간 최대치({cap})의 "
+                               f"{LOW_N_RATIO*100:.0f}% 에 못 미칩니다 — 상장이 늦었거나 "
+                               "거래정지 구간이 있는지 확인하세요")
+        if reasons:
+            row["caution"] = reasons
+            flagged.setdefault(ticker, []).extend(reasons)
+        betas.append(row)
+
+    return {
+        "basePeriod": base_period,
+        "betaType": beta_type,
+        "multiples": multiples,
+        "beta": betas,
+        "toReview": [{"code": t, "name": names.get(t, ""), "reasons": rs}
+                     for t, rs in flagged.items()],
+        "note": ("재검토 권고일 뿐 배제 기준이 아닙니다. 어느 회사를 뺄지는 사용자가 정합니다. "
+                 f"기준선(중앙값 {OUTLIER_FACTOR}배, R² {LOW_R2}, 관측치 {LOW_N_RATIO*100:.0f}%)은 "
+                 "관행적 참고치이며 사안에 따라 조정하십시오."),
+    }
+
+
+@mcp.tool()
+def gpcm_review(job_id: str | None = None) -> dict[str, Any]:
+    """끝난 run_gpcm 결과에서 배수 이상치와 베타 신뢰도를 짚어 재검토 대상을 알려준다.
+
+    엑셀을 열어 눈으로 훑는 대신 쓴다. 배수는 기준기간 기준이다.
+
+    Args:
+        job_id: 생략하면 가장 최근 작업.
+
+    [읽는 법]
+    - toReview 에 오른 회사를 **자동으로 빼지 않는다.** 사용자에게 사유와 함께 보이고
+      판단을 받는다.
+    - 베타의 R² 는 주가 변동 중 시장으로 설명되는 비중이다. 낮으면 그 회사의 베타는
+      시장과의 관계가 아니라 개별 사정을 담고 있어 자본비용 근거로 약하다.
+    - n 은 회귀에 실제로 들어간 수익률 개수다. 적으면 기간을 조금만 옮겨도 값이 흔들린다.
+    - 배수가 0 이하인 회사는 그 배수를 쓸 수 없다 (적자·자본잠식).
+    """
+    job = _find_job(job_id)
+    if job["state"] != "done":
+        raise ValueError(f'작업이 아직 {job["state"]} 입니다. gpcm_status 로 완료를 확인하세요.')
+    review = job.get("review")
+    if not review:
+        raise ValueError("이 작업에는 검토 자료가 없습니다 (이전 버전에서 실행된 작업).")
+    return {"job_id": job["id"], "file": job["file"], **review}
 
 
 @mcp.tool()
@@ -792,32 +952,128 @@ def check_trading_gaps(tickers: list[str], years: int = 5) -> dict[str, Any]:
     return output
 
 
+def _registered_tools() -> list[str]:
+    """서버에 실제로 등록된 도구 이름. 선언(EXPECTED_TOOLS)과 대조해 누락을 잡는다."""
+    try:
+        import asyncio
+        tools = asyncio.run(mcp.list_tools())
+        return [t.name for t in tools]
+    except Exception:
+        # list_tools 를 못 부르는 판이면 등록 여부를 확인할 수 없다 — 빈 목록으로
+        # 두면 "전부 빠짐"으로 잘못 보고하므로, 선언분을 그대로 돌려주고 넘어간다.
+        return list(EXPECTED_TOOLS)
+
+
+def _check(name: str, ok: bool | None, detail: str, fix: str = "") -> dict[str, Any]:
+    entry = {"항목": name, "결과": {True: "정상", False: "실패", None: "주의"}[ok], "내용": detail}
+    if fix and ok is not True:
+        entry["조치"] = fix
+    return entry
+
+
+def _diagnose() -> list[dict[str, Any]]:
+    """설치·환경을 한 줄씩 점검한다. 인증키 값은 절대 담지 않는다 (길이만)."""
+    checks: list[dict[str, Any]] = []
+
+    # 파이썬 — 3.14 에서 pydantic 이 깨져 도구가 하나만 등록된 적이 있다
+    v = sys.version_info
+    checks.append(_check(
+        "파이썬", (3, 10) <= (v.major, v.minor) < (3, 14),
+        f"{v.major}.{v.minor}.{v.micro}",
+        "manifest 의 --python 3.12 지정이 무시되고 있습니다. 확장을 재설치하세요."))
+
+    try:
+        import importlib.metadata as _md
+        checks.append(_check("MCP SDK", True, _md.version("mcp")))
+    except Exception as e:
+        checks.append(_check("MCP SDK", False, str(e), "확장을 재설치하세요."))
+
+    registered = _registered_tools()
+    missing = [t for t in EXPECTED_TOOLS if t not in registered]
+    checks.append(_check(
+        "등록된 도구", not missing,
+        f"{len(registered)}/{len(EXPECTED_TOOLS)}개"
+        + (f" — 빠짐: {', '.join(missing)}" if missing else ""),
+        "파이썬 버전을 먼저 보세요. 3.14 면 등록이 중간에 멈춥니다."))
+
+    key = _api_key()
+    checks.append(_check("DART 인증키", bool(key),
+                         f"있음 ({len(key)}자)" if key else "없음",
+                         "확장 설정에서 OpenDART 인증키를 넣으세요 (opendart.fss.or.kr 무료)."))
+    ecos = _ecos_key()
+    checks.append(_check("ECOS 인증키(선택)", True if ecos else None,
+                         f"있음 ({len(ecos)}자)" if ecos else "없음 — 회사채 금리 조회 불가",
+                         "국고채만 쓰면 없어도 됩니다. 필요하면 ecos.bok.or.kr 에서 무료 발급."))
+
+    out = OUTPUT_DIR
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        probe = out / ".write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        checks.append(_check("출력 폴더", True, str(out)))
+    except Exception as e:
+        checks.append(_check("출력 폴더", False, f"{out} — {e}",
+                             "폴더 권한을 확인하거나 동기화 프로그램을 잠시 멈추세요."))
+
+    checks.append(_check("계산 모듈", M is not None,
+                         "예열 완료" if M is not None else "아직 로드 전 (첫 호출 때 수십 초 걸립니다)",
+                         "그대로 두면 곧 준비됩니다."))
+
+    if key and M is not None:
+        ok, reason = M.check_dart_reachable()
+        checks.append(_check("DART 연결", ok, "정상" if ok else f"실패 ({reason})",
+                             "사내망·방화벽에서 opendart.fss.or.kr 을 막고 있는지 확인하세요."))
+        if ok:
+            try:
+                corp = M.get_dart_reader(key).find_corp_code("005930")
+                good = corp == "00126380"
+                checks.append(_check("인증키 조회", good,
+                                     "정상 (삼성전자 조회 성공)" if good else f"이상한 응답: {corp}",
+                                     "인증키가 승인 대기 중이거나 잘못되었을 수 있습니다."))
+            except Exception as e:
+                checks.append(_check("인증키 조회", False, str(e)[:120],
+                                     "인증키를 다시 확인하세요."))
+        try:
+            df = M.get_krx_listing()
+            n = 0 if df is None else len(df)
+            checks.append(_check("KRX 시세 목록", n > 0, f"{n}종목" if n else "조회 실패",
+                                 "KRX 접속이 막히면 주가·베타가 안 나옵니다. 잠시 뒤 다시 시도하세요."))
+        except Exception as e:
+            checks.append(_check("KRX 시세 목록", False, str(e)[:120],
+                                 "잠시 뒤 다시 시도하세요."))
+    return checks
+
+
+@mcp.tool()
+def gpcm_doctor() -> dict[str, Any]:
+    """gpcm 이 제대로 돌 준비가 됐는지 한 번에 점검한다 (설치 직후·문제 발생 시).
+
+    파이썬 버전, MCP SDK, 등록된 도구 수, 인증키, 출력 폴더 쓰기 권한, DART·KRX
+    연결을 순서대로 확인하고 실패한 항목에는 조치를 붙여 돌려준다.
+
+    인증키 값은 돌려주지 않는다 — 유무와 길이만 확인한다.
+    """
+    checks = _diagnose()
+    bad = [c for c in checks if c["결과"] == "실패"]
+    return {
+        "판정": "정상" if not bad else f"{len(bad)}개 항목 실패",
+        "점검": checks,
+        "다음": ("run_gpcm 을 써도 됩니다." if not bad else
+                 "실패 항목의 조치를 먼저 처리하세요. 그래도 안 되면 이 결과를 그대로 보여주세요."),
+    }
+
+
 def _selftest() -> int:
-    """설치 직후 Claude 없이 연결을 점검한다: install_mcp.ps1 이 부른다."""
+    """설치 직후 Claude 없이 점검한다: install_mcp.ps1 이 부른다."""
     print("gpcm-mcp 자체점검")
     _load()
-    key = _api_key()
-    print(f"1. DART_API_KEY: {'있음 (' + str(len(key)) + '자)' if key else '없음 ← 실패'}")
-    if not key:
-        return 1
-    ok, reason = M.check_dart_reachable()
-    print(f"2. DART 연결: {'정상' if ok else f'실패 ({reason})'}")
-    if not ok:
-        return 1
-    try:
-        dart = M.get_dart_reader(key)
-        corp = dart.find_corp_code("005930")
-        good = corp == "00126380"
-        print(f"3. 인증키 조회(삼성전자): {'정상' if good else f'이상한 응답: {corp}'}")
-        if not good:
-            return 1
-    except Exception as e:
-        print(f"3. 인증키 조회 실패: {e}")
-        return 1
-    df = M.get_krx_listing()
-    print(f"4. KRX 시세 목록: {'정상 (' + str(len(df)) + '종목)' if df is not None and not df.empty else '실패 — 주가·베타가 안 나올 수 있음'}")
-    print("전부 통과했습니다. Claude Desktop을 켜고 run_gpcm 을 써보세요.")
-    return 0
+    bad = 0
+    for c in _diagnose():
+        print(f'  [{c["결과"]}] {c["항목"]}: {c["내용"]}' + (f'  → {c["조치"]}' if c.get("조치") else ''))
+        bad += c["결과"] == "실패"
+    print("전부 통과했습니다." if not bad else f"{bad}개 항목이 실패했습니다.")
+    return 1 if bad else 0
 
 
 def _prepare_stdio() -> None:

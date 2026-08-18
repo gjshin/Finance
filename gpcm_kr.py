@@ -1425,7 +1425,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
 
     return raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name, screen_summary_data, base_year, base_qtr, base_date_str, all_multiples, quality
 
-def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_rate_input, rf_input, mrp_input, size_premium_input, kd_pretax_input, beta_type_input, fiscal_year=None):
+def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_rate_input, rf_input, mrp_input, size_premium_input, kd_pretax_input, beta_type_input, fiscal_year=None, quality=None):
     # 1.5. WACC Calculation (Target 기업용)
     # Beta 시트에서 계산될 Unlevered Beta를 엑셀에서 참조할 것이므로,
     # 여기서는 대략적인 값만 계산 (정확한 값은 엑셀 수식 기반)
@@ -1482,11 +1482,31 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
                         beta_raw = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else np.nan
                         beta_adj = (2/3) * beta_raw + (1/3) * 1
 
+                        # 신뢰도 — 값 계산은 그대로 두고 판단 근거만 덧붙인다.
+                        # R²: 주가 변동 중 시장으로 설명되는 비중 (낮으면 기울기가
+                        # 관계를 요약한 것이 아니다). n: 회귀에 실제로 들어간 관측치.
+                        comp_data['Beta_5Y_Raw'] = None if np.isnan(beta_raw) else float(beta_raw)
+                        comp_data['Beta_5Y_N'] = int(len(common_idx))
+                        with np.errstate(invalid='ignore'):
+                            corr = np.corrcoef(stock_ret_aligned, market_ret_aligned)[0, 1]
+                        comp_data['Beta_5Y_R2'] = None if np.isnan(corr) else float(corr ** 2)
+
                         if not np.isnan(beta_adj) and equity > 0:
                             unlevered_beta_5y = beta_adj / (1 + (1 - tax_rate) * de_ratio)
                             avg_unlevered_betas_5y.append(unlevered_beta_5y)
-            except Exception:
-                pass
+                        elif quality is not None:
+                            quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
+                                        f'5년 월간 베타를 평균에서 제외했습니다 '
+                                        f'(베타 산출 불가 또는 자기자본 0 이하). '
+                                        f'피어 평균이 이 회사 없이 계산됩니다.')
+                    elif quality is not None:
+                        quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
+                                    f'5년 월간 수익률 관측치가 {len(common_idx)}개뿐이라 '
+                                    f'(10개 초과 필요) 베타를 산출하지 않았습니다.')
+            except Exception as e:
+                if quality is not None:
+                    quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
+                                f'5년 월간 베타 계산이 실패해 평균에서 빠졌습니다: {e}')
 
         # 2Y Weekly Beta
         if stock_weekly_2y is not None and market_weekly_2y is not None and not stock_weekly_2y.empty and not market_weekly_2y.empty:
@@ -1503,20 +1523,47 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
                         beta_raw = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else np.nan
                         beta_adj = (2/3) * beta_raw + (1/3) * 1
 
+                        # 신뢰도 — 값 계산은 그대로 두고 판단 근거만 덧붙인다.
+                        # R²: 주가 변동 중 시장으로 설명되는 비중 (낮으면 기울기가
+                        # 관계를 요약한 것이 아니다). n: 회귀에 실제로 들어간 관측치.
+                        comp_data['Beta_2Y_Raw'] = None if np.isnan(beta_raw) else float(beta_raw)
+                        comp_data['Beta_2Y_N'] = int(len(common_idx))
+                        with np.errstate(invalid='ignore'):
+                            corr = np.corrcoef(stock_ret_aligned, market_ret_aligned)[0, 1]
+                        comp_data['Beta_2Y_R2'] = None if np.isnan(corr) else float(corr ** 2)
+
                         if not np.isnan(beta_adj) and equity > 0:
                             unlevered_beta_2y = beta_adj / (1 + (1 - tax_rate) * de_ratio)
                             avg_unlevered_betas_2y.append(unlevered_beta_2y)
-            except Exception:
-                pass
+                        elif quality is not None:
+                            quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
+                                        f'2년 주간 베타를 평균에서 제외했습니다 '
+                                        f'(베타 산출 불가 또는 자기자본 0 이하). '
+                                        f'피어 평균이 이 회사 없이 계산됩니다.')
+                    elif quality is not None:
+                        quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
+                                    f'2년 주간 수익률 관측치가 {len(common_idx)}개뿐이라 '
+                                    f'(20개 초과 필요) 베타를 산출하지 않았습니다.')
+            except Exception as e:
+                if quality is not None:
+                    quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
+                                f'2년 주간 베타 계산이 실패해 평균에서 빠졌습니다: {e}')
 
     # 평균값 계산
     avg_debt_ratio = np.mean(avg_debt_ratios) if avg_debt_ratios else 0.3
 
     # Beta Type에 따라 선택
-    if beta_type_input == "5Y":
-        avg_unlevered_beta = np.mean(avg_unlevered_betas_5y) if avg_unlevered_betas_5y else 0.8
-    else:
-        avg_unlevered_beta = np.mean(avg_unlevered_betas_2y) if avg_unlevered_betas_2y else 0.8
+    used_betas = avg_unlevered_betas_5y if beta_type_input == "5Y" else avg_unlevered_betas_2y
+    avg_unlevered_beta = np.mean(used_betas) if used_betas else 0.8
+    if not used_betas and quality is not None:
+        # 값(0.8)은 종전 그대로 둔다 — 다만 말없이 쓰이면 안 된다
+        quality.add(SEV_ERROR, '', '', 'Beta',
+                    f'피어 중 어느 곳에서도 {beta_type_input} 베타를 못 구해 '
+                    f'기본값 0.8 을 사용했습니다. WACC 이 이 가정 위에 서 있습니다.')
+    elif quality is not None and len(used_betas) < len(target_code_list):
+        quality.add(SEV_WARN, '', '', 'Beta',
+                    f'{beta_type_input} 무차입베타 평균에 {len(used_betas)}곳만 기여했습니다 '
+                    f'(대상 {len(target_code_list)}곳). 빠진 회사는 위 Beta 경고를 보세요.')
 
     # Target D/E Ratio 계산
     target_de_ratio = avg_debt_ratio / (1 - avg_debt_ratio) if avg_debt_ratio < 1 else 0
@@ -1741,6 +1788,20 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
                bd=BD, al=aR, nf='0.0000')
             adj_5y_row = r_beta
 
+            # 신뢰도 — 베타를 그대로 써도 되는지 판단할 근거.
+            # R²: 주가 변동 중 시장으로 설명되는 비중. 낮으면 그 기울기는 관계가
+            #     아니라 흩어진 점에 그은 선이다. n: 회귀에 실제로 들어간 관측치 수.
+            r_beta += 1
+            ws_beta.cell(r_beta, 1, 'R² (시장 설명력)')
+            ws_beta.cell(r_beta, 2).value = f'=RSQ(D{data_start_row+1}:D{data_end_row},E{data_start_row+1}:E{data_end_row})'
+            sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', size=9), bd=BD)
+            sc(ws_beta.cell(r_beta, 2), fo=Font(name='Arial', size=9), bd=BD, al=aR, nf='0.000')
+            r_beta += 1
+            ws_beta.cell(r_beta, 1, '관측치 수 n')
+            ws_beta.cell(r_beta, 2).value = f'=COUNT(D{data_start_row+1}:D{data_end_row})'
+            sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', size=9), bd=BD)
+            sc(ws_beta.cell(r_beta, 2), fo=Font(name='Arial', size=9), bd=BD, al=aR, nf='#,##0')
+
         else:
             ws_beta.cell(r_beta, 1, 'No 5Y price data available')
             sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', size=9, color='FF0000'))
@@ -1818,6 +1879,20 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
             sc(ws_beta.cell(r_beta, 2), fo=Font(name='Arial', bold=True, size=9), fi=PatternFill('solid', fgColor='FFF9C4'),
                bd=BD, al=aR, nf='0.0000')
             adj_2y_row = r_beta
+
+            # 신뢰도 — 베타를 그대로 써도 되는지 판단할 근거.
+            # R²: 주가 변동 중 시장으로 설명되는 비중. 낮으면 그 기울기는 관계가
+            #     아니라 흩어진 점에 그은 선이다. n: 회귀에 실제로 들어간 관측치 수.
+            r_beta += 1
+            ws_beta.cell(r_beta, 1, 'R² (시장 설명력)')
+            ws_beta.cell(r_beta, 2).value = f'=RSQ(D{data_start_row+1}:D{data_end_row},E{data_start_row+1}:E{data_end_row})'
+            sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', size=9), bd=BD)
+            sc(ws_beta.cell(r_beta, 2), fo=Font(name='Arial', size=9), bd=BD, al=aR, nf='0.000')
+            r_beta += 1
+            ws_beta.cell(r_beta, 1, '관측치 수 n')
+            ws_beta.cell(r_beta, 2).value = f'=COUNT(D{data_start_row+1}:D{data_end_row})'
+            sc(ws_beta.cell(r_beta, 1), fo=Font(name='Arial', size=9), bd=BD)
+            sc(ws_beta.cell(r_beta, 2), fo=Font(name='Arial', size=9), bd=BD, al=aR, nf='#,##0')
 
         else:
             ws_beta.cell(r_beta, 1, 'No 2Y price data available')
