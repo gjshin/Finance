@@ -6,7 +6,7 @@ gpcm_kr 모듈 전역을 원숭이 패칭해 파이프라인을 통째로 돌리
 따로 확인하는 것 하나 — stdout 위생. MCP 는 stdout 이 프로토콜 통로라,
 gpcm_kr 임포트(사이드바 실행)가 한 글자라도 흘리면 클라이언트 파서가 깨진다.
 """
-import os, subprocess, sys, tempfile
+import json, os, subprocess, sys, tempfile, threading
 from pathlib import Path
 
 import pandas as pd
@@ -171,6 +171,60 @@ proc = subprocess.run(
     capture_output=True, timeout=300)
 check('임포트·로드가 stdout 에 아무것도 안 쓴다', proc.stdout == b'',
       proc.stdout[:200])
+
+# 6-b. 로드 중에도 프로토콜 통로(stdout)가 살아 있어야 한다.
+# 예전엔 contextlib.redirect_stdout 으로 임포트 출력을 막았는데, 그건 프로세스
+# 전역이라 로드하는 60초 동안 서버 응답까지 통째로 stderr 로 샜다 — 클라이언트는
+# initialize 응답을 못 받고 끊었다(데스크톱 로그로 확인). 그 상황을 그대로 세운다.
+LEAK = 'IMPORT-CHATTER'
+PROTO = 'PROTOCOL-FRAME'
+script = (
+    'import sys, threading, time\n'
+    'import gpcm_mcp as W\n'
+    'started, done = threading.Event(), threading.Event()\n'
+    'def loader():\n'
+    '    with W._muted_stdout():\n'
+    f'        print("{LEAK}")\n'          # 임포트가 흘리는 출력을 흉내
+    '        started.set(); time.sleep(1.0)\n'
+    '    done.set()\n'
+    'threading.Thread(target=loader, daemon=True).start()\n'
+    'started.wait(5)\n'
+    f'print("{PROTO}"); sys.stdout.flush()\n'   # 그 사이 서버가 보내는 응답
+    'done.wait(5)\n'
+)
+proc2 = subprocess.run(
+    [sys.executable, '-c', script],
+    cwd=os.path.dirname(os.path.abspath(__file__)),
+    env={**os.environ, 'DART_API_KEY': 'x' * 40},
+    capture_output=True, text=True, timeout=120)
+check('로드 중에도 프로토콜 출력은 stdout 으로 나간다', PROTO in proc2.stdout, proc2.stdout[:200])
+check('로드가 흘린 출력만 stderr 로 빠진다',
+      LEAK not in proc2.stdout and LEAK in proc2.stderr, proc2.stdout[:200])
+
+# 6-c. 종단 — 실제로 서버를 띄워 initialize 응답이 stdout 으로 돌아오는지 본다.
+server = subprocess.Popen(
+    [sys.executable, 'gpcm_mcp.py'],
+    cwd=os.path.dirname(os.path.abspath(__file__)),
+    env={**os.environ, 'DART_API_KEY': 'x' * 40},
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+try:
+    server.stdin.write(json.dumps({
+        "jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                   "clientInfo": {"name": "test", "version": "0"}},
+    }) + '\n')
+    server.stdin.flush()
+    box: list[str] = []
+    reader = threading.Thread(target=lambda: box.append(server.stdout.readline()), daemon=True)
+    reader.start()
+    reader.join(timeout=30)
+    reply = json.loads(box[0]) if box and box[0].strip() else {}
+    check('initialize 응답이 30초 안에 stdout 으로 온다', reply.get('id') == 0, box[:1])
+    check('응답에 도구 능력이 실려 있다',
+          'tools' in reply.get('result', {}).get('capabilities', {}), reply.get('result'))
+finally:
+    server.kill()
+    server.wait(timeout=10)
 
 # --- 7. 오늘 상장사 명단 (KRX 차단 환경 — 응답을 흉내 내 검증) --------------------
 IND = pd.DataFrame([

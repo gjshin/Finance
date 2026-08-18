@@ -27,12 +27,57 @@ from mcp.server.mcpserver import MCPServer
 
 mcp = MCPServer("gpcm")
 
+class _ThreadRoutedStdout:
+    """sys.stdout 대역 — '조용히' 표시한 스레드의 출력만 stderr 로 보낸다.
+
+    stdout 은 MCP 프로토콜 통로라 gpcm_kr 임포트가 흘리는 안내문(streamlit 의
+    "to view this Streamlit app..." 등)이 섞이면 안 된다. 그렇다고
+    contextlib.redirect_stdout 을 쓰면 안 된다 — 그건 프로세스 전역이라,
+    백그라운드 스레드가 임포트하는 동안 서버가 보내는 JSON-RPC 응답까지 통째로
+    stderr 로 새어 클라이언트가 initialize 응답을 못 받고 60초 뒤 끊는다(실측).
+    그래서 스레드 단위로만 돌린다. 프로토콜을 쓰는 스레드는 손대지 않는다.
+    """
+
+    _muted = threading.local()
+
+    def __init__(self, real, alt):
+        self._real, self._alt = real, alt
+
+    def _target(self):
+        return self._alt if getattr(self._muted, "on", False) else self._real
+
+    def write(self, s):
+        return self._target().write(s)
+
+    def flush(self):
+        self._target().flush()
+
+    def __getattr__(self, name):  # encoding·buffer·fileno·reconfigure 등은 원본 것
+        return getattr(self._real, name)
+
+
+@contextlib.contextmanager
+def _muted_stdout():
+    """이 스레드에서만 print 를 stderr 로 보낸다 (다른 스레드는 그대로)."""
+    local = _ThreadRoutedStdout._muted
+    previous = getattr(local, "on", False)
+    local.on = True
+    try:
+        yield
+    finally:
+        local.on = previous
+
+
+# 임포트 시점에 갈아 끼운다 — gpcm_kr 로드가 main() 을 거치지 않고 일어나는
+# 경로(테스트·직접 임포트)에서도 _muted_stdout 이 실제로 듣게 하려면 여기여야 한다.
+sys.stdout = _ThreadRoutedStdout(sys.stdout, sys.stderr)
+
+
 # gpcm_kr 은 임포트가 무겁다: streamlit·pandas·scipy 를 끌고 오고, 사이드바 블록이
 # 실행되며 KRX 목록까지 조회한다 — 합쳐서 수십 초. Claude 는 initialize 응답을
 # 60초만 기다리므로, 서버 기동 시 이걸 먼저 하면 접속 자체가 끊긴다(실측 80초).
 # 그래서 기동은 빈손으로 즉시 하고, 모듈은 뒤에서(main 의 예열 스레드) 또는
-# 첫 도구 호출에서 로드한다. stdout 은 MCP 프로토콜 통로라 임포트 중 새는 출력을
-# stderr 로 돌린다.
+# 첫 도구 호출에서 로드한다.
 M = None
 _load_lock = threading.Lock()
 
@@ -43,7 +88,7 @@ def _load():
     with _load_lock:
         if M is None:
             print("gpcm-mcp: 계산 모듈 로드 중...", file=sys.stderr)
-            with contextlib.redirect_stdout(sys.stderr):
+            with _muted_stdout():
                 import gpcm_kr as _M
             M = _M
             print("gpcm-mcp: 계산 모듈 준비 완료", file=sys.stderr)
@@ -54,6 +99,7 @@ OUTPUT_DIR = Path.home() / "Documents" / "GPCM"
 # 사이드바 기본값과 동일하게 유지한다 (gpcm_kr.py 의 위젯 기본값)
 BETA_TYPES = ("5Y", "2Y")
 MAX_TICKERS = 30  # 티커당 수 초~수십 초 — 이 이상은 앱에서 돌리는 게 낫다
+PREHEAT_DELAY_SEC = 5  # 접속 handshake 가 끝난 뒤에 예열을 시작한다
 
 # 원본은 gpcm_kr.py UI 블록의 notes_list (Valuation Methodology Notes).
 # 그쪽 파일은 수정하지 않기로 해 사본을 둔다 — 저쪽이 바뀌면 여기도 맞출 것.
@@ -147,6 +193,11 @@ _counter = 0
 
 def _work(job: dict[str, Any]) -> None:
     p = job["params"]
+    with _muted_stdout():  # 수집 중 라이브러리가 흘리는 출력이 프로토콜에 섞이지 않게
+        _run_job(job, p)
+
+
+def _run_job(job: dict[str, Any], p: dict[str, Any]) -> None:
     try:
         dart = M.get_dart_reader(p["api_key"])
         rec = Recorder(job)
@@ -570,9 +621,11 @@ def main() -> None:
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     _prepare_stdio()
-    # 접속(initialize)은 즉시 응답하고, 무거운 모듈은 뒤에서 예열한다.
+    # 접속(initialize·tools/list)은 즉시 응답하고, 무거운 모듈은 뒤에서 예열한다.
     # 보통 사용자가 첫 도구를 부를 때쯤엔 준비가 끝나 있다.
-    threading.Thread(target=_load, daemon=True).start()
+    # 예열을 몇 초 늦추는 이유: 임포트가 GIL 을 오래 잡아 handshake 응답이
+    # 밀리면 클라이언트가 접속을 포기한다. 손잡이부터 잡고 짐을 든다.
+    threading.Timer(PREHEAT_DELAY_SEC, _load).start()
     mcp.run()
 
 
