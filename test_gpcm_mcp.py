@@ -291,9 +291,11 @@ check('자동 배제 금지 안내가 실린다', '자동 배제' in g['meta']['
 # --- 8. 시장금리 조회 (WACC 입력값의 근거) -------------------------------------
 class FakeRateFdr:
     """국고채만 답하는 FDR 대역 — 회사채는 FDR 에 없다."""
-    def __init__(self, rows=None): self.rows = rows
+    def __init__(self, rows=None, symbol='KR5YT=RR'):
+        self.rows, self.symbol, self.asked = rows, symbol, []
     def DataReader(self, symbol, start=None, end=None):
-        if symbol != 'KR5YT=RR':
+        self.asked.append(symbol)
+        if symbol != self.symbol:
             raise RuntimeError(symbol)
         if self.rows is None:
             return pd.DataFrame()
@@ -352,6 +354,32 @@ check('무키 경로가 막히면 ECOS 로 넘어간다', w2['kd_pretax']['value
 check('등급에 맞는 항목코드를 이름으로 찾는다',
       any('010220000' in c for c in calls) and not any('010210000' in c for c in calls), calls)
 check('ECOS 출처와 항목명이 남는다', '회사채(3년, BBB-)' in w2['kd_pretax']['source'], w2['kd_pretax'])
+os.environ.pop('ECOS_API_KEY', None)
+
+# 만기는 고정이 아니다 — 평가 대상 현금흐름 기간에 맞춰 바뀐다
+check('만기 표기를 "10"·"10Y"·"10년" 모두 같게 읽는다',
+      {W._maturity(x, 'rf') for x in ('10', '10Y', '10년', ' 10 년 ')} == {'10년'},
+      [W._maturity(x, 'rf') for x in ('10', '10Y', '10년')])
+check('빈 값이면 종목별 기본 만기', (W._maturity('', 'rf'), W._maturity('', 'kd')) == ('5년', '3년'))
+expect_error('만기 형식 오류는 거절', lambda: W._maturity('오년', 'rf'), '만기는')
+
+f10 = FakeRateFdr([4.05, 4.11], symbol='KR10YT=RR')
+M.fdr = f10
+w3 = W.get_wacc_inputs(as_of='2026-08-18', rf_maturity='10Y')
+check('10년을 요청하면 10년 심볼로 조회한다', f10.asked == ['KR10YT=RR'], f10.asked)
+check('라벨·citation 에 요청한 만기가 찍힌다',
+      w3['rf']['label'] == '국고채 10년' and '국고채 10년' in w3['citation'], w3['rf']['label'])
+check('만기 선택이 판단 항목으로 남는다', '10년' in w3['judgment']['maturity'], w3['judgment']['maturity'])
+
+# ECOS 경로도 만기를 이름으로 찾고, 없는 만기면 있는 항목을 알려준다
+os.environ['ECOS_API_KEY'] = 'ECOSKEY'
+W._ecos_get = fake_ecos
+M.fdr = FakeRateFdr(None, symbol='없음')
+w4 = W.get_wacc_inputs(as_of='2026-08-18', rf_maturity='5년')
+check('ECOS 도 요청한 만기의 항목을 찾는다', '국고채(5년)' in w4['rf']['source'], w4['rf']['source'])
+w5 = W.get_wacc_inputs(as_of='2026-08-18', rf_maturity='20년')
+check('없는 만기는 실제로 있는 항목을 알려준다',
+      '국고채(5년)' in w5['rf']['failed'], w5['rf'].get('failed'))
 os.environ.pop('ECOS_API_KEY', None)
 
 # 근거 문장이 실제로 엑셀 Notes 에 실리는지

@@ -254,11 +254,25 @@ ECOS_MARKET_RATES = "817Y002"  # 한국은행 ECOS 통계표: 시장금리(일�
 BOND_GRADES = ("AA-", "BBB-")
 # 항목코드는 하드코딩하지 않는다. ECOS 가 코드를 바꾸면 조용히 엉뚱한 금리를 물어오게
 # 되므로, 통계표의 항목 목록을 받아 이름으로 찾는다.
-RATE_KINDS = {
-    "rf": ("국고채", "5년"),
-    "kd": ("회사채", "3년"),
-}
-FDR_SYMBOLS = {"rf": "KR5YT=RR"}  # 무키 경로 — 회사채는 FDR 에 없어 rf 만 시도한다
+RATE_BONDS = {"rf": "국고채", "kd": "회사채"}
+# 만기는 고정하지 않는다. 평가에서 rf 만기는 현금흐름 기간에 맞춰 5년·10년을 오간다.
+DEFAULT_MATURITY = {"rf": "5년", "kd": "3년"}
+# 무키 경로 — FDR 에 있는 국채 만기만. 회사채는 FDR 에 없어 ECOS 로 간다.
+FDR_TREASURY = {"1년": "KR1YT=RR", "3년": "KR3YT=RR", "5년": "KR5YT=RR", "10년": "KR10YT=RR"}
+
+_MATURITY_RE = re.compile(r"^\s*(\d+)\s*(?:년|y|Y)?\s*$")
+
+
+def _maturity(text: str, kind: str) -> str:
+    """"10" · "10Y" · "10년" 을 모두 "10년" 으로 읽는다. 어떤 만기가 실제로 있는지는
+    조회할 때 소스가 답한다 — 여기서 허용 목록을 박으면 소스가 늘 때 막힌다."""
+    raw = (text or "").strip()
+    if not raw:
+        return DEFAULT_MATURITY[kind]
+    m = _MATURITY_RE.match(raw)
+    if not m:
+        raise ValueError(f'만기는 "5년"·"10Y"·"10" 처럼 적습니다: {text!r}')
+    return f"{int(m.group(1))}년"
 
 
 def _ecos_key() -> str:
@@ -278,9 +292,9 @@ def _get_fdr():
     return fdr
 
 
-def _rate_from_fdr(kind: str, asof: datetime) -> dict[str, Any] | None:
+def _rate_from_fdr(kind: str, asof: datetime, maturity: str) -> dict[str, Any] | None:
     """무키 경로. 못 구하면 None — 여기서 조용히 기본값을 만들지 않는다."""
-    symbol = FDR_SYMBOLS.get(kind)
+    symbol = FDR_TREASURY.get(maturity) if kind == "rf" else None
     if symbol is None:
         return None
     try:
@@ -318,16 +332,21 @@ def _ecos_item_code(words: tuple[str, ...], grade: str | None) -> tuple[str, str
     wanted = list(words) + ([grade] if grade else [])
     hits = [r for r in rows if all(w in r.get("ITEM_NAME", "") for w in wanted)]
     if not hits:
+        # 어떤 만기·등급이 실제로 있는지 보여준다 — "없다"로 끝내면 다음 수를 못 둔다
+        available = [r.get("ITEM_NAME", "") for r in rows
+                     if words and words[0] in r.get("ITEM_NAME", "")]
         raise RuntimeError(
-            f"ECOS 통계표 {ECOS_MARKET_RATES} 에서 '{' '.join(wanted)}' 항목을 못 찾았습니다.")
+            f"ECOS 통계표 {ECOS_MARKET_RATES} 에서 '{' '.join(wanted)}' 항목을 못 찾았습니다."
+            + (f" 이 통계표에 있는 {words[0]} 항목: {', '.join(available)}" if available else ""))
     hit = min(hits, key=lambda r: len(r.get("ITEM_NAME", "")))
     return hit["ITEM_CODE"], hit["ITEM_NAME"]
 
 
-def _rate_from_ecos(kind: str, asof: datetime, grade: str | None) -> dict[str, Any] | None:
+def _rate_from_ecos(kind: str, asof: datetime, grade: str | None,
+                    maturity: str) -> dict[str, Any] | None:
     if not _ecos_key():
         return None
-    code, name = _ecos_item_code(RATE_KINDS[kind], grade)
+    code, name = _ecos_item_code((RATE_BONDS[kind], maturity), grade)
     start = (asof - timedelta(days=30)).strftime("%Y%m%d")
     payload = _ecos_get(
         f"StatisticSearch/{_ecos_key()}/json/kr/1/100/{ECOS_MARKET_RATES}/D/"
@@ -344,11 +363,12 @@ def _rate_from_ecos(kind: str, asof: datetime, grade: str | None) -> dict[str, A
     }
 
 
-def _fetch_rate(kind: str, asof: datetime, grade: str | None) -> tuple[dict[str, Any] | None, list[str]]:
+def _fetch_rate(kind: str, asof: datetime, grade: str | None,
+                maturity: str) -> tuple[dict[str, Any] | None, list[str]]:
     """무키(FDR) → ECOS 순으로 시도하고, 실패한 경로를 그대로 남긴다."""
     tried: list[str] = []
-    for label, getter in (("FinanceDataReader", lambda: _rate_from_fdr(kind, asof)),
-                          ("한국은행 ECOS", lambda: _rate_from_ecos(kind, asof, grade))):
+    for label, getter in (("FinanceDataReader", lambda: _rate_from_fdr(kind, asof, maturity)),
+                          ("한국은행 ECOS", lambda: _rate_from_ecos(kind, asof, grade, maturity))):
         try:
             got = getter()
         except Exception as exc:
@@ -362,7 +382,8 @@ def _fetch_rate(kind: str, asof: datetime, grade: str | None) -> tuple[dict[str,
 
 
 @mcp.tool()
-def get_wacc_inputs(as_of: str = "", bond_grade: str = "AA-") -> dict[str, Any]:
+def get_wacc_inputs(as_of: str = "", bond_grade: str = "AA-",
+                    rf_maturity: str = "5년", kd_maturity: str = "3년") -> dict[str, Any]:
     """기준일 시장금리를 조회해 WACC 입력값(무위험이자율·타인자본비용)을 근거와 함께 제시한다.
 
     run_gpcm 을 부르기 전에 이걸 먼저 불러 rf·kd_pretax 후보와 출처를 확인한다.
@@ -370,6 +391,11 @@ def get_wacc_inputs(as_of: str = "", bond_grade: str = "AA-") -> dict[str, Any]:
     Args:
         as_of: 기준일 YYYY-MM-DD. 비우면 오늘. 그 날짜 이전의 최근 고시치를 쓴다.
         bond_grade: 회사채 신용등급 (AA- 또는 BBB-). 평가대상의 신용도에 맞춘다.
+        rf_maturity: 국고채 만기. "5년"·"10Y"·"10" 형식 모두 된다. 기본 5년.
+            평가 대상 현금흐름의 기간에 맞춘다 — 영구현금흐름 전제면 10년·20년을
+            쓰기도 한다. 무키 경로는 1·3·5·10년만 되고, 그 밖(20·30년)은
+            ECOS 인증키가 있어야 한다.
+        kd_maturity: 회사채 만기. 기본 3년 (ECOS 시장금리 통계표에 실린 만기).
 
     [쓰는 규칙]
     - 여기서 나온 값을 **그대로 run_gpcm 에 넣지 않는다.** 사용자에게 값과 출처를
@@ -382,13 +408,15 @@ def get_wacc_inputs(as_of: str = "", bond_grade: str = "AA-") -> dict[str, Any]:
     grade = (bond_grade or "").strip().upper()
     if grade not in BOND_GRADES:
         raise ValueError(f"bond_grade 는 {' 또는 '.join(BOND_GRADES)} 입니다: {bond_grade!r}")
+    rf_term = _maturity(rf_maturity, "rf")
+    kd_term = _maturity(kd_maturity, "kd")
     try:
         asof = datetime.strptime(as_of.strip(), "%Y-%m-%d") if as_of.strip() else datetime.now()
     except ValueError:
         raise ValueError(f"as_of 는 YYYY-MM-DD 형식입니다: {as_of!r}")
 
-    rf, rf_tried = _fetch_rate("rf", asof, None)
-    kd, kd_tried = _fetch_rate("kd", asof, grade)
+    rf, rf_tried = _fetch_rate("rf", asof, None, rf_term)
+    kd, kd_tried = _fetch_rate("kd", asof, grade, kd_term)
     if rf is None and kd is None:
         raise RuntimeError(
             "시장금리를 한 곳에서도 못 받았습니다. rf·kd_pretax 를 직접 넣어야 합니다.\n"
@@ -401,8 +429,8 @@ def get_wacc_inputs(as_of: str = "", bond_grade: str = "AA-") -> dict[str, Any]:
         "asOf": asof.strftime("%Y-%m-%d"),
         "fetchedAt": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
-    for key, got, label, tried in (("rf", rf, "국고채 5년", rf_tried),
-                                   ("kd_pretax", kd, f"회사채 3년 {grade}", kd_tried)):
+    for key, got, label, tried in (("rf", rf, f"국고채 {rf_term}", rf_tried),
+                                   ("kd_pretax", kd, f"회사채 {kd_term} {grade}", kd_tried)):
         if got:
             result[key] = {"label": label, **got}
             parts.append(f'{label} {got["value"]}% ({got["rateDate"]}, {got["source"]})')
@@ -415,6 +443,8 @@ def get_wacc_inputs(as_of: str = "", bond_grade: str = "AA-") -> dict[str, Any]:
         "mrp": "시장위험프리미엄 — 관측치가 아니라 판단 항목이라 조회하지 않는다. 사용자에게 묻는다.",
         "size_premium": "규모프리미엄 — 위와 같다. 참고 관행값은 있으나 대상 규모에 따라 달라진다.",
         "tax_rate": "한계세율 — 사업연도 세율표에 따르되 대상의 과세표준 구간 판단이 필요하다.",
+        "maturity": f"만기 선택도 판단이다 (지금 rf={rf_term}, kd={kd_term}). "
+                    "평가 대상 현금흐름의 기간에 맞춘다 — 필요하면 rf_maturity 를 바꿔 다시 부른다.",
     }
     result["note"] = ("값을 그대로 쓰지 말고 사용자에게 확정을 받는다. "
                       "확정 후 run_gpcm(rate_source=citation) 으로 넘기면 엑셀 Notes 에 근거가 남는다.")
