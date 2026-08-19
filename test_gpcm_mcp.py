@@ -323,7 +323,7 @@ except RuntimeError as exc:
     check('전부 실패하면 값을 만들지 않고 실패를 알린다', '직접 넣어야' in str(exc), str(exc)[:80])
 
 os.environ['ECOS_API_KEY'] = '${user_config.ecos_api_key}'
-check('미입력 확장 리터럴은 키 없음으로 본다', W._ecos_key() == '', W._ecos_key())
+check('미입력 확장 리터럴은 키 없음으로 본다', M.ecos_key_from_env() == '', M.ecos_key_from_env())
 os.environ.pop('ECOS_API_KEY', None)
 
 try:
@@ -347,7 +347,7 @@ def fake_ecos(path):
         {'TIME': '20260813', 'DATA_VALUE': '4.10'},
         {'TIME': '20260814', 'DATA_VALUE': '4.12'},
     ]}}
-W._ecos_get = fake_ecos
+M._ecos_get = fake_ecos
 M.fdr = FakeRateFdr(None)          # 무키 경로 실패 → ECOS 로 넘어가야 한다
 w2 = W.get_wacc_inputs(as_of='2026-08-18', bond_grade='BBB-')
 check('무키 경로가 막히면 ECOS 로 넘어간다', w2['kd_pretax']['value'] == 4.12, w2['kd_pretax'])
@@ -358,10 +358,10 @@ os.environ.pop('ECOS_API_KEY', None)
 
 # 만기는 고정이 아니다 — 평가 대상 현금흐름 기간에 맞춰 바뀐다
 check('만기 표기를 "10"·"10Y"·"10년" 모두 같게 읽는다',
-      {W._maturity(x, 'rf') for x in ('10', '10Y', '10년', ' 10 년 ')} == {'10년'},
-      [W._maturity(x, 'rf') for x in ('10', '10Y', '10년')])
-check('빈 값이면 종목별 기본 만기', (W._maturity('', 'rf'), W._maturity('', 'kd')) == ('5년', '3년'))
-expect_error('만기 형식 오류는 거절', lambda: W._maturity('오년', 'rf'), '만기는')
+      {M.maturity(x, 'rf') for x in ('10', '10Y', '10년', ' 10 년 ')} == {'10년'},
+      [M.maturity(x, 'rf') for x in ('10', '10Y', '10년')])
+check('빈 값이면 종목별 기본 만기', (M.maturity('', 'rf'), M.maturity('', 'kd')) == ('5년', '3년'))
+expect_error('만기 형식 오류는 거절', lambda: M.maturity('오년', 'rf'), '만기는')
 
 f10 = FakeRateFdr([4.05, 4.11], symbol='KR10YT=RR')
 M.fdr = f10
@@ -373,7 +373,7 @@ check('만기 선택이 판단 항목으로 남는다', '10년' in w3['judgment'
 
 # ECOS 경로도 만기를 이름으로 찾고, 없는 만기면 있는 항목을 알려준다
 os.environ['ECOS_API_KEY'] = 'ECOSKEY'
-W._ecos_get = fake_ecos
+M._ecos_get = fake_ecos
 M.fdr = FakeRateFdr(None, symbol='없음')
 w4 = W.get_wacc_inputs(as_of='2026-08-18', rf_maturity='5년')
 check('ECOS 도 요청한 만기의 항목을 찾는다', '국고채(5년)' in w4['rf']['source'], w4['rf']['source'])
@@ -635,10 +635,10 @@ expect_error('target_ticker 가 목록에 없으면 거절',
 
 # 기준일 표기 — 분기 표기도 받는다
 check('as_of 가 분기 표기를 분기말로 읽는다',
-      W._as_of_date('2025.4Q').strftime('%Y-%m-%d') == '2025-12-31')
+      M.as_of_date('2025.4Q').strftime('%Y-%m-%d') == '2025-12-31')
 check('as_of 가 날짜 표기도 받는다',
-      W._as_of_date('2026-06-30').strftime('%Y-%m-%d') == '2026-06-30')
-expect_error('as_of 형식 오류는 거절', lambda: W._as_of_date('2026/06/30'), '형식입니다')
+      M.as_of_date('2026-06-30').strftime('%Y-%m-%d') == '2026-06-30')
+expect_error('as_of 형식 오류는 거절', lambda: M.as_of_date('2026/06/30'), '형식입니다')
 
 # 버전 — 두 설치 경로가 같은 판인지 확인할 근거
 d3 = W.gpcm_doctor()

@@ -287,163 +287,6 @@ def _run_job(job: dict[str, Any], p: dict[str, Any]) -> None:
         job["error"] = traceback.format_exc(limit=3)
 
 
-# --- 시장금리 (WACC 입력값의 근거) ------------------------------------------
-# rf·Kd 는 판단이 아니라 기준일의 시장 관측치다. 값만 손으로 넣으면 나중에
-# "이 3.3%는 어디서 왔나"에 답할 근거가 산출물에 남지 않는다. 조회해서 값과 함께
-# 출처·금리기준일을 돌려주고, 그 문장을 그대로 엑셀 Notes 에 실을 수 있게 한다.
-# MRP·size premium 은 조회 대상이 아니다 — 시장에서 관측되지 않는 판단 항목이다.
-
-ECOS_MARKET_RATES = "817Y002"  # 한국은행 ECOS 통계표: 시장금리(일별)
-BOND_GRADES = ("AA-", "BBB-")
-# 항목코드는 하드코딩하지 않는다. ECOS 가 코드를 바꾸면 조용히 엉뚱한 금리를 물어오게
-# 되므로, 통계표의 항목 목록을 받아 이름으로 찾는다.
-RATE_BONDS = {"rf": "국고채", "kd": "회사채"}
-# 만기는 고정하지 않는다. 평가에서 rf 만기는 현금흐름 기간에 맞춰 5년·10년을 오간다.
-DEFAULT_MATURITY = {"rf": "5년", "kd": "3년"}
-# 무키 경로 — FDR 에 있는 국채 만기만. 회사채는 FDR 에 없어 ECOS 로 간다.
-FDR_TREASURY = {"1년": "KR1YT=RR", "3년": "KR3YT=RR", "5년": "KR5YT=RR", "10년": "KR10YT=RR"}
-
-_MATURITY_RE = re.compile(r"^\s*(\d+)\s*(?:년|y|Y)?\s*$")
-
-
-def _maturity(text: str, kind: str) -> str:
-    """"10" · "10Y" · "10년" 을 모두 "10년" 으로 읽는다. 어떤 만기가 실제로 있는지는
-    조회할 때 소스가 답한다 — 여기서 허용 목록을 박으면 소스가 늘 때 막힌다."""
-    raw = (text or "").strip()
-    if not raw:
-        return DEFAULT_MATURITY[kind]
-    m = _MATURITY_RE.match(raw)
-    if not m:
-        raise ValueError(f'만기는 "5년"·"10Y"·"10" 처럼 적습니다: {text!r}')
-    return f"{int(m.group(1))}년"
-
-
-def _ecos_key() -> str:
-    """한국은행 ECOS 인증키(선택). 미입력 시 확장이 `${...}` 리터럴을 넘긴다."""
-    value = (os.environ.get("ECOS_API_KEY") or "").strip()
-    if value.startswith("${") and value.endswith("}"):
-        return ""
-    return value
-
-
-def _as_of_date(as_of: str) -> datetime:
-    """기준일을 읽는다. "2026-06-30" 도 되고 "2026.2Q" 도 된다.
-
-    금리는 기준일 시점을 써야 한다 — 평가기준일이 작년 말인데 오늘 금리를 넣으면
-    조서의 다른 숫자와 시점이 어긋난다. 그래서 GPCM 기간 표기를 그대로 받아
-    분기말로 바꿔준다.
-    """
-    text = (as_of or "").strip()
-    if not text:
-        return datetime.now()
-    if _PERIOD_RE.match(text):
-        year, qtr = _parse_period(text)
-        month, day = {"1Q": (3, 31), "2Q": (6, 30), "3Q": (9, 30), "4Q": (12, 31)}[qtr]
-        return datetime(year, month, day)
-    try:
-        return datetime.strptime(text, "%Y-%m-%d")
-    except ValueError:
-        raise ValueError(f'as_of 는 "2026-06-30" 또는 "2026.2Q" 형식입니다: {as_of!r}')
-
-
-def _get_fdr():
-    """FinanceDataReader. gpcm_kr 이 이미 올라와 있으면 그것을 쓴다(테스트도 여기 문다)."""
-    if M is not None:
-        return M.fdr
-    with _muted_stdout():
-        import FinanceDataReader as fdr
-    return fdr
-
-
-def _rate_from_fdr(kind: str, asof: datetime, maturity: str) -> dict[str, Any] | None:
-    """무키 경로. 못 구하면 None — 여기서 조용히 기본값을 만들지 않는다."""
-    symbol = FDR_TREASURY.get(maturity) if kind == "rf" else None
-    if symbol is None:
-        return None
-    try:
-        df = _get_fdr().DataReader(symbol, (asof - timedelta(days=30)).strftime("%Y-%m-%d"),
-                                   asof.strftime("%Y-%m-%d"))
-    except Exception:
-        return None
-    if df is None or len(df) == 0 or "Close" not in getattr(df, "columns", []):
-        return None
-    row = df.dropna(subset=["Close"]).tail(1)
-    if len(row) == 0:
-        return None
-    return {
-        "value": round(float(row["Close"].iloc[0]), 3),
-        "rateDate": str(row.index[0])[:10],
-        "source": f"FinanceDataReader {symbol}",
-    }
-
-
-def _ecos_get(path: str) -> Any:
-    import requests
-    response = requests.get(f"https://ecos.bok.or.kr/api/{path}", timeout=20)
-    response.raise_for_status()
-    payload = response.json()
-    if "RESULT" in payload:  # ECOS 는 오류도 200 으로 준다
-        raise RuntimeError(payload["RESULT"].get("MESSAGE", "ECOS 오류"))
-    return payload
-
-
-def _ecos_item_code(words: tuple[str, ...], grade: str | None) -> tuple[str, str]:
-    """통계표 항목 목록에서 이름으로 찾는다 — 코드를 박아두지 않는다."""
-    key = _ecos_key()
-    payload = _ecos_get(f"StatisticItemList/{key}/json/kr/1/500/{ECOS_MARKET_RATES}")
-    rows = payload.get("StatisticItemList", {}).get("row", [])
-    wanted = list(words) + ([grade] if grade else [])
-    hits = [r for r in rows if all(w in r.get("ITEM_NAME", "") for w in wanted)]
-    if not hits:
-        # 어떤 만기·등급이 실제로 있는지 보여준다 — "없다"로 끝내면 다음 수를 못 둔다
-        available = [r.get("ITEM_NAME", "") for r in rows
-                     if words and words[0] in r.get("ITEM_NAME", "")]
-        raise RuntimeError(
-            f"ECOS 통계표 {ECOS_MARKET_RATES} 에서 '{' '.join(wanted)}' 항목을 못 찾았습니다."
-            + (f" 이 통계표에 있는 {words[0]} 항목: {', '.join(available)}" if available else ""))
-    hit = min(hits, key=lambda r: len(r.get("ITEM_NAME", "")))
-    return hit["ITEM_CODE"], hit["ITEM_NAME"]
-
-
-def _rate_from_ecos(kind: str, asof: datetime, grade: str | None,
-                    maturity: str) -> dict[str, Any] | None:
-    if not _ecos_key():
-        return None
-    code, name = _ecos_item_code((RATE_BONDS[kind], maturity), grade)
-    start = (asof - timedelta(days=30)).strftime("%Y%m%d")
-    payload = _ecos_get(
-        f"StatisticSearch/{_ecos_key()}/json/kr/1/100/{ECOS_MARKET_RATES}/D/"
-        f"{start}/{asof.strftime('%Y%m%d')}/{code}")
-    rows = [r for r in payload.get("StatisticSearch", {}).get("row", [])
-            if (r.get("DATA_VALUE") or "").strip()]
-    if not rows:
-        raise RuntimeError(f"ECOS 에 {start}~{asof:%Y%m%d} 구간 '{name}' 값이 없습니다.")
-    last = rows[-1]
-    return {
-        "value": round(float(last["DATA_VALUE"]), 3),
-        "rateDate": f'{last["TIME"][:4]}-{last["TIME"][4:6]}-{last["TIME"][6:8]}',
-        "source": f"한국은행 ECOS {ECOS_MARKET_RATES} {name}",
-    }
-
-
-def _fetch_rate(kind: str, asof: datetime, grade: str | None,
-                maturity: str) -> tuple[dict[str, Any] | None, list[str]]:
-    """무키(FDR) → ECOS 순으로 시도하고, 실패한 경로를 그대로 남긴다."""
-    tried: list[str] = []
-    for label, getter in (("FinanceDataReader", lambda: _rate_from_fdr(kind, asof, maturity)),
-                          ("한국은행 ECOS", lambda: _rate_from_ecos(kind, asof, grade, maturity))):
-        try:
-            got = getter()
-        except Exception as exc:
-            tried.append(f"{label}: {exc}")
-            continue
-        if got:
-            return got, tried
-        tried.append(f"{label}: 값 없음"
-                     + ("" if label != "한국은행 ECOS" or _ecos_key() else " (인증키 미설정)"))
-    return None, tried
-
-
 @mcp.tool()
 def get_wacc_inputs(as_of: str = "", bond_grade: str = "AA-",
                     rf_maturity: str = "5년", kd_maturity: str = "3년") -> dict[str, Any]:
@@ -471,21 +314,23 @@ def get_wacc_inputs(as_of: str = "", bond_grade: str = "AA-",
     - 조회에 실패하면 값을 지어내지 않고 실패를 알린다. 그때는 사용자가 직접 넣는다.
     - 확정 후 run_gpcm(rate_source=<citation>) 로 넘기면 엑셀 Notes 에 근거가 남는다.
     """
+    _load()  # 금리 조회 로직은 gpcm_kr 에 있다 — Streamlit 앱과 같은 코드를 쓴다
     grade = (bond_grade or "").strip().upper()
-    if grade not in BOND_GRADES:
-        raise ValueError(f"bond_grade 는 {' 또는 '.join(BOND_GRADES)} 입니다: {bond_grade!r}")
-    rf_term = _maturity(rf_maturity, "rf")
-    kd_term = _maturity(kd_maturity, "kd")
-    asof = _as_of_date(as_of)
+    if grade not in M.BOND_GRADES:
+        raise ValueError(f"bond_grade 는 {' 또는 '.join(M.BOND_GRADES)} 입니다: {bond_grade!r}")
+    rf_term = M.maturity(rf_maturity, "rf")
+    kd_term = M.maturity(kd_maturity, "kd")
+    asof = M.as_of_date(as_of)
+    key = M.ecos_key_from_env()
 
-    rf, rf_tried = _fetch_rate("rf", asof, None, rf_term)
-    kd, kd_tried = _fetch_rate("kd", asof, grade, kd_term)
+    rf, rf_tried = M.fetch_market_rate("rf", asof, None, rf_term, key)
+    kd, kd_tried = M.fetch_market_rate("kd", asof, grade, kd_term, key)
     if rf is None and kd is None:
         raise RuntimeError(
             "시장금리를 한 곳에서도 못 받았습니다. rf·kd_pretax 를 직접 넣어야 합니다.\n"
             "시도한 경로 — " + " / ".join(rf_tried + kd_tried)
             + ("\n한국은행 ECOS 인증키(무료, ecos.bok.or.kr)를 확장 설정에 넣으면 "
-               "이 경로가 열립니다." if not _ecos_key() else ""))
+               "이 경로가 열립니다." if not key else ""))
 
     parts: list[str] = []
     result: dict[str, Any] = {
@@ -1076,7 +921,9 @@ def _diagnose() -> list[dict[str, Any]]:
     checks.append(_check("DART 인증키", bool(key),
                          f"있음 ({len(key)}자)" if key else "없음",
                          "확장 설정에서 OpenDART 인증키를 넣으세요 (opendart.fss.or.kr 무료)."))
-    ecos = _ecos_key()
+    ecos = (os.environ.get("ECOS_API_KEY") or "").strip()
+    if ecos.startswith("${") and ecos.endswith("}"):
+        ecos = ""  # 확장 입력칸이 비면 리터럴이 그대로 들어온다
     checks.append(_check("ECOS 인증키(선택)", True if ecos else None,
                          f"있음 ({len(ecos)}자)" if ecos else "없음 — 회사채 금리 조회 불가",
                          "국고채만 쓰면 없어도 됩니다. 필요하면 ecos.bok.or.kr 에서 무료 발급."))

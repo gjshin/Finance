@@ -4,6 +4,7 @@ import OpenDartReader
 import FinanceDataReader as fdr
 from datetime import datetime, timedelta
 from pathlib import Path
+import os
 import warnings
 import numpy as np
 import re
@@ -155,6 +156,156 @@ KR_TAX_BRACKETS_PRE2023 = [(2, 0.110), (200, 0.220), (3000, 0.242), (None, 0.275
 KR_TAX_BRACKETS_2023 = [(2, 0.099), (200, 0.209), (3000, 0.231), (None, 0.264)]
 KR_TAX_BRACKETS_2026 = [(2, 0.110), (200, 0.220), (3000, 0.242), (None, 0.275)]
 
+
+
+# ==========================================
+# 시장금리 (WACC 입력값의 근거)
+# ==========================================
+# rf·Kd 는 판단이 아니라 기준일의 시장 관측치다. 값만 손으로 넣으면 나중에
+# "이 3.3%는 어디서 왔나"에 답할 근거가 산출물에 남지 않는다. 값과 함께
+# 출처·금리기준일을 돌려주고, 그 문장을 그대로 엑셀 Notes 에 싣는다.
+# 앱(사이드바 조회 버튼)과 MCP(get_wacc_inputs)가 같은 코드를 쓴다.
+# MRP·size premium 은 조회 대상이 아니다 — 시장에서 관측되지 않는 판단 항목이다.
+
+ECOS_MARKET_RATES = "817Y002"  # 한국은행 ECOS 통계표: 시장금리(일별)
+BOND_GRADES = ("AA-", "BBB-")
+RATE_BONDS = {"rf": "국고채", "kd": "회사채"}
+# 만기는 고정하지 않는다. 평가에서 rf 만기는 현금흐름 기간에 맞춰 5년·10년을 오간다.
+DEFAULT_MATURITY = {"rf": "5년", "kd": "3년"}
+# 무키 경로 — FDR 에 있는 국채 만기만. 회사채는 FDR 에 없어 ECOS 로 간다.
+FDR_TREASURY = {"1년": "KR1YT=RR", "3년": "KR3YT=RR", "5년": "KR5YT=RR", "10년": "KR10YT=RR"}
+
+MATURITY_RE = re.compile(r"^\s*(\d+)\s*(?:년|y|Y)?\s*$")
+_QTR_END = {"1Q": (3, 31), "2Q": (6, 30), "3Q": (9, 30), "4Q": (12, 31)}
+
+
+def maturity(text, kind):
+    """"10" · "10Y" · "10년" 을 모두 "10년" 으로 읽는다.
+
+    어떤 만기가 실제로 있는지는 조회할 때 소스가 답한다 — 여기서 허용 목록을
+    박으면 소스가 늘 때 막힌다.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return DEFAULT_MATURITY[kind]
+    m = MATURITY_RE.match(raw)
+    if not m:
+        raise ValueError(f'만기는 "5년"·"10Y"·"10" 처럼 적습니다: {text!r}')
+    return f"{int(m.group(1))}년"
+
+
+def as_of_date(as_of):
+    """기준일을 읽는다. "2026-06-30" 도 되고 GPCM 기간 표기 "2026.2Q" 도 된다.
+
+    금리는 기준일 시점을 써야 한다 — 평가기준일이 작년 말인데 오늘 금리를 넣으면
+    조서의 다른 숫자와 시점이 어긋난다.
+    """
+    text = (as_of or "").strip()
+    if not text:
+        return datetime.now()
+    if re.match(r"^\d{4}\.[1-4]Q$", text):
+        year, qtr = text.split(".")
+        month, day = _QTR_END[qtr]
+        return datetime(int(year), month, day)
+    try:
+        return datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError(f'기준일은 "2026-06-30" 또는 "2026.2Q" 형식입니다: {as_of!r}')
+
+
+def ecos_key_from_env():
+    """환경변수의 ECOS 키. 확장 설치에서 입력칸이 비면 `${...}` 리터럴이 들어온다."""
+    value = (os.environ.get("ECOS_API_KEY") or "").strip()
+    if value.startswith("${") and value.endswith("}"):
+        return ""
+    return value
+
+
+def _rate_from_fdr(kind, asof, term):
+    """무키 경로. 못 구하면 None — 여기서 조용히 기본값을 만들지 않는다."""
+    symbol = FDR_TREASURY.get(term) if kind == "rf" else None
+    if symbol is None:
+        return None
+    try:
+        df = fdr.DataReader(symbol, (asof - timedelta(days=30)).strftime("%Y-%m-%d"),
+                            asof.strftime("%Y-%m-%d"))
+    except Exception:
+        return None
+    if df is None or len(df) == 0 or "Close" not in getattr(df, "columns", []):
+        return None
+    row = df.dropna(subset=["Close"]).tail(1)
+    if len(row) == 0:
+        return None
+    return {"value": round(float(row["Close"].iloc[0]), 3),
+            "rateDate": str(row.index[0])[:10],
+            "source": f"FinanceDataReader {symbol}"}
+
+
+def _ecos_get(path):
+    response = requests.get(f"https://ecos.bok.or.kr/api/{path}", timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    if "RESULT" in payload:  # ECOS 는 오류도 200 으로 준다
+        raise RuntimeError(payload["RESULT"].get("MESSAGE", "ECOS 오류"))
+    return payload
+
+
+def _ecos_item_code(words, grade, key):
+    """통계표 항목 목록에서 이름으로 찾는다 — 코드를 박아두지 않는다.
+
+    ECOS 가 항목코드를 바꾸면 조용히 엉뚱한 금리를 물어오게 되기 때문이다.
+    """
+    payload = _ecos_get(f"StatisticItemList/{key}/json/kr/1/500/{ECOS_MARKET_RATES}")
+    rows = payload.get("StatisticItemList", {}).get("row", [])
+    wanted = list(words) + ([grade] if grade else [])
+    hits = [r for r in rows if all(w in r.get("ITEM_NAME", "") for w in wanted)]
+    if not hits:
+        available = [r.get("ITEM_NAME", "") for r in rows
+                     if words and words[0] in r.get("ITEM_NAME", "")]
+        raise RuntimeError(
+            f"ECOS 통계표 {ECOS_MARKET_RATES} 에서 '{' '.join(wanted)}' 항목을 못 찾았습니다."
+            + (f" 이 통계표에 있는 {words[0]} 항목: {', '.join(available)}" if available else ""))
+    hit = min(hits, key=lambda r: len(r.get("ITEM_NAME", "")))
+    return hit["ITEM_CODE"], hit["ITEM_NAME"]
+
+
+def _rate_from_ecos(kind, asof, grade, term, key):
+    if not key:
+        return None
+    code, name = _ecos_item_code((RATE_BONDS[kind], term), grade, key)
+    start = (asof - timedelta(days=30)).strftime("%Y%m%d")
+    payload = _ecos_get(
+        f"StatisticSearch/{key}/json/kr/1/100/{ECOS_MARKET_RATES}/D/"
+        f"{start}/{asof.strftime('%Y%m%d')}/{code}")
+    rows = [r for r in payload.get("StatisticSearch", {}).get("row", [])
+            if (r.get("DATA_VALUE") or "").strip()]
+    if not rows:
+        raise RuntimeError(f"ECOS 에 {start}~{asof:%Y%m%d} 구간 '{name}' 값이 없습니다.")
+    last = rows[-1]
+    return {"value": round(float(last["DATA_VALUE"]), 3),
+            "rateDate": f'{last["TIME"][:4]}-{last["TIME"][4:6]}-{last["TIME"][6:8]}',
+            "source": f"한국은행 ECOS {ECOS_MARKET_RATES} {name}"}
+
+
+def fetch_market_rate(kind, asof, grade=None, term=None, key=""):
+    """무키(FDR) → ECOS 순으로 시도하고, 실패한 경로를 그대로 남긴다.
+
+    Returns: (결과 dict 또는 None, 시도한 경로 설명 목록)
+    """
+    term = term or DEFAULT_MATURITY[kind]
+    tried = []
+    for label, getter in (("FinanceDataReader", lambda: _rate_from_fdr(kind, asof, term)),
+                          ("한국은행 ECOS", lambda: _rate_from_ecos(kind, asof, grade, term, key))):
+        try:
+            got = getter()
+        except Exception as exc:
+            tried.append(f"{label}: {exc}")
+            continue
+        if got:
+            return got, tried
+        tried.append(f"{label}: 값 없음"
+                     + ("" if label != "한국은행 ECOS" or key else " (인증키 미설정)"))
+    return None, tried
 
 def get_korean_tax_brackets(fiscal_year):
     """사업연도에 적용되는 한국 법인세 한계세율표 반환."""
@@ -2657,7 +2808,43 @@ with st.sidebar:
             tickers_input = st.text_area("대상회사의 종목코드를 한줄씩 입력하세요", value="000250\n039030\n005290", height=150)
 
         st.subheader("Target WACC Parameters")
-        rf_input = st.number_input("Rf - 무위험이자율 (%)", min_value=0.0, max_value=10.0, value=3.3, step=0.1, format="%.2f") / 100
+
+        # 기준일 시장금리 조회 — rf·Kd 는 판단이 아니라 그날의 관측치다.
+        # 조회값을 그대로 쓰지 않고 아래 입력칸의 기본값으로만 넣는다(확정은 사용자).
+        with st.expander("📉 기준일 시장금리 조회 (선택)"):
+            st.caption("국고채는 인증키 없이 조회됩니다. 회사채는 한국은행 ECOS 인증키가 필요합니다.")
+            ecos_key_input = st.text_input(
+                "한국은행 ECOS 인증키 (선택)", type="password",
+                value=ecos_key_from_env(),
+                help="https://ecos.bok.or.kr 에서 무료 발급. 비워도 국고채는 조회됩니다.")
+            c1, c2 = st.columns(2)
+            rf_term_input = c1.selectbox("국고채 만기", ["1년", "3년", "5년", "10년", "20년", "30년"], index=2)
+            kd_grade_input = c2.selectbox("회사채 등급", list(BOND_GRADES), index=0)
+            if st.button("기준일 금리 조회", key="btn_rates"):
+                # 기준일은 화면에서 고른 종료 기간의 분기말이다 — 오늘 날짜가 아니다
+                asof = as_of_date(f"{g_end_year}.{g_end_qtr}")
+                lines, got_rf, got_kd = [], None, None
+                got_rf, tried_rf = fetch_market_rate('rf', asof, None, rf_term_input, ecos_key_input)
+                got_kd, tried_kd = fetch_market_rate('kd', asof, kd_grade_input, '3년', ecos_key_input)
+                if got_rf:
+                    st.session_state['rf_fetched'] = got_rf['value']
+                    lines.append(f"국고채 {rf_term_input} {got_rf['value']}% ({got_rf['rateDate']}, {got_rf['source']})")
+                else:
+                    st.warning("국고채 금리를 못 받았습니다 — " + " / ".join(tried_rf))
+                if got_kd:
+                    st.session_state['kd_fetched'] = got_kd['value']
+                    lines.append(f"회사채 3년 {kd_grade_input} {got_kd['value']}% ({got_kd['rateDate']}, {got_kd['source']})")
+                else:
+                    st.warning("회사채 금리를 못 받았습니다 — " + " / ".join(tried_kd))
+                if lines:
+                    st.session_state['rate_source'] = " | ".join(lines)
+                    st.success("아래 입력칸에 반영했습니다. 값과 출처를 확인하고 확정하세요.")
+            if st.session_state.get('rate_source'):
+                st.caption("출처: " + st.session_state['rate_source'])
+
+        rf_input = st.number_input("Rf - 무위험이자율 (%)", min_value=0.0, max_value=10.0,
+                                   value=float(st.session_state.get('rf_fetched', 3.3)),
+                                   step=0.1, format="%.2f") / 100
         mrp_input = st.slider("MRP (시장위험프리미엄)", min_value=7.0, max_value=9.0, value=8.0, step=0.1, format="%.1f%%") / 100
 
         with st.expander("📊 시가총액별 Size Premium 참고표"):
@@ -2698,10 +2885,20 @@ with st.sidebar:
         beta_type_choice = st.selectbox("WACC 계산에 사용할 Beta", list(beta_type_options.keys()), index=0)
         beta_type_input = beta_type_options[beta_type_choice]
 
-        kd_pretax_input = st.number_input("Kd (Pretax) - 세전 이자율 (%)", min_value=0.0, max_value=15.0, value=3.5, step=0.1, format="%.1f") / 100
+        kd_pretax_input = st.number_input("Kd (Pretax) - 세전 이자율 (%)", min_value=0.0, max_value=15.0,
+                                          value=float(st.session_state.get('kd_fetched', 3.5)),
+                                          step=0.1, format="%.1f") / 100
+
+        # 세율은 회사 규모에 따라 다르다. 기본값 26.4%는 3,000억 초과 구간이라
+        # 중소형 피평가회사에서는 대개 틀린다 — 세전이익에서 자동으로 정하게 한다.
+        tax_auto_input = st.checkbox(
+            "법인세율 자동 (피평가회사 세전이익 기준)", value=True,
+            help="목록 첫 번째 회사의 LTM 세전이익을 해당 사업연도 한계세율표에 넣어 정합니다. "
+                 "한국 법인 전제이며, 적용된 세율은 실행 후 화면과 Data_Quality에 남습니다.")
         target_tax_rate_input = st.number_input(
             "Target 법인세율 (%)", min_value=0.0, max_value=50.0, value=26.4, step=0.1, format="%.1f",
-            help="지방소득세 포함 한계세율. 최고구간 기준 FY2023~2025는 26.4%, FY2026부터는 27.5%입니다.") / 100
+            disabled=tax_auto_input,
+            help="지방소득세 포함 한계세율. 자동 체크를 끄면 이 값을 씁니다.") / 100
 
         run_btn = st.button("Go,Go,Go 🚀", type="primary", key="btn_gpcm")
 
@@ -2765,6 +2962,11 @@ if ui_mode == "GPCM Valuation (기존)":
     st.subheader("📝 Valuation Methodology Notes")
     notes_list = [
         f'• Base Date: {base_period_str} ({base_date_display}) | Unit: 억원 (KRW 100M)',
+    ]
+    if st.session_state.get('rate_source'):
+        # 조회한 금리를 썼으면 출처를 조서에 남긴다 ("이 rf 는 어디서 왔나")
+        notes_list.append('• Rf/Kd 출처: ' + st.session_state['rate_source'])
+    notes_list += [
         '• 공통: 연결재무제표 작성 시 CFS 우선, 미존재 시 OFS 기준으로 수집',
         '• PL: 요약 손익계산서에서 매출액/영업이익/당기순이익 3개 계정만 엄격 추출',
         '• PL Fetch: finstate(요약) → finstate_all(CFS/OFS) fallback',
@@ -2775,7 +2977,10 @@ if ui_mode == "GPCM Valuation (기존)":
         '• NOA(Option): 투자자산/관계기업 등은 기본적으로 NOA(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
         '• LTM = Current Cumulative + Prior Annual − Prior Same Quarter Cumulative (단, 4Q는 Annual)',
         '• Beta: 5년 월간 & 2년 주간 수익률 기준 (FinanceDataReader 사용)',
-        '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1',
+        '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1 (조정을 Unlevered 계산 前에 적용)',
+        '• Beta 벤치마크: 종목이 속한 시장지수 (KOSPI=KS11, KOSDAQ=KQ11). 시장이 다른 피어를 함께 평균',
+        '• Beta 수익률: 배당 미반영 가격수익률 기준 (종목·지수 모두 동일 기준)',
+        '• Beta 평균 대상: 조정베타가 0 초과인 회사 (GPCM 시트 Mean 행과 동일 모집단)',
         '• D/E Ratio = IBD / (Market Cap + 우선주 + NCI)',
         '• Debt Ratio (D/V) = IBD / (Market Cap + 우선주 + IBD + NCI)',
         '• 우선주: BS의 우선주자본금(액면) 기준. 시가총액은 보통주만 반영하므로 자기자본가치에 가산',
@@ -2903,9 +3108,29 @@ if run_btn:
                         st.dataframe(stats.style.format("{:.1f}x"))
 
                 # 1.5. WACC Calculation (Target 기업용)
+                # 세율 자동: 목록 첫 회사(피평가회사)의 세전이익을 사업연도 세율표에 넣는다.
+                # 기본값 26.4%는 3,000억 초과 구간이라 중소형 회사에서는 대개 틀린다.
+                tax_rate_used = target_tax_rate_input
+                if tax_auto_input:
+                    t_row = next((s for s in screen_summary_data
+                                  if s.get('Ticker') == target_code_list[0]), None)
+                    t_pretax = (t_row or {}).get('Pretax_Income')
+                    tax_rate_used = get_korean_marginal_tax_rate(t_pretax, base_year)
+                    st.info(
+                        f"법인세율 **{tax_rate_used*100:.2f}%** 적용 — "
+                        f"{(t_row or {}).get('Company', target_code_list[0])}의 세전이익 "
+                        f"{'미상' if t_pretax is None else format(t_pretax, ',.0f') + '억원'} · "
+                        f"FY{base_year} 한계세율표 (지방소득세 포함)")
+                    quality.add(SEV_INFO, target_code_list[0],
+                                (t_row or {}).get('Company', ''), 'Tax Rate',
+                                f'타겟 법인세율을 세전이익 '
+                                f'{"미상" if t_pretax is None else round(float(t_pretax), 1)}억원과 '
+                                f'FY{base_year} 한계세율표로 {tax_rate_used*100:.2f}% 로 정했습니다 '
+                                f'(한국 법인 전제, 지방소득세 포함).')
+
                 target_wacc_data, avg_debt_ratio = calculate_wacc_and_beta(
-                    target_code_list, screen_summary_data, target_tax_rate_input, rf_input, mrp_input, size_premium_input, kd_pretax_input, beta_type_input,
-                    fiscal_year=base_year)
+                    target_code_list, screen_summary_data, tax_rate_used, rf_input, mrp_input, size_premium_input, kd_pretax_input, beta_type_input,
+                    fiscal_year=base_year, quality=quality)
 
                 if target_wacc_data['Target_WACC'] <= rf_input:
                     st.error(
