@@ -146,6 +146,33 @@ _gl_vals = [float(v) for v in _re.findall(r'"\s*:\s*(-?\d+\.?\d*)', _blk)]
 _kr_vals = [r[1] for r in M.SRP_TERTILE] + [r[1] for r in M.SRP_QUINTILE] + [0.0]
 chk('해외판 SRP 값이 국내판과 동일', _gl_vals == _kr_vals, (_gl_vals, _kr_vals))
 
+# --- 베타 기준지수 선택 ------------------------------------------------------------
+print()
+print("베타 기준지수 선택")
+print("-" * 66)
+MAP = {'005930': 'KOSPI', '247540': 'KOSDAQ'}
+chk('기본값은 코스피 일괄 — 코스닥도 ^KS11 (기존 동작 불변)',
+    M.get_market_index('247540', 'KOSPI', MAP)[1] == '^KS11',
+    M.get_market_index('247540', 'KOSPI', MAP))
+chk('인자를 안 주면 코스피 일괄', M.get_market_index('247540')[1] == '^KS11')
+chk('소속시장: 코스닥 종목은 ^KQ11',
+    M.get_market_index('247540', 'MARKET', MAP)[1] == '^KQ11')
+chk('소속시장: 코스피 종목은 ^KS11',
+    M.get_market_index('005930', 'MARKET', MAP)[1] == '^KS11')
+chk('시장 판별 실패는 ^KS11 + 판정 None (조용히 넘기지 않음)',
+    M.get_market_index('999999', 'MARKET', {})[1:] == ('^KS11', None),
+    M.get_market_index('999999', 'MARKET', {}))
+chk('Notes 가 선택과 일치 (KOSPI)',
+    '단일 기준' in M.beta_basis_note('KOSPI')[0] and 'KQ11' not in ' '.join(M.beta_basis_note('KOSPI')))
+chk('Notes 가 선택과 일치 (MARKET)',
+    'KQ11' in ' '.join(M.beta_basis_note('MARKET')) and 'MRP' in ' '.join(M.beta_basis_note('MARKET')))
+
+# 해외판도 같은 선택지를 써야 한다 (같은 회사를 다른 기준으로 재면 안 된다)
+_gl2 = (Path(_os.path.dirname(_os.path.abspath(__file__))) / 'GPCM.py').read_text(encoding='utf-8')
+_gl_basis = dict(_re.findall(r"'(KOSPI|MARKET)':\s*'([^']+)'", _gl2.split('BETA_BASIS = {')[1].split('}')[0]))
+chk('해외판 BETA_BASIS 가 국내판과 동일', _gl_basis == M.BETA_BASIS, (_gl_basis, M.BETA_BASIS))
+chk('해외판 기본값도 코스피 일괄', "beta_basis='KOSPI'" in _gl2)
+
 print()
 print(f"잘못된 항목 {fails}건")
 sys.exit(1 if fails else 0)

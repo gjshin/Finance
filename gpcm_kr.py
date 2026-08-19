@@ -138,30 +138,85 @@ def _get_market_index_data(market_idx, start, end, cache):
     return data
 
 
-BETA_BENCHMARK = '^KS11'  # KOSPI. fdr 의 KS11 이 자주 실패해 yfinance 심볼을 쓴다
+# 베타 기준지수 선택.
+# 기본은 코스피 일괄이다. 피어 무차입베타를 평균해 하나의 WACC 을 만들므로 모든 β 가
+# 같은 지수 기준이어야 하고, MRP(한공회 7~9%)가 시장 전체 기준 추정치라 β 도 같은
+# 기준이어야 하기 때문이다. 코스닥 피어만으로 구성하고 MRP 도 그에 맞춘 경우에만
+# 소속시장 기준이 내적으로 일관된다.
+BETA_BASIS = {
+    'KOSPI': '코스피 일괄 (^KS11)',
+    'MARKET': '소속시장 지수 (코스피=^KS11, 코스닥=^KQ11)',
+}
+KOSPI_INDEX = '^KS11'
+KOSDAQ_INDEX = '^KQ11'
+BETA_BENCHMARK = KOSPI_INDEX  # 하위호환: 예전 상수를 참조하는 코드가 있을 수 있다
 
 
-def get_market_index(ticker=None):
-    """베타 기준지수를 돌려준다. 종목과 무관하게 **KOSPI 단일 기준**이다.
+@st.cache_resource(ttl=3600)
+def get_krx_market_map():
+    """{종목코드: 'KOSPI'|'KOSDAQ'}. 못 만들면 빈 dict — 지어내지 않는다."""
+    try:
+        df = get_krx_listing()
+        if df is not None and not df.empty and 'Market' in df.columns and 'Code' in df.columns:
+            out = {}
+            for code, mkt in zip(df['Code'], df['Market']):
+                m = str(mkt).upper()
+                if 'KOSDAQ' in m or '코스닥' in str(mkt):
+                    out[str(code).zfill(6)] = 'KOSDAQ'
+                elif 'KOSPI' in m or '유가' in str(mkt):
+                    out[str(code).zfill(6)] = 'KOSPI'
+            if out:
+                return out
+    except Exception:
+        pass
+    # Market 열이 없는 판이면 시장별로 따로 받아 만든다
+    out = {}
+    for mkt in ('KOSPI', 'KOSDAQ'):
+        try:
+            df_mkt = fdr.StockListing(mkt)
+            if df_mkt is not None and not df_mkt.empty and 'Code' in df_mkt.columns:
+                for code in df_mkt['Code']:
+                    out[str(code).zfill(6)] = mkt
+        except Exception:
+            continue
+    return out
 
-    코스닥 종목도 KOSPI 대비로 잰다. 시장별로 다른 지수를 쓰지 않는 이유:
 
-    1) 이 모델은 피어들의 무차입베타를 평균해 하나의 WACC 을 만든다. 평균이
-       의미를 가지려면 모든 β 가 같은 지수 기준이어야 한다 — 코스닥 기준 β 와
-       코스피 기준 β 를 섞어 평균하는 것은 단위가 다른 값을 더하는 것이다.
-    2) Ke = rf + β × MRP 에서 β 와 MRP 의 기준이 같아야 한다. 여기서 쓰는 MRP 는
-       시장 전체(KOSPI) 기준 추정치다. 코스닥 지수 기준 β 에 이 MRP 를 곱하면
-       기준이 어긋난다. 코스닥 기준으로 재려면 MRP 도 코스닥 기준으로 다시
-       추정해야 한다.
+def get_market_index(ticker=None, basis='KOSPI', market_map=None):
+    """베타 기준지수를 돌려준다.
 
-    코스닥 소형주는 이 기준에서 R² 가 낮게 나오는데, 그건 고유위험이 크다는
-    뜻이지 기준을 잘못 골랐다는 뜻이 아니다 (고유위험은 분산 가능해 가격에
-    반영되지 않는다). 낮은 R² 는 Beta 시트와 gpcm_review 에 드러난다.
+    basis='KOSPI'  : 종목과 무관하게 코스피 단일 기준 (기본값, 종전 동작)
+    basis='MARKET' : 코스닥 종목만 코스닥 지수. 시장을 못 정하면 코스피로 두되
+                     그 사실을 세 번째 값으로 알린다 — 호출부가 경고를 남긴다.
 
-    ticker 인자는 호출부 호환을 위해 남겨 두었고 쓰지 않는다.
-    Returns: (exchange_name, index_symbol)
+    Returns: (exchange_name, index_symbol, market)  — market 은 'KOSPI'|'KOSDAQ'|None
+             (None = 판별 실패. 조용히 넘기지 말 것)
     """
-    return 'KRX', BETA_BENCHMARK
+    if basis != 'MARKET':
+        return 'KRX', KOSPI_INDEX, 'KOSPI'
+    code = str(ticker or '').zfill(6)
+    market = (market_map or {}).get(code)
+    if market == 'KOSDAQ':
+        return 'KOSDAQ', KOSDAQ_INDEX, 'KOSDAQ'
+    if market == 'KOSPI':
+        return 'KOSPI', KOSPI_INDEX, 'KOSPI'
+    return 'KRX', KOSPI_INDEX, None
+
+
+def beta_basis_note(basis='KOSPI'):
+    """Notes 에 실을 기준지수 설명. **실제 선택과 반드시 일치해야 한다.**"""
+    if basis == 'MARKET':
+        return [
+            '• Beta 벤치마크: 종목이 속한 시장지수 (코스피=^KS11, 코스닥=^KQ11) 기준 —',
+            '  서로 다른 기준의 β 를 평균하므로, 시장 전체 기준으로 추정된 MRP 와',
+            '  기준이 어긋날 수 있다. 코스닥 피어만으로 구성하고 MRP 도 그에 맞춘',
+            '  경우에만 내적으로 일관된다',
+        ]
+    return [
+        '• Beta 벤치마크: 전 종목 KOSPI(^KS11) 단일 기준. 코스닥 종목도 KOSPI 대비로 산출한다 —',
+        '  피어 무차입베타를 평균해 하나의 WACC 을 만들므로 모든 β 가 같은 지수 기준이어야 하고,',
+        '  MRP 도 시장 전체(KOSPI) 기준 추정치라 β 와 기준을 맞춘 것이다',
+    ]
 
 # 한국 법인세 한계세율표 (사업연도별, 지방소득세 10% 포함)
 # 각 구간: (과세표준 상한(억원), 한계세율)  — 상한 None = 초과 구간
@@ -1440,7 +1495,8 @@ def add_gpcm_section_row(ws):
 
 # ==========================================
 
-def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, status_container, progress_bar):
+def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, status_container,
+                         progress_bar, beta_benchmark='KOSPI'):
     df_krx = get_krx_listing()
     
     # 변수 초기화
@@ -1460,6 +1516,9 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
     total_tickers = len(target_code_list)
     dart_fs_cache = {}  # DART API Call 최소화를 위한 캐시 (ticker 포함 키로 충돌 방지)
     market_idx_cache = {}  # 시장지수 시계열 캐시 (전 종목 공통)
+    # 소속시장 기준일 때만 KRX 목록이 필요하다 (기본값에서는 조회하지 않는다)
+    market_map = get_krx_market_map() if beta_benchmark == 'MARKET' else {}
+    markets_seen = {}
 
     for idx, ticker in enumerate(target_code_list):
         status_container.write(f"Processing [{ticker}] ({idx+1}/{total_tickers})...")
@@ -1676,9 +1735,16 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                 temp_metrics.update(period_metrics)
 
         # 4) Beta Calculation (5Y Monthly, 2Y Weekly)
-        exchange, market_idx = get_market_index(ticker)
+        exchange, market_idx, market_of = get_market_index(ticker, beta_benchmark, market_map)
         temp_metrics['Exchange'] = exchange
         temp_metrics['Market_Index'] = market_idx
+        if beta_benchmark == 'MARKET':
+            markets_seen[ticker] = market_of
+            if market_of is None:
+                # 코스닥인지 코스피인지 못 정했다. 코스피로 두되 조용히 넘기지 않는다.
+                quality.add(SEV_WARN, ticker, display_name, 'Beta 기준지수',
+                            '상장시장을 확인하지 못해 KOSPI(^KS11) 기준으로 산출했습니다. '
+                            'KRX 목록 조회가 실패했을 수 있습니다.')
 
         try:
             end_date = base_date_str
@@ -1759,6 +1825,18 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
     status_container.update(label="분석 완료!", state="complete", expanded=False)
 
     # --- 결과 처리 및 엑셀 생성 ---
+
+    # 코스피·코스닥을 섞어 평균하면 서로 다른 기준의 β 를 더하는 셈이다.
+    # 막지는 않되(사용자 결정) 반드시 드러낸다.
+    if beta_benchmark == 'MARKET':
+        kinds = {m for m in markets_seen.values() if m}
+        if len(kinds) > 1:
+            counts = {k: sum(1 for v in markets_seen.values() if v == k) for k in sorted(kinds)}
+            quality.add(SEV_WARN, '', '', 'Beta 기준지수',
+                        '소속시장 기준에서 ' +
+                        ', '.join(f'{k} {n}사' for k, n in counts.items()) +
+                        '의 베타를 함께 평균했습니다. 서로 다른 지수 기준의 β 를 섞은 것이며, '
+                        '시장 전체 기준으로 추정된 MRP 와도 기준이 어긋날 수 있습니다.')
 
     return raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name, screen_summary_data, base_year, base_qtr, base_date_str, all_multiples, quality
 
@@ -2944,6 +3022,13 @@ with st.sidebar:
         size_premium_choice = st.selectbox("기업 규모 선택", list(size_premium_options.keys()), index=0)
         size_premium_input = size_premium_options[size_premium_choice]
 
+        beta_basis_choice = st.selectbox(
+            "베타 기준지수", list(BETA_BASIS.values()), index=0,
+            help="기본은 코스피 일괄입니다. 피어 무차입베타를 평균해 하나의 WACC 을 만들므로 "
+                 "모든 β 가 같은 지수 기준이어야 하고, MRP 도 시장 전체 기준 추정치이기 때문입니다. "
+                 "코스닥 피어만으로 구성하고 MRP 도 그에 맞춘 경우에만 소속시장 기준을 고르세요.")
+        beta_basis_input = next(k for k, v in BETA_BASIS.items() if v == beta_basis_choice)
+
         beta_type_options = {"5년 월간 베타 (5Y Monthly)": "5Y", "2년 주간 베타 (2Y Weekly)": "2Y"}
         beta_type_choice = st.selectbox("WACC 계산에 사용할 Beta", list(beta_type_options.keys()), index=0)
         beta_type_input = beta_type_options[beta_type_choice]
@@ -3043,9 +3128,7 @@ if ui_mode == "GPCM Valuation (기존)":
         f'• MRP: 한국공인회계사회 시장위험 프리미엄 가이던스 ({CPA_GUIDANCE_DATE}) {MRP_GUIDANCE[0]*100:.0f}~{MRP_GUIDANCE[1]*100:.0f}% 범위 내 선택',
         f'• Size Premium: 한국공인회계사회 기업규모위험 프리미엄 연구결과 ({CPA_GUIDANCE_DATE}) 시가총액 분위 기준',
         '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1 (조정을 Unlevered 계산 前에 적용)',
-        '• Beta 벤치마크: 전 종목 KOSPI(^KS11) 단일 기준. 코스닥 종목도 KOSPI 대비로 산출한다 —',
-        '  피어 무차입베타를 평균해 하나의 WACC 을 만들므로 모든 β 가 같은 지수 기준이어야 하고,',
-        '  MRP 도 시장 전체(KOSPI) 기준 추정치라 β 와 기준을 맞춘 것이다',
+        *beta_basis_note(beta_basis_input),
         '• Beta 수익률: 배당 미반영 가격수익률 기준 (종목·지수 모두 동일 기준)',
         '• Beta 평균 대상: 조정베타가 0 초과인 회사 (GPCM 시트 Mean 행과 동일 모집단)',
         '• D/E Ratio = IBD / (Market Cap + 우선주 + NCI)',
@@ -3125,7 +3208,8 @@ if run_btn:
 
                 # 변수 초기화 및 데이터 수집
                 raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name, screen_summary_data, base_year, base_qtr, base_date_str, all_multiples, quality = fetch_financial_data(
-                    api_key_input, target_code_list, target_periods, dart, status_container, progress_bar)
+                    api_key_input, target_code_list, target_periods, dart, status_container, progress_bar,
+                    beta_benchmark=beta_basis_input)
 
                 # 1. 화면 출력용 DataFrame 구성
                 df_screen = pd.DataFrame(all_multiples)

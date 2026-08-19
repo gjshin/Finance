@@ -78,9 +78,19 @@ def _to_price_series(df, col='Close'):
 # 1. Helper Functions (v17 Logic + Beta Calculation)
 # ==========================================
 
-def get_market_index(ticker):
+# 한국 종목의 베타 기준지수 선택. 국내판(gpcm_kr.BETA_BASIS)과 같은 값·라벨을 쓴다
+# — 두 앱이 같은 회사를 다른 기준으로 재면 안 된다. 국내판을 임포트하면 그쪽
+# 사이드바가 실행되므로 값을 복사해 두고, 테스트로 동일성을 고정한다.
+BETA_BASIS = {
+    'KOSPI': '코스피 일괄 (^KS11)',
+    'MARKET': '소속시장 지수 (코스피=^KS11, 코스닥=^KQ11)',
+}
+
+
+def get_market_index(ticker, beta_basis='KOSPI'):
     """
     티커 기반으로 거래소 및 시장지수 코드 반환
+    beta_basis 는 한국 종목(.KS/.KQ)에만 영향을 준다 — 기본은 코스피 일괄이다.
     Returns: (exchange_name, index_symbol)
     """
     ticker_upper = ticker.upper()
@@ -89,7 +99,7 @@ def get_market_index(ticker):
     if ticker_upper.endswith('.KS'):
         return 'KOSPI', '^KS11'
     elif ticker_upper.endswith('.KQ'):
-        return 'KOSDAQ', '^KQ11'
+        return ('KOSDAQ', '^KQ11') if beta_basis == 'MARKET' else ('KOSDAQ', '^KS11')
     elif ticker_upper.endswith('.T'):
         return 'TSE', '^N225'  # Nikkei 225
     elif ticker_upper.endswith('.SS'):
@@ -484,7 +494,8 @@ def _price_on_or_before(price_series, target_dt, max_lookback_days=10):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_ticker_bundle(ticker, base_period_str, lookback, force_annual, include_recent):
+def fetch_ticker_bundle(ticker, base_period_str, lookback, force_annual, include_recent,
+                        beta_basis='KOSPI'):
     """
     단일 티커의 원천 데이터를 수집한다.
 
@@ -514,7 +525,7 @@ def fetch_ticker_bundle(ticker, base_period_str, lookback, force_annual, include
         info = stock.info or {}
         company_name = info.get('longName') or info.get('shortName') or ticker
         currency = info.get('currency', 'USD')
-        exchange, market_idx = get_market_index(ticker)
+        exchange, market_idx = get_market_index(ticker, beta_basis)
 
         bundle.update({'company': company_name, 'currency': currency,
                        'exchange': exchange, 'market_index': market_idx})
@@ -1131,7 +1142,8 @@ def trimmed_stats(values, method='none', low_pct=25, high_pct=75, iqr_k=1.5):
 
 def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_premium=0.0402,
                   target_tax_rate=0.264, user_rf_rate=None, beta_type="5Y",
-                  force_annual=False, include_recent=False, outlier_method='none'):
+                  force_annual=False, include_recent=False, outlier_method='none',
+                  beta_basis='KOSPI'):
     """
     GPCM 데이터 수집 및 엑셀 생성을 위한 데이터 구조 반환
 
@@ -1169,7 +1181,8 @@ def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_
         status_text.text(f"Processing: {ticker}... ({idx + 1}/{total_tickers})")
         progress_bar.progress((idx + 1) / total_tickers)
 
-        bundle = fetch_ticker_bundle(ticker, base_period_str, lookback, force_annual, include_recent)
+        bundle = fetch_ticker_bundle(ticker, base_period_str, lookback, force_annual, include_recent,
+                                     beta_basis=beta_basis)
         data_quality_rows.extend(bundle['flags'])
 
         if not bundle['ok']:
@@ -1963,6 +1976,8 @@ def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_a
         '• Ke = Rf + MRP × Relevered Beta + Size Premium',
         '  - Relevered Beta = Avg Unlevered Beta × (1 + (1 - Tax) × Target D/E)',
         '  - Size Premium: 한국공인회계사회 기업규모위험 프리미엄 연구결과 (2026.06.05, 3분위·5분위)',
+        f'  - Beta 벤치마크(한국 종목): '
+        f'{BETA_BASIS.get(target_inputs.get("beta_basis", "KOSPI"), "코스피 일괄 (^KS11)")}',
         '• Kd (Aftertax) = Kd (Pretax) × (1 - Target Tax Rate)',
         '• Target D/V = 피어 평균 부채비율 (GPCM 시트 Mean 행 참조)',
         '• WACC = (E/V) × Ke + (D/V) × Kd (Aftertax)',
@@ -3014,6 +3029,13 @@ PYT.VI"""
     size_premium_input = size_premium_options[size_premium_choice]
 
     st.markdown("**Beta 계산 기준 선택**")
+    beta_basis_choice = st.selectbox(
+        "베타 기준지수 (한국 종목)", list(BETA_BASIS.values()), index=0,
+        help="한국 종목(.KS/.KQ)에만 적용됩니다. 기본은 코스피 일괄 — 피어 무차입베타를 "
+             "평균해 하나의 WACC 을 만들므로 모든 β 가 같은 지수 기준이어야 하고, "
+             "MRP 도 시장 전체 기준 추정치이기 때문입니다.")
+    beta_basis_input = next(k for k, v in BETA_BASIS.items() if v == beta_basis_choice)
+
     beta_type_options = {
         "5년 월간 베타 (5Y Monthly)": "5Y",
         "2년 주간 베타 (2Y Weekly)": "2Y"
@@ -3063,6 +3085,8 @@ PYT.VI"""
         'Revenue': ti_revenue or None, 'EBITDA': ti_ebitda or None, 'EBIT': ti_ebit or None,
         'NI': ti_ni or None, 'Equity': ti_equity or None, 'IBD': ti_ibd or None,
         'Cash': ti_cash or None, 'NCI': ti_nci or None, 'Shares': ti_shares or None,
+        # Implied Valuation 시트는 위의 고정 키만 읽는다. 이 값은 Notes 에서만 쓴다.
+        'beta_basis': beta_basis_input,
     }
 
     # 6. Run Button
@@ -3088,6 +3112,7 @@ if btn_run:
                 target_tax_rate=target_tax_rate_input,
                 user_rf_rate=rf_input,
                 beta_type=beta_type_input,
+                beta_basis=beta_basis_input,
                 outlier_method=outlier_method_input,
             )
 

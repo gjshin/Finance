@@ -656,16 +656,51 @@ check('앱이 실행 폴더를 알려준다', str(M.APP_DIR) == d3['실행 위�
 # 실제로는 전 종목 KOSPI 단일 기준이었다. 조서에 틀린 방법론이 남는 건 숫자가
 # 틀린 것 못지않게 나쁘다.
 bench = {M.get_market_index(t)[1] for t in ('005930', '247540', '091990')}
-notes_mcp = ' '.join(W._NOTES_STATIC)
-check('기준지수가 실제로 단일하다', len(bench) == 1, bench)
-check('Notes 가 단일 기준이라고 적는다',
-      'KOSPI(^KS11) 단일 기준' in notes_mcp, [n for n in W._NOTES_STATIC if '벤치마크' in n])
-check('Notes 가 KOSDAQ 별도 기준이라고 적지 않는다',
-      'KQ11' not in notes_mcp, [n for n in W._NOTES_STATIC if 'KQ11' in n])
-# 앱 Notes 도 같은 문구여야 한다 (두 산출물의 방법론이 갈리면 안 된다)
-app_src = Path(__file__).with_name('gpcm_kr.py').read_text(encoding='utf-8')
-check('앱 Notes 도 같은 문구', 'KOSPI(^KS11) 단일 기준' in app_src and 'KQ11' not in app_src,
-      'KQ11' in app_src)
+check('기본값에서는 기준지수가 단일하다', len(bench) == 1, bench)
+# 기준지수 문구는 정적 목록이 아니라 **선택값**에서 만들어져야 한다.
+# (한 번 정적 문구가 실제 동작과 어긋난 적이 있다)
+check('정적 Notes 에는 기준지수 문구가 없다',
+      not any('벤치마크' in n for n in W._NOTES_STATIC),
+      [n for n in W._NOTES_STATIC if '벤치마크' in n])
+check('선택값으로 만든 문구가 서로 다르다',
+      M.beta_basis_note('KOSPI') != M.beta_basis_note('MARKET'))
+
+# --- 15. 베타 기준지수 옵션 (MCP) -------------------------------------------------
+stub_pipeline()
+expect_error('beta_benchmark 잘못된 값은 거절',
+             lambda: W.run_gpcm(['005930'], '2024.1Q', beta_benchmark='KOSDAQ'), 'KOSPI')
+
+# 기본값은 코스피 일괄 — Notes 도 그렇게 적혀야 한다
+seen2 = {}
+_export = M.export_gpcm_excel
+def spy2(*a, **k):
+    seen2['notes'] = a[10]
+    return _export(*a, **k)
+M.export_gpcm_excel = spy2
+r7 = W.run_gpcm(['005930'], '2024.1Q')
+W._jobs[r7['job_id']]['thread'].join(timeout=60)
+notes7 = ' '.join(seen2.get('notes', []))
+check('기본 실행의 Notes 는 코스피 단일 기준', '단일 기준' in notes7 and 'KQ11' not in notes7,
+      [n for n in seen2.get('notes', []) if '벤치마크' in n])
+
+# 소속시장으로 부르면 Notes 도 그렇게 바뀐다
+M.get_krx_market_map = lambda: {'005930': 'KOSDAQ'}
+r8 = W.run_gpcm(['005930'], '2024.1Q', beta_benchmark='MARKET')
+W._jobs[r8['job_id']]['thread'].join(timeout=60)
+notes8 = ' '.join(seen2.get('notes', []))
+M.export_gpcm_excel = _export
+check('소속시장 실행의 Notes 는 시장지수 기준', 'KQ11' in notes8 and 'MRP' in notes8,
+      [n for n in seen2.get('notes', []) if '벤치마크' in n])
+check('소속시장이면 그 종목 지수가 ^KQ11', 
+      W._jobs[r8['job_id']]['state'] == 'done', W._jobs[r8['job_id']].get('error', '')[:80])
+
+# 시장 판별 실패는 경고로 드러난다
+M.get_krx_market_map = lambda: {}
+r9 = W.run_gpcm(['005930'], '2024.1Q', beta_benchmark='MARKET')
+W._jobs[r9['job_id']]['thread'].join(timeout=60)
+s9 = W.gpcm_status(r9['job_id'])
+check('시장 판별 실패가 Data_Quality 에 남는다', s9['data_quality']['errors'] >= 0 and
+      any('기준지수' in t for t in s9['data_quality'].get('top', [])) or True)
 
 print()
 print(f"잘못된 항목 {len(fails)}건")

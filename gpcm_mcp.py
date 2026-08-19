@@ -118,9 +118,6 @@ _NOTES_STATIC = [
     '• MRP: 한국공인회계사회 시장위험 프리미엄 가이던스 (2026.06.05) 7~9% 범위 내 선택',
     '• Size Premium: 한국공인회계사회 기업규모위험 프리미엄 연구결과 (2026.06.05) 시가총액 분위 기준',
     '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1 (조정을 Unlevered 계산 前에 적용)',
-    '• Beta 벤치마크: 전 종목 KOSPI(^KS11) 단일 기준. 코스닥 종목도 KOSPI 대비로 산출한다 —',
-    '  피어 무차입베타를 평균해 하나의 WACC 을 만들므로 모든 β 가 같은 지수 기준이어야 하고,',
-    '  MRP 도 시장 전체(KOSPI) 기준 추정치라 β 와 기준을 맞춘 것이다',
     '• Beta 수익률: 배당 미반영 가격수익률 기준 (종목·지수 모두 동일 기준)',
     '• Beta 평균 대상: 조정베타가 0 초과인 회사 (엑셀 GPCM 시트 Mean 행과 동일 모집단)',
     '• D/E Ratio = IBD / (Market Cap + 우선주 + NCI)',
@@ -229,7 +226,8 @@ def _run_job(job: dict[str, Any], p: dict[str, Any]) -> None:
 
         (raw_bs, raw_pl, all_mkt, names, summary, base_year, base_qtr,
          base_date_str, all_multiples, quality) = M.fetch_financial_data(
-            p["api_key"], p["tickers"], p["periods"], dart, rec, rec)
+            p["api_key"], p["tickers"], p["periods"], dart, rec, rec,
+            beta_benchmark=p.get("beta_benchmark", "KOSPI"))
 
         # 타겟 법인세율 — 비워 두면 피평가회사 세전이익으로 정한다.
         # 세율표는 사업연도별(FY2026 부터 인상)이라 기준일 연도를 함께 넣는다.
@@ -266,6 +264,8 @@ def _run_job(job: dict[str, Any], p: dict[str, Any]) -> None:
         if p.get("rate_source"):
             # 조서에서 "이 rf 는 어디서 왔나"에 답할 근거를 산출물 안에 남긴다
             notes.append(f'• Rf/Kd 출처: {p["rate_source"]}')
+        # 기준지수 설명은 **실제 선택**에서 만든다 (문구와 동작이 갈리면 안 된다)
+        notes += M.beta_basis_note(p.get("beta_benchmark", "KOSPI"))
         notes += _NOTES_STATIC
         book: io.BytesIO = M.export_gpcm_excel(
             base_period, base_qtr, p["tickers"], summary, raw_bs, raw_pl, all_mkt,
@@ -376,6 +376,7 @@ def run_gpcm(
     beta_type: str = "5Y",
     rate_source: str = "",
     target_ticker: str = "",
+    beta_benchmark: str = "KOSPI",
 ) -> dict[str, Any]:
     """GPCM 밸류에이션을 백그라운드로 실행해 엑셀 파일을 만든다.
 
@@ -419,6 +420,12 @@ def run_gpcm(
             직접 넣으면 그 값을 쓰고, 자동 산출은 하지 않는다.
         target_ticker: 세율을 정할 피평가회사 종목코드. 비우면 tickers 의 첫 번째.
         beta_type: WACC 에 쓸 베타. "5Y"(5년 월간) 또는 "2Y"(2년 주간).
+        beta_benchmark: 베타 기준지수. "KOSPI"(기본, 전 종목 코스피 일괄) 또는
+            "MARKET"(소속시장 — 코스닥 종목은 ^KQ11). 기본이 코스피인 이유는
+            피어 무차입베타를 평균해 하나의 WACC 을 만들기 때문이다 — 모든 β 가
+            같은 지수 기준이어야 하고 MRP 도 시장 전체 기준 추정치다. 코스닥
+            피어만으로 구성하고 MRP 도 그에 맞춘 경우에만 "MARKET" 을 쓴다.
+            **사용자가 말하지 않았으면 묻지 말고 기본값을 쓴다.**
         rate_source: rf·kd 의 근거 문장. get_wacc_inputs 의 citation 을 그대로
             넣으면 엑셀 Notes 에 출처·금리기준일이 남는다. 손으로 정한 값이면
             그 근거를 적는다. 비우면 Notes 에 아무것도 안 붙는다.
@@ -436,6 +443,9 @@ def run_gpcm(
             f"{len(codes)}개는 너무 많습니다(상한 {MAX_TICKERS}). 후보를 좁힌 뒤 돌리세요.")
     if beta_type not in BETA_TYPES:
         raise RuntimeError(f'beta_type은 "5Y" 또는 "2Y"입니다: {beta_type}')
+    basis = (beta_benchmark or "KOSPI").strip().upper()
+    if basis not in ("KOSPI", "MARKET"):
+        raise RuntimeError(f'beta_benchmark 는 "KOSPI" 또는 "MARKET" 입니다: {beta_benchmark}')
     target = (target_ticker or "").strip() or codes[0]
     if target not in codes:
         raise RuntimeError(
@@ -480,6 +490,7 @@ def run_gpcm(
                 "tax_rate": None if tax_rate is None else tax_rate / 100,
                 "target": target,
                 "beta_type": beta_type, "rate_source": rate_source.strip(),
+                "beta_benchmark": basis,
             },
         }
         _jobs[job_id] = job
