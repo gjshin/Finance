@@ -138,14 +138,30 @@ def _get_market_index_data(market_idx, start, end, cache):
     return data
 
 
-def get_market_index(ticker):
-    """
-    티커 기반으로 거래소 및 시장지수 코드 반환 (한국 종목만 지원)
+BETA_BENCHMARK = '^KS11'  # KOSPI. fdr 의 KS11 이 자주 실패해 yfinance 심볼을 쓴다
+
+
+def get_market_index(ticker=None):
+    """베타 기준지수를 돌려준다. 종목과 무관하게 **KOSPI 단일 기준**이다.
+
+    코스닥 종목도 KOSPI 대비로 잰다. 시장별로 다른 지수를 쓰지 않는 이유:
+
+    1) 이 모델은 피어들의 무차입베타를 평균해 하나의 WACC 을 만든다. 평균이
+       의미를 가지려면 모든 β 가 같은 지수 기준이어야 한다 — 코스닥 기준 β 와
+       코스피 기준 β 를 섞어 평균하는 것은 단위가 다른 값을 더하는 것이다.
+    2) Ke = rf + β × MRP 에서 β 와 MRP 의 기준이 같아야 한다. 여기서 쓰는 MRP 는
+       시장 전체(KOSPI) 기준 추정치다. 코스닥 지수 기준 β 에 이 MRP 를 곱하면
+       기준이 어긋난다. 코스닥 기준으로 재려면 MRP 도 코스닥 기준으로 다시
+       추정해야 한다.
+
+    코스닥 소형주는 이 기준에서 R² 가 낮게 나오는데, 그건 고유위험이 크다는
+    뜻이지 기준을 잘못 골랐다는 뜻이 아니다 (고유위험은 분산 가능해 가격에
+    반영되지 않는다). 낮은 R² 는 Beta 시트와 gpcm_review 에 드러난다.
+
+    ticker 인자는 호출부 호환을 위해 남겨 두었고 쓰지 않는다.
     Returns: (exchange_name, index_symbol)
     """
-    # 한국 종목 - FinanceDataReader 기준
-    # KS11 (KOSPI)가 fdr에서 실패하는 경우가 많아 yfinance 심볼(^KS11)로 대체
-    return 'KRX', '^KS11'  # 기본값: KOSPI
+    return 'KRX', BETA_BENCHMARK
 
 # 한국 법인세 한계세율표 (사업연도별, 지방소득세 10% 포함)
 # 각 구간: (과세표준 상한(억원), 한계세율)  — 상한 None = 초과 구간
@@ -2978,7 +2994,9 @@ if ui_mode == "GPCM Valuation (기존)":
         '• LTM = Current Cumulative + Prior Annual − Prior Same Quarter Cumulative (단, 4Q는 Annual)',
         '• Beta: 5년 월간 & 2년 주간 수익률 기준 (FinanceDataReader 사용)',
         '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1 (조정을 Unlevered 계산 前에 적용)',
-        '• Beta 벤치마크: 종목이 속한 시장지수 (KOSPI=KS11, KOSDAQ=KQ11). 시장이 다른 피어를 함께 평균',
+        '• Beta 벤치마크: 전 종목 KOSPI(^KS11) 단일 기준. 코스닥 종목도 KOSPI 대비로 산출한다 —',
+        '  피어 무차입베타를 평균해 하나의 WACC 을 만들므로 모든 β 가 같은 지수 기준이어야 하고,',
+        '  MRP 도 시장 전체(KOSPI) 기준 추정치라 β 와 기준을 맞춘 것이다',
         '• Beta 수익률: 배당 미반영 가격수익률 기준 (종목·지수 모두 동일 기준)',
         '• Beta 평균 대상: 조정베타가 0 초과인 회사 (GPCM 시트 Mean 행과 동일 모집단)',
         '• D/E Ratio = IBD / (Market Cap + 우선주 + NCI)',

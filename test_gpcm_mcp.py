@@ -651,6 +651,22 @@ check('Streamlit 앱과 MCP 서버가 같은 버전을 읽는다',
       M.app_version() == d3['버전'], (M.app_version(), d3['버전']))
 check('앱이 실행 폴더를 알려준다', str(M.APP_DIR) == d3['실행 위치'], (str(M.APP_DIR), d3['실행 위치']))
 
+# --- 14. 조서에 적히는 방법론이 실제 동작과 맞는가 ------------------------------
+# 한 번 어긋난 적이 있다: Notes 에 "종목이 속한 시장지수(KOSPI/KOSDAQ)" 라고 적었는데
+# 실제로는 전 종목 KOSPI 단일 기준이었다. 조서에 틀린 방법론이 남는 건 숫자가
+# 틀린 것 못지않게 나쁘다.
+bench = {M.get_market_index(t)[1] for t in ('005930', '247540', '091990')}
+notes_mcp = ' '.join(W._NOTES_STATIC)
+check('기준지수가 실제로 단일하다', len(bench) == 1, bench)
+check('Notes 가 단일 기준이라고 적는다',
+      'KOSPI(^KS11) 단일 기준' in notes_mcp, [n for n in W._NOTES_STATIC if '벤치마크' in n])
+check('Notes 가 KOSDAQ 별도 기준이라고 적지 않는다',
+      'KQ11' not in notes_mcp, [n for n in W._NOTES_STATIC if 'KQ11' in n])
+# 앱 Notes 도 같은 문구여야 한다 (두 산출물의 방법론이 갈리면 안 된다)
+app_src = Path(__file__).with_name('gpcm_kr.py').read_text(encoding='utf-8')
+check('앱 Notes 도 같은 문구', 'KOSPI(^KS11) 단일 기준' in app_src and 'KQ11' not in app_src,
+      'KQ11' in app_src)
+
 print()
 print(f"잘못된 항목 {len(fails)}건")
 sys.exit(1 if fails else 0)

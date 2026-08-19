@@ -110,6 +110,16 @@ for fy in (2024, 2025, 2026):
     chk(f'FY{fy} 수식 세율이 파이썬 표와 일치',
         all(f'{r:g}' in f for _, r in br), f)
 
+# --- 베타 기준지수 ---------------------------------------------------------------
+print()
+print("베타 기준지수")
+print("-" * 66)
+chk('모든 종목이 KOSPI 단일 기준 (코스닥도 동일)',
+    len({M.get_market_index(t)[1] for t in ('005930', '247540', '091990', '000660')}) == 1,
+    {t: M.get_market_index(t)[1] for t in ('005930', '247540')})
+chk('기준지수는 ^KS11', M.get_market_index('247540')[1] == '^KS11', M.get_market_index('247540'))
+# 조서에 적히는 방법론이 실제 동작과 어긋나면 안 된다 (한 번 틀리게 적은 적이 있다)
+
 print()
 print(f"잘못된 항목 {fails}건")
 sys.exit(1 if fails else 0)
