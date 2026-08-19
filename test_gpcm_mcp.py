@@ -645,6 +645,11 @@ d3 = W.gpcm_doctor()
 check('진단이 버전과 실행 위치를 알려준다',
       d3.get('버전') not in (None, 'unknown') and d3.get('실행 위치'), (d3.get('버전'), d3.get('실행 위치')))
 check('버전이 manifest 와 일치', d3['버전'] == manifest['version'], (d3['버전'], manifest['version']))
+# run_kr.bat 은 내려받은 폴더의 gpcm_kr.py 를 그대로 실행한다 — 앱도 같은 버전을
+# 보여줘야 어느 폴더에서 돌고 있는지 대조할 수 있다.
+check('Streamlit 앱과 MCP 서버가 같은 버전을 읽는다',
+      M.app_version() == d3['버전'], (M.app_version(), d3['버전']))
+check('앱이 실행 폴더를 알려준다', str(M.APP_DIR) == d3['실행 위치'], (str(M.APP_DIR), d3['실행 위치']))
 
 print()
 print(f"잘못된 항목 {len(fails)}건")

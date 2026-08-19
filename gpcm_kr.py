@@ -3,6 +3,7 @@ import pandas as pd
 import OpenDartReader
 import FinanceDataReader as fdr
 from datetime import datetime, timedelta
+from pathlib import Path
 import warnings
 import numpy as np
 import re
@@ -32,6 +33,20 @@ from openpyxl.workbook.defined_name import DefinedName
 
 # Streamlit 페이지 설정 (가장 먼저 와야 함)
 st.set_page_config(page_title="GPCM Calculator", layout="wide")
+
+# 이 앱은 "설치"가 없다 — run_kr.bat 이 이 폴더의 파일을 그대로 실행하므로
+# 내려받은 폴더가 곧 버전이다. 옛 폴더에서 돌리고 있는지 화면에서 보이게 한다.
+# MCP 서버(gpcm_mcp.py)와 같은 출처(manifest.json)를 읽어 두 경로의 판을 대조할 수 있다.
+APP_DIR = Path(__file__).resolve().parent
+
+
+def app_version():
+    try:
+        import json
+        return json.loads((APP_DIR / "manifest.json").read_text(encoding="utf-8"))["version"]
+    except Exception:
+        return "unknown"
+
 
 warnings.filterwarnings('ignore')
 
@@ -2533,6 +2548,9 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
 # 사이드바 UI
 with st.sidebar:
     st.header("Settings")
+    st.caption(f"gpcm {app_version()}  ·  {APP_DIR}")
+    if app_version() == "unknown":
+        st.caption("⚠️ manifest.json 이 없어 버전을 알 수 없습니다 — 폴더가 온전한지 확인하세요.")
     
     # 좌측 1 : 기능 모드 선택 (신규)
     ui_mode = st.radio(
