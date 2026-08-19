@@ -323,6 +323,63 @@ def fetch_market_rate(kind, asof, grade=None, term=None, key=""):
                      + ("" if label != "한국은행 ECOS" or key else " (인증키 미설정)"))
     return None, tried
 
+
+# ==========================================
+# 자본비용 참고치 (한국공인회계사회)
+# ==========================================
+# 출처: 「한국의 시장위험 프리미엄 가이던스」·「한국의 기업규모위험 프리미엄
+#       연구결과」 (둘 다 2026.06.05 발표)
+# MRP 는 가이던스(한공회 입장)이고 SRP 는 연구결과(참고자료)다 — 그대로 써야 할
+# 의무는 없으며, 사안에 따라 다른 값이 적절할 수 있다는 것이 문서의 명시적 입장이다.
+CPA_GUIDANCE_DATE = '2026.06.05'
+MRP_GUIDANCE = (0.07, 0.09)   # 2026년도 가이던스 — 전년과 동일한 7~9% 유지
+MRP_DEFAULT = 0.08            # 범위 중앙값
+
+# 규모위험 프리미엄. 시가총액 경계는 연구결과의 분위별 평균시가총액 Min~Max
+# (단위: 백만원)를 억원으로 환산한 값이다.
+# (구분, SRP, 시총 하한(억원), 시총 상한(억원) — None 이면 상한 없음)
+SRP_TERTILE = [
+    ('Micro', 0.0402, 296, 2583),
+    ('Low', 0.0119, 2585, 8671),
+    ('Mid', -0.0045, 8679, None),
+]
+SRP_QUINTILE = [
+    ('5분위 (최소)', 0.0486, 296, 1759),
+    ('4분위', 0.0267, 1760, 3135),
+    ('3분위', 0.0097, 3142, 6600),
+    ('2분위', -0.0006, 6608, 18794),
+    ('1분위 (최대)', -0.0051, 18837, None),
+]
+
+
+def _srp_range_text(low, high):
+    if high is None:
+        return f'{low:,}억 초과'
+    return f'{low:,} ~ {high:,}억'
+
+
+def srp_options():
+    """사이즈 프리미엄 선택지 {라벨: 값}. 앱·MCP 가 같은 표를 쓴다."""
+    out = {}
+    for group, rows in (('3분위', SRP_TERTILE), ('5분위', SRP_QUINTILE)):
+        for name, srp, low, high in rows:
+            out[f'{group} - {name} ({srp*100:.2f}%): {_srp_range_text(low, high)}'] = srp
+    out['Size Premium 미적용 (0%)'] = 0.0
+    return out
+
+
+def srp_for_market_cap(mktcap_100m, basis='3분위'):
+    """시가총액(억원)에 해당하는 SRP. 못 정하면 None (지어내지 않는다)."""
+    rows = SRP_TERTILE if basis == '3분위' else SRP_QUINTILE
+    try:
+        v = float(mktcap_100m)
+    except (TypeError, ValueError):
+        return None
+    for name, srp, low, high in rows:
+        if v >= low and (high is None or v <= high):
+            return srp
+    return None
+
 def get_korean_tax_brackets(fiscal_year):
     """사업연도에 적용되는 한국 법인세 한계세율표 반환."""
     try:
@@ -2861,39 +2918,26 @@ with st.sidebar:
         rf_input = st.number_input("Rf - 무위험이자율 (%)", min_value=0.0, max_value=10.0,
                                    value=float(st.session_state.get('rf_fetched', 3.3)),
                                    step=0.1, format="%.2f") / 100
-        mrp_input = st.slider("MRP (시장위험프리미엄)", min_value=7.0, max_value=9.0, value=8.0, step=0.1, format="%.1f%%") / 100
+        mrp_input = st.slider(
+            "MRP (시장위험프리미엄)",
+            min_value=MRP_GUIDANCE[0] * 100, max_value=MRP_GUIDANCE[1] * 100,
+            value=MRP_DEFAULT * 100, step=0.1, format="%.1f%%",
+            help=f"한국공인회계사회 「한국의 시장위험 프리미엄 가이던스」({CPA_GUIDANCE_DATE}) "
+                 f"{MRP_GUIDANCE[0]*100:.0f}~{MRP_GUIDANCE[1]*100:.0f}% 범위. "
+                 "가이던스는 한공회 입장이며 그대로 써야 할 의무는 없습니다.") / 100
 
-        with st.expander("📊 시가총액별 Size Premium 참고표"):
-            st.markdown("**3분위수 기준**")
-            st.markdown("""
-            | 구분 | 시가총액 범위 (억원) | Size Premium |
-            |------|---------------------|--------------|
-            | **Micro** | < 2,000 | **4.02%** |
-            | **Low** | 2,000 ~ 20,000 | 1.37% |
-            | **Mid** | > 20,000 | -0.36% |
-            """)
-            st.markdown("**5분위수 기준**")
-            st.markdown("""
-            | 구분 | 시가총액 범위 (억원) | Size Premium |
-            |------|---------------------|--------------|
-            | **5분위 (최소)** | < 2,000 | **4.66%** |
-            | **4분위** | 2,000 ~ 5,000 | 3.02% |
-            | **3분위** | 5,000 ~ 20,000 | 1.21% |
-            | **2분위** | 20,000 ~ 50,000 | 0.06% |
-            | **1분위 (최대)** | > 50,000 | -0.58% |
-            """)
-        
-        size_premium_options = {
-            "3분위 - Micro (4.02%): < 2,000억": 0.0402,
-            "3분위 - Low (1.37%): 2,000~20,000억": 0.0137,
-            "3분위 - Mid (-0.36%): > 20,000억": -0.0036,
-            "5분위 - 5분위/최소 (4.66%): < 2,000억": 0.0466,
-            "5분위 - 4분위 (3.02%): 2,000~5,000억": 0.0302,
-            "5분위 - 3분위 (1.21%): 5,000~20,000억": 0.0121,
-            "5분위 - 2분위 (0.06%): 20,000~50,000억": 0.0006,
-            "5분위 - 1분위/최대 (-0.58%): > 50,000억": -0.0058,
-            "Size Premium 없음 (0%)": 0.0
-        }
+        with st.expander(f"📊 시가총액별 Size Premium 참고표 (한공회 {CPA_GUIDANCE_DATE})"):
+            for title, rows in (("**3분위수 기준**", SRP_TERTILE), ("**5분위수 기준**", SRP_QUINTILE)):
+                st.markdown(title)
+                lines = ["| 구분 | 시가총액 범위 (억원) | Size Premium |",
+                         "|------|---------------------|--------------|"]
+                for name, srp, low, high in rows:
+                    lines.append(f"| **{name}** | {_srp_range_text(low, high)} | {srp*100:.2f}% |")
+                st.markdown("\n".join(lines))
+            st.caption("한국공인회계사회가 외부에 의뢰한 연구결과(참고자료)입니다. "
+                       "그대로 써야 할 의무는 없으며 사안에 따라 다른 값이 적절할 수 있습니다.")
+
+        size_premium_options = srp_options()
         size_premium_choice = st.selectbox("기업 규모 선택", list(size_premium_options.keys()), index=0)
         size_premium_input = size_premium_options[size_premium_choice]
 
@@ -2993,6 +3037,8 @@ if ui_mode == "GPCM Valuation (기존)":
         '• NOA(Option): 투자자산/관계기업 등은 기본적으로 NOA(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
         '• LTM = Current Cumulative + Prior Annual − Prior Same Quarter Cumulative (단, 4Q는 Annual)',
         '• Beta: 5년 월간 & 2년 주간 수익률 기준 (FinanceDataReader 사용)',
+        f'• MRP: 한국공인회계사회 시장위험 프리미엄 가이던스 ({CPA_GUIDANCE_DATE}) {MRP_GUIDANCE[0]*100:.0f}~{MRP_GUIDANCE[1]*100:.0f}% 범위 내 선택',
+        f'• Size Premium: 한국공인회계사회 기업규모위험 프리미엄 연구결과 ({CPA_GUIDANCE_DATE}) 시가총액 분위 기준',
         '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1 (조정을 Unlevered 계산 前에 적용)',
         '• Beta 벤치마크: 전 종목 KOSPI(^KS11) 단일 기준. 코스닥 종목도 KOSPI 대비로 산출한다 —',
         '  피어 무차입베타를 평균해 하나의 WACC 을 만들므로 모든 β 가 같은 지수 기준이어야 하고,',

@@ -5,6 +5,7 @@
 (매출이 1/4로 나오는데 오류는 나지 않아 알아채기 어려웠다).
 """
 import sys, types, pandas as pd, numpy as np
+from pathlib import Path
 sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
 import gpcm_kr as M
 
@@ -119,6 +120,31 @@ chk('모든 종목이 KOSPI 단일 기준 (코스닥도 동일)',
     {t: M.get_market_index(t)[1] for t in ('005930', '247540')})
 chk('기준지수는 ^KS11', M.get_market_index('247540')[1] == '^KS11', M.get_market_index('247540'))
 # 조서에 적히는 방법론이 실제 동작과 어긋나면 안 된다 (한 번 틀리게 적은 적이 있다)
+
+# --- 한국공인회계사회 참고치 (MRP·SRP) -------------------------------------------
+print()
+print("한공회 MRP·SRP")
+print("-" * 66)
+chk('MRP 가이던스 범위 7~9%', M.MRP_GUIDANCE == (0.07, 0.09), M.MRP_GUIDANCE)
+chk('발표일 2026.06.05', M.CPA_GUIDANCE_DATE == '2026.06.05', M.CPA_GUIDANCE_DATE)
+chk('3분위 SRP (4.02 / 1.19 / -0.45)',
+    [r[1] for r in M.SRP_TERTILE] == [0.0402, 0.0119, -0.0045], [r[1] for r in M.SRP_TERTILE])
+chk('5분위 SRP (4.86 / 2.67 / 0.97 / -0.06 / -0.51)',
+    [r[1] for r in M.SRP_QUINTILE] == [0.0486, 0.0267, 0.0097, -0.0006, -0.0051],
+    [r[1] for r in M.SRP_QUINTILE])
+chk('시총으로 구간을 찾는다',
+    (M.srp_for_market_cap(1500), M.srp_for_market_cap(5000), M.srp_for_market_cap(30000))
+    == (0.0402, 0.0119, -0.0045))
+chk('범위 밖은 지어내지 않는다', M.srp_for_market_cap(10) is None, M.srp_for_market_cap(10))
+
+# 해외판(GPCM.py)은 국내 앱을 임포트할 수 없어 값을 복사해 둔다 — 어긋나면 안 된다
+import re as _re, os as _os
+_gl = (Path(_os.path.dirname(_os.path.abspath(__file__))) / 'GPCM.py').read_text(encoding='utf-8')
+_blk = _gl.split('size_premium_options = {')[1].split('}')[0]
+# 라벨 안에도 숫자가 있으므로, 닫는 따옴표 뒤의 값만 읽는다
+_gl_vals = [float(v) for v in _re.findall(r'"\s*:\s*(-?\d+\.?\d*)', _blk)]
+_kr_vals = [r[1] for r in M.SRP_TERTILE] + [r[1] for r in M.SRP_QUINTILE] + [0.0]
+chk('해외판 SRP 값이 국내판과 동일', _gl_vals == _kr_vals, (_gl_vals, _kr_vals))
 
 print()
 print(f"잘못된 항목 {fails}건")
