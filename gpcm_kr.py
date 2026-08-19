@@ -2786,8 +2786,13 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # 공통 입력 1: OpenDart API Key
+    # 공통 입력 1: 인증키 — 두 키를 한자리에 모은다. 한쪽만 아래에 두면 못 찾는다.
     api_key_input = st.text_input("OpenDart API Key", type="password", help="OpenDart API 키를 입력하세요.")
+    ecos_key_input = st.text_input(
+        "한국은행 ECOS 인증키 (선택)", type="password", value=ecos_key_from_env(),
+        help="아래 Target WACC Parameters 의 '기준일 시장금리 조회' 에 쓴다. "
+             "국고채는 이 키 없이도 조회되고, 회사채(등급별) 금리에만 필요하다. "
+             "발급: https://ecos.bok.or.kr (무료)")
     
     # 모드별 입력 파라미터 분기
     if ui_mode == "GPCM Valuation (기존)":
@@ -2884,12 +2889,10 @@ with st.sidebar:
 
         # 기준일 시장금리 조회 — rf·Kd 는 판단이 아니라 그날의 관측치다.
         # 조회값을 그대로 쓰지 않고 아래 입력칸의 기본값으로만 넣는다(확정은 사용자).
-        with st.expander("📉 기준일 시장금리 조회 (선택)"):
-            st.caption("국고채는 인증키 없이 조회됩니다. 회사채는 한국은행 ECOS 인증키가 필요합니다.")
-            ecos_key_input = st.text_input(
-                "한국은행 ECOS 인증키 (선택)", type="password",
-                value=ecos_key_from_env(),
-                help="https://ecos.bok.or.kr 에서 무료 발급. 비워도 국고채는 조회됩니다.")
+        with st.expander("📉 기준일 시장금리 조회 (선택)", expanded=True):
+            st.caption("국고채는 인증키 없이 조회됩니다. 회사채는 위쪽 **ECOS 인증키** 칸을 채워야 합니다."
+                       if not ecos_key_input else
+                       "ECOS 인증키가 입력돼 있어 국고채·회사채 모두 조회됩니다.")
             c1, c2 = st.columns(2)
             rf_term_input = c1.selectbox("국고채 만기", ["1년", "3년", "5년", "10년", "20년", "30년"], index=2)
             kd_grade_input = c2.selectbox("회사채 등급", list(BOND_GRADES), index=0)
