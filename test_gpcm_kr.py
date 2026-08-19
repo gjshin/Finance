@@ -92,6 +92,24 @@ chk('오검출 방지: 품목별 수익 태그는 안 쓴다',
     M.match_pl_lenient('상품매출', 'ifrs-full_RevenueFromSaleOfGoods') is None,
     M.match_pl_lenient('상품매출', 'ifrs-full_RevenueFromSaleOfGoods'))
 
+# --- 엑셀 세율 수식 (사업연도별) -----------------------------------------------
+print()
+print("엑셀 Tax Rate 수식")
+print("-" * 66)
+OLD_2025 = '=IF(AE6<=2, 0.099, IF(AE6<=200, 0.209, IF(AE6<=3000, 0.231, 0.264)))'
+chk('FY2025 수식이 종전과 글자까지 같다', M.korean_tax_rate_formula('AE6', 2025) == OLD_2025,
+    M.korean_tax_rate_formula('AE6', 2025))
+chk('FY2024 도 동일', M.korean_tax_rate_formula('AE6', 2024) == OLD_2025)
+chk('FY2026 은 개정 세율(11%/22%/24.2%/27.5%)',
+    M.korean_tax_rate_formula('AE6', 2026) ==
+    '=IF(AE6<=2, 0.11, IF(AE6<=200, 0.22, IF(AE6<=3000, 0.242, 0.275)))',
+    M.korean_tax_rate_formula('AE6', 2026))
+for fy in (2024, 2025, 2026):
+    br = M.get_korean_tax_brackets(fy)
+    f = M.korean_tax_rate_formula('X1', fy)
+    chk(f'FY{fy} 수식 세율이 파이썬 표와 일치',
+        all(f'{r:g}' in f for _, r in br), f)
+
 print()
 print(f"잘못된 항목 {fails}건")
 sys.exit(1 if fails else 0)

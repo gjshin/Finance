@@ -7,8 +7,11 @@
 # 인증키를 물어본다. 이미 mydart를 설치했다면 그 키를 자동으로 재사용한다.
 # 미리 주려면:
 #        powershell -ExecutionPolicy Bypass -File .\install_mcp.ps1 -ApiKey "발급받은키"
+#
+# 한국은행 ECOS 인증키(선택)를 넣으면 회사채 금리까지 자동 조회한다. 없어도 된다:
+#        ... -ApiKey "발급받은키" -EcosKey "ECOS키"
 
-param([string]$ApiKey = "")
+param([string]$ApiKey = "", [string]$EcosKey = "")
 
 $ErrorActionPreference = "Stop"
 $root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -81,6 +84,29 @@ if (-not $ApiKey) {
 if (-not $ApiKey) { throw "인증키가 없으면 등록해도 조회가 되지 않습니다." }
 Ok "$($ApiKey.Length)자 확인 (화면에 키는 표시하지 않습니다)"
 
+# --- 2-b. 한국은행 ECOS 인증키 (선택) ------------------------------------------
+# 없어도 국고채 금리는 무키 경로로 조회된다. 회사채(등급별) 금리에만 필요하다.
+# 확장(.mcpb)은 이 키를 받는데 이 스크립트만 빠져 있어 설치 경로별로 기능이
+# 달랐다 — 같게 맞춘다.
+Step "한국은행 ECOS 인증키 (선택)"
+if (-not $EcosKey -and (Test-Path $configPath)) {
+    try {
+        $existing = Get-Content $configPath -Raw | ConvertFrom-Json
+        $candidate = $existing.mcpServers.gpcm.env.ECOS_API_KEY
+        # 확장에서 입력칸이 비면 `${user_config...}` 리터럴이 들어온다 — 키로 보지 않는다
+        if ($candidate -and -not $candidate.StartsWith('$')) {
+            $EcosKey = $candidate; Ok "기존 gpcm 설정에서 ECOS 키를 찾았습니다."
+        }
+    } catch { $EcosKey = "" }
+}
+if (-not $EcosKey) {
+    Write-Host "   https://ecos.bok.or.kr 에서 무료로 발급받습니다."
+    Write-Host "   비워두고 엔터를 눌러도 됩니다 (국고채 금리는 키 없이 조회됩니다)."
+    $EcosKey = (Read-Host "   ECOS 인증키 (건너뛰려면 엔터)").Trim()
+}
+if ($EcosKey) { Ok "$($EcosKey.Length)자 확인 (화면에 키는 표시하지 않습니다)" }
+else { Warn "ECOS 키 없이 진행합니다 — 회사채 금리 조회는 안 됩니다." }
+
 # --- 3. uv 준비 ----------------------------------------------------------------
 Step "uv 준비"
 $uv = Join-Path $env:USERPROFILE ".local\bin\uv.exe"
@@ -123,6 +149,8 @@ $server = [ordered]@{
                 "python", (Join-Path $root "gpcm_mcp.py"))
     env     = [ordered]@{ DART_API_KEY = $ApiKey }
 }
+# 있을 때만 넣는다 — 빈 값을 넣으면 서버가 "키 있음"으로 오인한다
+if ($EcosKey) { $server.env['ECOS_API_KEY'] = $EcosKey }
 $config.mcpServers | Add-Member -NotePropertyName gpcm -NotePropertyValue $server -Force
 [System.IO.File]::WriteAllText($configPath, ($config | ConvertTo-Json -Depth 30))
 Ok $configPath
@@ -133,6 +161,7 @@ Ok ("등록된 서버: " + (($config.mcpServers.PSObject.Properties.Name) -join 
 # 첫 실행은 파이썬·패키지를 내려받아 몇 분 걸릴 수 있다.
 Step "연결 자체점검 (첫 실행은 몇 분 걸릴 수 있습니다)"
 $env:DART_API_KEY = $ApiKey
+if ($EcosKey) { $env:ECOS_API_KEY = $EcosKey }
 & $uv run --no-project --python 3.12 `
     --with-requirements (Join-Path $root "requirements-mcp.txt") `
     python (Join-Path $root "gpcm_mcp.py") --selftest

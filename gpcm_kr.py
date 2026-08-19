@@ -43,6 +43,10 @@ QUARTER_INFO = {'1Q': '03-31', '2Q': '06-30', '3Q': '09-30', '4Q': '12-31'}
 
 BETA_5Y_DAYS = 365 * 5 + 20
 BETA_2Y_DAYS = 365 * 2 + 20
+# 창(window)을 다 채웠을 때의 관측치 — 미달이면 경고한다(제외는 하지 않는다)
+FULL_MONTHLY_OBS = 60   # 5년 × 12개월
+FULL_WEEKLY_OBS = 104   # 2년 × 52주
+BETA_SANITY_LIMIT = 3.0  # 통상 범위. 넘으면 경고만 하고 값은 그대로 둔다
 MIN_MONTHLY_PTS = 12
 MIN_WEEKLY_PTS = 50
 
@@ -148,6 +152,22 @@ def get_korean_tax_brackets(fiscal_year):
     if fy >= 2023:
         return KR_TAX_BRACKETS_2023
     return KR_TAX_BRACKETS_PRE2023
+
+
+def korean_tax_rate_formula(cell_ref, fiscal_year):
+    """엑셀 Tax Rate 수식을 사업연도 세율표에서 만든다.
+
+    종전에는 FY2023~25 세율이 수식에 박혀 있어, 2025년 세법개정(FY2026~)이
+    반영되지 않았다 — 같은 워크북 안에서 엑셀 세율과 파이썬 세율이 갈렸다.
+    get_korean_marginal_tax_rate 와 같은 표를 써서 두 값이 항상 맞물리게 한다.
+    """
+    brackets = get_korean_tax_brackets(fiscal_year)
+    finite = [(u, r) for u, r in brackets if u is not None]
+    last_rate = brackets[-1][1]
+    formula = f'{last_rate:g}'
+    for upper, rate in reversed(finite):
+        formula = f'IF({cell_ref}<={upper:g}, {rate:g}, {formula})'
+    return '=' + formula
 
 
 def get_korean_marginal_tax_rate(pretax_income_100m, fiscal_year=None):
@@ -1549,38 +1569,52 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
         if stock_monthly_5y is not None and market_monthly_5y is not None and not stock_monthly_5y.empty and not market_monthly_5y.empty:
             try:
                 common_dates = stock_monthly_5y.index.intersection(market_monthly_5y.index)
-                if len(common_dates) > MIN_MONTHLY_PTS:
-                    stock_ret = stock_monthly_5y.loc[common_dates].pct_change().dropna()
-                    market_ret = market_monthly_5y.loc[common_dates].pct_change().dropna()
-                    common_idx = stock_ret.index.intersection(market_ret.index)
-                    if len(common_idx) > 10:
-                        stock_ret_aligned = stock_ret.loc[common_idx]
-                        market_ret_aligned = market_ret.loc[common_idx]
-                        cov_matrix = np.cov(stock_ret_aligned, market_ret_aligned)
-                        beta_raw = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else np.nan
-                        beta_adj = (2/3) * beta_raw + (1/3) * 1
+                stock_ret = stock_monthly_5y.loc[common_dates].pct_change().dropna()
+                market_ret = market_monthly_5y.loc[common_dates].pct_change().dropna()
+                common_idx = stock_ret.index.intersection(market_ret.index)
+                # 관측치가 적다고 여기서 빼지 않는다 — 엑셀 SLOPE 는 그대로 계산하므로
+                # 파이썬만 빼면 두 평균의 대상이 달라진다. 대신 아래에서 경고한다.
+                if len(common_idx) >= 2:
+                    stock_ret_aligned = stock_ret.loc[common_idx]
+                    market_ret_aligned = market_ret.loc[common_idx]
+                    cov_matrix = np.cov(stock_ret_aligned, market_ret_aligned)
+                    beta_raw = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else np.nan
+                    beta_adj = (2/3) * beta_raw + (1/3) * 1
 
-                        # 신뢰도 — 값 계산은 그대로 두고 판단 근거만 덧붙인다.
-                        # R²: 주가 변동 중 시장으로 설명되는 비중 (낮으면 기울기가
-                        # 관계를 요약한 것이 아니다). n: 회귀에 실제로 들어간 관측치.
-                        comp_data['Beta_5Y_Raw'] = None if np.isnan(beta_raw) else float(beta_raw)
-                        comp_data['Beta_5Y_N'] = int(len(common_idx))
-                        with np.errstate(invalid='ignore'):
-                            corr = np.corrcoef(stock_ret_aligned, market_ret_aligned)[0, 1]
-                        comp_data['Beta_5Y_R2'] = None if np.isnan(corr) else float(corr ** 2)
+                    # 신뢰도 — 값 계산은 그대로 두고 판단 근거만 덧붙인다.
+                    # R²: 주가 변동 중 시장으로 설명되는 비중 (낮으면 기울기가
+                    # 관계를 요약한 것이 아니다). n: 회귀에 실제로 들어간 관측치.
+                    n_obs = int(len(common_idx))
+                    comp_data['Beta_5Y_Raw'] = None if np.isnan(beta_raw) else float(beta_raw)
+                    comp_data['Beta_5Y_N'] = n_obs
+                    with np.errstate(invalid='ignore'):
+                        corr = np.corrcoef(stock_ret_aligned, market_ret_aligned)[0, 1]
+                    comp_data['Beta_5Y_R2'] = None if np.isnan(corr) else float(corr ** 2)
 
-                        if not np.isnan(beta_adj) and equity > 0:
-                            unlevered_beta_5y = beta_adj / (1 + (1 - tax_rate) * de_ratio)
-                            avg_unlevered_betas_5y.append(unlevered_beta_5y)
-                        elif quality is not None:
-                            quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
-                                        f'5년 월간 베타를 평균에서 제외했습니다 '
-                                        f'(베타 산출 불가 또는 자기자본 0 이하). '
-                                        f'피어 평균이 이 회사 없이 계산됩니다.')
+                    if quality is not None and n_obs < FULL_MONTHLY_OBS:
+                        quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
+                                    f'5년 월간 관측치가 {n_obs}/{FULL_MONTHLY_OBS}개입니다. 상장이 늦었거나 '
+                                    f'거래정지 구간이 있는지 확인하세요 — 값은 그대로 씁니다.')
+                    if quality is not None and not np.isnan(beta_raw) and abs(beta_raw) > BETA_SANITY_LIMIT:
+                        quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
+                                    f'5년 월간 Raw 베타가 {beta_raw:.2f} 로 통상 범위'
+                                    f'(±{BETA_SANITY_LIMIT})를 벗어납니다. 버리지 않고 그대로 두니 '
+                                    f'쓸지 여부를 판단하세요.')
+
+                    # 엑셀과 같은 조건으로 평균에 넣는다:
+                    #   =IF(조정베타>0, 조정베타/(1+(1-세율)*D/E), "")  → 빈칸은 AVERAGE 에서 빠짐
+                    # 자기자본(장부) 조건은 두지 않는다 — 엑셀에 없는 조건이라
+                    # 파이썬만 빼면 두 평균이 달라진다.
+                    if not np.isnan(beta_adj) and beta_adj > 0:
+                        unlevered_beta_5y = beta_adj / (1 + (1 - tax_rate) * de_ratio)
+                        avg_unlevered_betas_5y.append(unlevered_beta_5y)
                     elif quality is not None:
                         quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
-                                    f'5년 월간 수익률 관측치가 {len(common_idx)}개뿐이라 '
-                                    f'(10개 초과 필요) 베타를 산출하지 않았습니다.')
+                                    f'5년 월간 조정베타가 0 이하이거나 산출되지 않아 평균에서 '
+                                    f'빠집니다(엑셀도 동일). 피어 평균이 이 회사 없이 계산됩니다.')
+                elif quality is not None:
+                    quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
+                                f'5년 월간 수익률이 {len(common_idx)}개뿐이라 회귀가 불가능합니다.')
             except Exception as e:
                 if quality is not None:
                     quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
@@ -1590,38 +1624,52 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
         if stock_weekly_2y is not None and market_weekly_2y is not None and not stock_weekly_2y.empty and not market_weekly_2y.empty:
             try:
                 common_dates = stock_weekly_2y.index.intersection(market_weekly_2y.index)
-                if len(common_dates) > MIN_WEEKLY_PTS:
-                    stock_ret = stock_weekly_2y.loc[common_dates].pct_change().dropna()
-                    market_ret = market_weekly_2y.loc[common_dates].pct_change().dropna()
-                    common_idx = stock_ret.index.intersection(market_ret.index)
-                    if len(common_idx) > 20:
-                        stock_ret_aligned = stock_ret.loc[common_idx]
-                        market_ret_aligned = market_ret.loc[common_idx]
-                        cov_matrix = np.cov(stock_ret_aligned, market_ret_aligned)
-                        beta_raw = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else np.nan
-                        beta_adj = (2/3) * beta_raw + (1/3) * 1
+                stock_ret = stock_weekly_2y.loc[common_dates].pct_change().dropna()
+                market_ret = market_weekly_2y.loc[common_dates].pct_change().dropna()
+                common_idx = stock_ret.index.intersection(market_ret.index)
+                # 관측치가 적다고 여기서 빼지 않는다 — 엑셀 SLOPE 는 그대로 계산하므로
+                # 파이썬만 빼면 두 평균의 대상이 달라진다. 대신 아래에서 경고한다.
+                if len(common_idx) >= 2:
+                    stock_ret_aligned = stock_ret.loc[common_idx]
+                    market_ret_aligned = market_ret.loc[common_idx]
+                    cov_matrix = np.cov(stock_ret_aligned, market_ret_aligned)
+                    beta_raw = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else np.nan
+                    beta_adj = (2/3) * beta_raw + (1/3) * 1
 
-                        # 신뢰도 — 값 계산은 그대로 두고 판단 근거만 덧붙인다.
-                        # R²: 주가 변동 중 시장으로 설명되는 비중 (낮으면 기울기가
-                        # 관계를 요약한 것이 아니다). n: 회귀에 실제로 들어간 관측치.
-                        comp_data['Beta_2Y_Raw'] = None if np.isnan(beta_raw) else float(beta_raw)
-                        comp_data['Beta_2Y_N'] = int(len(common_idx))
-                        with np.errstate(invalid='ignore'):
-                            corr = np.corrcoef(stock_ret_aligned, market_ret_aligned)[0, 1]
-                        comp_data['Beta_2Y_R2'] = None if np.isnan(corr) else float(corr ** 2)
+                    # 신뢰도 — 값 계산은 그대로 두고 판단 근거만 덧붙인다.
+                    # R²: 주가 변동 중 시장으로 설명되는 비중 (낮으면 기울기가
+                    # 관계를 요약한 것이 아니다). n: 회귀에 실제로 들어간 관측치.
+                    n_obs = int(len(common_idx))
+                    comp_data['Beta_2Y_Raw'] = None if np.isnan(beta_raw) else float(beta_raw)
+                    comp_data['Beta_2Y_N'] = n_obs
+                    with np.errstate(invalid='ignore'):
+                        corr = np.corrcoef(stock_ret_aligned, market_ret_aligned)[0, 1]
+                    comp_data['Beta_2Y_R2'] = None if np.isnan(corr) else float(corr ** 2)
 
-                        if not np.isnan(beta_adj) and equity > 0:
-                            unlevered_beta_2y = beta_adj / (1 + (1 - tax_rate) * de_ratio)
-                            avg_unlevered_betas_2y.append(unlevered_beta_2y)
-                        elif quality is not None:
-                            quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
-                                        f'2년 주간 베타를 평균에서 제외했습니다 '
-                                        f'(베타 산출 불가 또는 자기자본 0 이하). '
-                                        f'피어 평균이 이 회사 없이 계산됩니다.')
+                    if quality is not None and n_obs < FULL_WEEKLY_OBS:
+                        quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
+                                    f'2년 주간 관측치가 {n_obs}/{FULL_WEEKLY_OBS}개입니다. 상장이 늦었거나 '
+                                    f'거래정지 구간이 있는지 확인하세요 — 값은 그대로 씁니다.')
+                    if quality is not None and not np.isnan(beta_raw) and abs(beta_raw) > BETA_SANITY_LIMIT:
+                        quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
+                                    f'2년 주간 Raw 베타가 {beta_raw:.2f} 로 통상 범위'
+                                    f'(±{BETA_SANITY_LIMIT})를 벗어납니다. 버리지 않고 그대로 두니 '
+                                    f'쓸지 여부를 판단하세요.')
+
+                    # 엑셀과 같은 조건으로 평균에 넣는다:
+                    #   =IF(조정베타>0, 조정베타/(1+(1-세율)*D/E), "")  → 빈칸은 AVERAGE 에서 빠짐
+                    # 자기자본(장부) 조건은 두지 않는다 — 엑셀에 없는 조건이라
+                    # 파이썬만 빼면 두 평균이 달라진다.
+                    if not np.isnan(beta_adj) and beta_adj > 0:
+                        unlevered_beta_2y = beta_adj / (1 + (1 - tax_rate) * de_ratio)
+                        avg_unlevered_betas_2y.append(unlevered_beta_2y)
                     elif quality is not None:
                         quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
-                                    f'2년 주간 수익률 관측치가 {len(common_idx)}개뿐이라 '
-                                    f'(20개 초과 필요) 베타를 산출하지 않았습니다.')
+                                    f'2년 주간 조정베타가 0 이하이거나 산출되지 않아 평균에서 '
+                                    f'빠집니다(엑셀도 동일). 피어 평균이 이 회사 없이 계산됩니다.')
+                elif quality is not None:
+                    quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
+                                f'2년 주간 수익률이 {len(common_idx)}개뿐이라 회귀가 불가능합니다.')
             except Exception as e:
                 if quality is not None:
                     quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
@@ -1686,6 +1734,9 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
     output = io.BytesIO()
     wb = Workbook()
     wb.remove(wb.active)
+
+    # 세율 수식을 만들 사업연도 — 파이썬 WACC 계산에 쓴 것과 같은 기준이어야 한다
+    base_fiscal_year, _ = parse_period(base_period_str)
 
     # (기존 엑셀 생성 로직 그대로 활용 - 함수화 하지 않고 바로 실행)
     # Sheet 1: BS_Full
@@ -2303,9 +2354,9 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
         ws.cell(r, C['Pretax']).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "Pretax_Income")'; sc(ws.cell(r, C['Pretax']), fo=fLINK, fi=bg, al=aR, nf=NB, bd=BD)
 
         # Tax Rate (한국 법인세 한계세율, 사업연도별 세율표, 지방소득세 포함)
-        # FY2023~2025: 2억 이하 9.9% / 2~200억 20.9% / 200~3000억 23.1% / 3000억 초과 26.4%
-        # FY2026~    : 2억 이하 11.0% / 2~200억 22.0% / 200~3000억 24.2% / 3000억 초과 27.5%
-        ws.cell(r, C['TaxRate']).value = f'=IF({L["Pretax"]}{r}<=2, 0.099, IF({L["Pretax"]}{r}<=200, 0.209, IF({L["Pretax"]}{r}<=3000, 0.231, 0.264)))'
+        # 세율표는 파이썬과 같은 출처(get_korean_tax_brackets)에서 만든다 —
+        # 수식에 박아두면 세법이 바뀔 때 엑셀만 옛 세율로 남는다.
+        ws.cell(r, C['TaxRate']).value = korean_tax_rate_formula(f'{L["Pretax"]}{r}', base_fiscal_year)
         sc(ws.cell(r, C['TaxRate']), fo=fFRM, fi=bg, al=aR, nf=NF_PCT, bd=BD)
 
         # D/E Ratio = IBD / (Mkt Cap + 우선주 + NCI)

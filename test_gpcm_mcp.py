@@ -547,6 +547,64 @@ check('매칭 실패는 경고로 남는다', bool(warn), [r['Item'] for r in q4
 check('경고에 실제 계정과목명이 실린다', '알수없는수익항목' in warn[0]['Message'], warn[0]['Message'][:120])
 check('없는 시트를 가리키지 않는다', 'PL_Data 시트에서' not in warn[0]['Message'], warn[0]['Message'][:120])
 
+# --- 12. 베타 평균 모집단이 엑셀과 같은가 --------------------------------------
+# 엑셀 UB5 = IF(조정베타>0, 조정베타/(1+(1-세율)*D/E), "") → 빈칸은 AVERAGE 에서 제외.
+# 파이썬이 다른 조건으로 걸러내면 조서(엑셀)와 채팅 보고값이 갈린다.
+import numpy as np
+
+def series(vals, freq='ME'):
+    return pd.Series(vals, index=pd.date_range('2021-01-31', periods=len(vals), freq=freq))
+
+def wacc_with(stock_px, mkt_px, **over):
+    comp = {'Ticker': '005930', 'Company': '테스트', 'Market_Cap': 1000, 'IBD': 200,
+            'NCI': 0, 'Preferred': 0, 'Equity': 500, 'Pretax_Income': 100,
+            'Market_Index': 'KS11',
+            'Stock_Monthly_Prices_5Y': stock_px, 'Market_Monthly_Prices_5Y': mkt_px,
+            'Stock_Weekly_Prices_2Y': None, 'Market_Weekly_Prices_2Y': None}
+    comp.update(over)
+    q = M.QualityLog()
+    w, _ = M.calculate_wacc_and_beta(['005930'], [comp], 0.264, 0.033, 0.08, 0.0402,
+                                     0.035, '5Y', fiscal_year=2025, quality=q)
+    return comp, w, q
+
+mkt = series([100 + i for i in range(40)])
+up2 = series([100 * (1 + 2 * (i / 100.0)) for i in range(40)])
+
+# 관측치가 적어도 평균에 들어간다 (엑셀 SLOPE 는 계산하므로)
+short_m = series([100, 103, 106, 110, 115])
+short_s = series([100, 106, 112, 120, 130])
+comp, w, q = wacc_with(short_s, short_m)
+check('관측치가 적어도 평균에서 빼지 않는다 (엑셀과 동일)',
+      w['Avg_Unlevered_Beta'] != 0.8, w['Avg_Unlevered_Beta'])
+check('대신 관측치 부족을 경고한다',
+      any('관측치가' in r['Message'] for r in q.rows), [r['Message'][:40] for r in q.rows])
+
+# 자기자본(장부)이 0 이하여도 엑셀은 계산한다 → 파이썬도 포함
+comp2, w2, q2 = wacc_with(up2, mkt, Equity=-100)
+check('자본잠식이어도 평균에 넣는다 (엑셀에 없는 조건이었음)',
+      w2['Avg_Unlevered_Beta'] != 0.8, w2['Avg_Unlevered_Beta'])
+
+# 조정베타가 0 이하면 엑셀이 빈칸으로 두므로 파이썬도 뺀다
+# 시장과 반대로 움직이게 만든다 (수익률을 -2배로 되짚어 가격을 만든다)
+mret = mkt.pct_change().dropna()
+inv = [100.0]
+for x in mret:
+    inv.append(inv[-1] * (1 - 2 * x))
+down = series(inv)
+comp3, w3, q3 = wacc_with(down, mkt)
+check('조정베타 0 이하는 엑셀처럼 평균에서 뺀다',
+      comp3['Beta_5Y_Raw'] < 0 and w3['Avg_Unlevered_Beta'] == 0.8, comp3.get('Beta_5Y_Raw'))
+check('뺀 사유를 남긴다', any('조정베타가 0 이하' in r['Message'] for r in q3.rows),
+      [r['Message'][:40] for r in q3.rows])
+
+# 극단 베타는 버리지 않고 경고만
+wild = series([100 * (1 + 8 * (i / 100.0)) for i in range(40)])
+comp4, w4, q4 = wacc_with(wild, mkt)
+check('극단 베타도 버리지 않는다', comp4['Beta_5Y_Raw'] > M.BETA_SANITY_LIMIT
+      and w4['Avg_Unlevered_Beta'] != 0.8, comp4.get('Beta_5Y_Raw'))
+check('극단 베타는 경고로 남는다', any('통상 범위' in r['Message'] for r in q4.rows),
+      [r['Message'][:40] for r in q4.rows])
+
 print()
 print(f"잘못된 항목 {len(fails)}건")
 sys.exit(1 if fails else 0)

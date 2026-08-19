@@ -160,6 +160,7 @@ def get_market_index(ticker):
         return 'US', '^GSPC'  # S&P 500
 
 EMPTY_BETA = {'raw': None, 'adj': None, 'r2': None, 'stderr': None, 'n': 0}
+BETA_SANITY_LIMIT = 3.0  # 통상 범위. 넘으면 경고만 하고 값은 그대로 둔다
 
 
 def align_prices(stock_prices, market_prices):
@@ -212,10 +213,9 @@ def calculate_beta(stock_returns, market_returns, min_periods=20):
         raw_beta = slope
         adjusted_beta = (2/3) * raw_beta + (1/3) * 1.0
 
-        # 값 검증: NaN, inf, 극단값(±10 초과) 필터링
+        # NaN·inf 만 버린다. 극단값은 버리지 않는다 — 조용히 사라지면 그 회사가
+        # 피어 평균에서 빠진 사실조차 드러나지 않는다. 호출부에서 경고로 알린다.
         if not np.isfinite(raw_beta) or not np.isfinite(adjusted_beta):
-            return dict(EMPTY_BETA)
-        if abs(raw_beta) > 10 or abs(adjusted_beta) > 10:
             return dict(EMPTY_BETA)
 
         return {
@@ -1050,6 +1050,10 @@ def _compute_betas(base_gpcm, hist_adj, market_idx, base_dt, add_flag):
         base_gpcm['Stock_Monthly_Prices_5Y'] = s_px
         base_gpcm['Market_Monthly_Prices_5Y'] = m_px
         base_gpcm['Beta_5Y_Monthly_Raw'] = res['raw']
+        if res['raw'] is not None and abs(res['raw']) > BETA_SANITY_LIMIT:
+            add_flag(SEV_WARN, 'Y', '베타',
+                     f"5Y 월간 Raw 베타 {res['raw']:.2f} — 통상 범위(±{BETA_SANITY_LIMIT}) 밖. "
+                     f"버리지 않았으니 쓸지 판단 필요")
         base_gpcm['Beta_5Y_Monthly_Adj'] = res['adj']
         base_gpcm['Beta_5Y_R2'] = res['r2']
         base_gpcm['Beta_5Y_StdErr'] = res['stderr']
@@ -1073,6 +1077,10 @@ def _compute_betas(base_gpcm, hist_adj, market_idx, base_dt, add_flag):
         base_gpcm['Stock_Weekly_Prices_2Y'] = s_px
         base_gpcm['Market_Weekly_Prices_2Y'] = m_px
         base_gpcm['Beta_2Y_Weekly_Raw'] = res['raw']
+        if res['raw'] is not None and abs(res['raw']) > BETA_SANITY_LIMIT:
+            add_flag(SEV_WARN, 'Y', '베타',
+                     f"2Y 주간 Raw 베타 {res['raw']:.2f} — 통상 범위(±{BETA_SANITY_LIMIT}) 밖. "
+                     f"버리지 않았으니 쓸지 판단 필요")
         base_gpcm['Beta_2Y_Weekly_Adj'] = res['adj']
         base_gpcm['Beta_2Y_R2'] = res['r2']
         base_gpcm['Beta_2Y_StdErr'] = res['stderr']
