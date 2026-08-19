@@ -135,6 +135,19 @@ _PERIOD_RE = re.compile(r"^\d{4}\.[1-4]Q$")
 EXPECTED_TOOLS = ("get_wacc_inputs", "run_gpcm", "gpcm_status", "gpcm_review",
                   "list_krx_companies", "check_trading_gaps", "gpcm_doctor")
 
+# 설치 경로가 둘이라 버전이 어긋날 수 있다: 확장(.mcpb)은 설치 시점의 사본을 쓰고,
+# install_mcp.ps1 는 내려받은 폴더의 파일을 그대로 돌린다(git pull 을 안 하면 옛 판).
+# 어느 쪽이 돌고 있는지 채팅에서 바로 보이도록 버전과 경로를 읽어 둔다.
+SERVER_DIR = Path(__file__).resolve().parent
+
+
+def _server_version() -> str:
+    try:
+        import json
+        return json.loads((SERVER_DIR / "manifest.json").read_text(encoding="utf-8"))["version"]
+    except Exception:
+        return "unknown"
+
 
 def _api_key() -> str:
     """DART 인증키. 확장(.mcpb)으로 설치할 때 입력칸이 비면 환경변수에
@@ -214,8 +227,27 @@ def _run_job(job: dict[str, Any], p: dict[str, Any]) -> None:
          base_date_str, all_multiples, quality) = M.fetch_financial_data(
             p["api_key"], p["tickers"], p["periods"], dart, rec, rec)
 
+        # 타겟 법인세율 — 비워 두면 피평가회사 세전이익으로 정한다.
+        # 세율표는 사업연도별(FY2026 부터 인상)이라 기준일 연도를 함께 넣는다.
+        tax_rate = p["tax_rate"]
+        if tax_rate is None:
+            row = next((s for s in summary if s.get("Ticker") == p["target"]), None)
+            pretax = (row or {}).get("Pretax_Income")
+            tax_rate = M.get_korean_marginal_tax_rate(pretax, base_year)
+            job["tax_basis"] = {
+                "ticker": p["target"],
+                "company": (row or {}).get("Company", ""),
+                "pretaxIncome100M": None if pretax is None else round(float(pretax), 1),
+                "fiscalYear": base_year,
+                "rate_pct": round(tax_rate * 100, 2),
+            }
+            quality.add(M.SEV_INFO, p["target"], (row or {}).get("Company", ""), 'Tax Rate',
+                        f'타겟 법인세율을 세전이익 {pretax if pretax is not None else "미상"}억원과 '
+                        f'FY{base_year} 한계세율표로 {tax_rate*100:.2f}% 로 정했습니다 '
+                        f'(한국 법인 전제, 지방소득세 포함).')
+
         wacc_data, avg_debt_ratio = M.calculate_wacc_and_beta(
-            p["tickers"], summary, p["tax_rate"], p["rf"], p["mrp"],
+            p["tickers"], summary, tax_rate, p["rf"], p["mrp"],
             p["size_premium"], p["kd_pretax"], p["beta_type"], fiscal_year=base_year,
             quality=quality)  # 베타가 빠지거나 기본값이 쓰이면 Data_Quality 에 남는다
 
@@ -292,6 +324,26 @@ def _ecos_key() -> str:
     if value.startswith("${") and value.endswith("}"):
         return ""
     return value
+
+
+def _as_of_date(as_of: str) -> datetime:
+    """기준일을 읽는다. "2026-06-30" 도 되고 "2026.2Q" 도 된다.
+
+    금리는 기준일 시점을 써야 한다 — 평가기준일이 작년 말인데 오늘 금리를 넣으면
+    조서의 다른 숫자와 시점이 어긋난다. 그래서 GPCM 기간 표기를 그대로 받아
+    분기말로 바꿔준다.
+    """
+    text = (as_of or "").strip()
+    if not text:
+        return datetime.now()
+    if _PERIOD_RE.match(text):
+        year, qtr = _parse_period(text)
+        month, day = {"1Q": (3, 31), "2Q": (6, 30), "3Q": (9, 30), "4Q": (12, 31)}[qtr]
+        return datetime(year, month, day)
+    try:
+        return datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError(f'as_of 는 "2026-06-30" 또는 "2026.2Q" 형식입니다: {as_of!r}')
 
 
 def _get_fdr():
@@ -400,7 +452,10 @@ def get_wacc_inputs(as_of: str = "", bond_grade: str = "AA-",
     run_gpcm 을 부르기 전에 이걸 먼저 불러 rf·kd_pretax 후보와 출처를 확인한다.
 
     Args:
-        as_of: 기준일 YYYY-MM-DD. 비우면 오늘. 그 날짜 이전의 최근 고시치를 쓴다.
+        as_of: **평가기준일**. "2026-06-30" 또는 GPCM 기간 표기 "2026.2Q" 둘 다 된다
+            (분기 표기는 분기말로 읽는다). 비우면 오늘. 그 날짜 이전의 최근
+            고시치를 쓴다. run_gpcm 의 기준일과 반드시 같은 날로 맞춘다 —
+            다르면 금리만 다른 시점이 되어 조서가 어긋난다.
         bond_grade: 회사채 신용등급 (AA- 또는 BBB-). 평가대상의 신용도에 맞춘다.
         rf_maturity: 국고채 만기. "5년"·"10Y"·"10" 형식 모두 된다. 기본 5년.
             평가 대상 현금흐름의 기간에 맞춘다 — 영구현금흐름 전제면 10년·20년을
@@ -421,10 +476,7 @@ def get_wacc_inputs(as_of: str = "", bond_grade: str = "AA-",
         raise ValueError(f"bond_grade 는 {' 또는 '.join(BOND_GRADES)} 입니다: {bond_grade!r}")
     rf_term = _maturity(rf_maturity, "rf")
     kd_term = _maturity(kd_maturity, "kd")
-    try:
-        asof = datetime.strptime(as_of.strip(), "%Y-%m-%d") if as_of.strip() else datetime.now()
-    except ValueError:
-        raise ValueError(f"as_of 는 YYYY-MM-DD 형식입니다: {as_of!r}")
+    asof = _as_of_date(as_of)
 
     rf, rf_tried = _fetch_rate("rf", asof, None, rf_term)
     kd, kd_tried = _fetch_rate("kd", asof, grade, kd_term)
@@ -471,9 +523,10 @@ def run_gpcm(
     mrp: float = 8.0,
     size_premium: float = 4.02,
     kd_pretax: float = 3.5,
-    tax_rate: float = 26.4,
+    tax_rate: float | None = None,
     beta_type: str = "5Y",
     rate_source: str = "",
+    target_ticker: str = "",
 ) -> dict[str, Any]:
     """GPCM 밸류에이션을 백그라운드로 실행해 엑셀 파일을 만든다.
 
@@ -488,7 +541,9 @@ def run_gpcm(
       3. 사이즈 프리미엄 size_premium — 시총 구간을 안내하며 묻는다
          (2천억 미만 4.02% / 2천억~2조 1.37% / 2조 초과 -0.36% / 미적용 0)
       4. 세전 타인자본비용 kd_pretax (기본 3.5%)
-      5. 타겟 법인세율 tax_rate (기본 26.4%)
+      5. 타겟 법인세율 tax_rate — **묻지 않는다.** 비워 두면 피평가회사의
+         세전이익과 사업연도 세율표로 자동 산출한다(대상이 한국 법인이라는 전제).
+         사용자가 값을 지정하면 그것을 쓴다.
       6. 베타 종류 beta_type — 5Y(5년 월간) 또는 2Y(2년 주간)
     사용자가 "전부 기본값으로"라고 하면 개별 질문을 생략해도 된다.
 
@@ -506,7 +561,10 @@ def run_gpcm(
         size_premium: 사이즈 프리미엄 %. 기본 4.02 (3분위 Micro, 시총 2천억 미만).
             2,000~20,000억은 1.37, 2조 초과는 -0.36, 미적용은 0.
         kd_pretax: 세전 타인자본비용 %. 기본 3.5
-        tax_rate: 타겟 법인세율 %. 기본 26.4
+        tax_rate: 타겟 법인세율 %. **비우면 자동** — 피평가회사의 세전이익(LTM)을
+            사업연도 한계세율표(지방소득세 포함)에 넣어 정한다. 한국 법인 전제.
+            직접 넣으면 그 값을 쓰고, 자동 산출은 하지 않는다.
+        target_ticker: 세율을 정할 피평가회사 종목코드. 비우면 tickers 의 첫 번째.
         beta_type: WACC 에 쓸 베타. "5Y"(5년 월간) 또는 "2Y"(2년 주간).
         rate_source: rf·kd 의 근거 문장. get_wacc_inputs 의 citation 을 그대로
             넣으면 엑셀 Notes 에 출처·금리기준일이 남는다. 손으로 정한 값이면
@@ -525,6 +583,11 @@ def run_gpcm(
             f"{len(codes)}개는 너무 많습니다(상한 {MAX_TICKERS}). 후보를 좁힌 뒤 돌리세요.")
     if beta_type not in BETA_TYPES:
         raise RuntimeError(f'beta_type은 "5Y" 또는 "2Y"입니다: {beta_type}')
+    target = (target_ticker or "").strip() or codes[0]
+    if target not in codes:
+        raise RuntimeError(
+            f"target_ticker({target})가 tickers 안에 없습니다. "
+            "피평가회사도 목록에 넣어야 세율을 그 회사 기준으로 정합니다.")
 
     periods = _build_periods(start_period, end_period)
 
@@ -560,7 +623,9 @@ def run_gpcm(
             "params": {
                 "api_key": api_key, "tickers": codes, "periods": periods,
                 "rf": rf / 100, "mrp": mrp / 100, "size_premium": size_premium / 100,
-                "kd_pretax": kd_pretax / 100, "tax_rate": tax_rate / 100,
+                "kd_pretax": kd_pretax / 100,
+                "tax_rate": None if tax_rate is None else tax_rate / 100,
+                "target": target,
                 "beta_type": beta_type, "rate_source": rate_source.strip(),
             },
         }
@@ -618,6 +683,9 @@ def gpcm_status(job_id: str | None = None) -> dict[str, Any]:
         result["file"] = job["file"]
         result["data_quality"] = job["dq"]
         result["target_wacc_pct"] = job["target_wacc"]
+        if job.get("tax_basis"):
+            # 세율을 자동으로 정했으면 무엇을 근거로 했는지 함께 보고한다
+            result["tax_rate_basis"] = job["tax_basis"]
         result["note"] = (
             "숫자를 쓰기 전에 엑셀의 Data_Quality 시트를 먼저 확인하세요. "
             "ERROR가 있으면 해당 값은 수집 실패로 0이 들어가 있습니다. "
@@ -978,6 +1046,11 @@ def _diagnose() -> list[dict[str, Any]]:
     """설치·환경을 한 줄씩 점검한다. 인증키 값은 절대 담지 않는다 (길이만)."""
     checks: list[dict[str, Any]] = []
 
+    version = _server_version()
+    checks.append(_check(
+        "버전", version != "unknown", f"gpcm {version}  ({SERVER_DIR})",
+        "manifest.json 을 못 읽었습니다. 설치 폴더가 온전한지 확인하세요."))
+
     # 파이썬 — 3.14 에서 pydantic 이 깨져 도구가 하나만 등록된 적이 있다
     v = sys.version_info
     checks.append(_check(
@@ -1060,6 +1133,8 @@ def gpcm_doctor() -> dict[str, Any]:
     checks = _diagnose()
     bad = [c for c in checks if c["결과"] == "실패"]
     return {
+        "버전": _server_version(),
+        "실행 위치": str(SERVER_DIR),
         "판정": "정상" if not bad else f"{len(bad)}개 항목 실패",
         "점검": checks,
         "다음": ("run_gpcm 을 써도 됩니다." if not bad else

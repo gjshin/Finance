@@ -145,7 +145,11 @@ powershell -ExecutionPolicy Bypass -File .\install_mcp.ps1
 run_gpcm으로 005930, 000660, 042700 돌려줘. 기간은 2025.4Q
 ```
 
-- 도구 3개: `run_gpcm`(실행) · `gpcm_status`(진행·결과) · `list_krx_companies`(오늘
+- 도구 7개:
+  - `run_gpcm`(실행) · `gpcm_status`(진행·결과) · `gpcm_review`(배수 이상치·베타 신뢰도 검토)
+  - `get_wacc_inputs`(기준일 국고채·회사채 금리를 출처와 함께)
+  - `gpcm_doctor`(버전·인증키·연결 한 번에 점검) · `check_trading_gaps`(거래정지 흔적)
+  - `list_krx_companies`(오늘
   상장사 명단 — 업종·주요제품 포함. 이 PC에서 KRX에 직접 물어 상장폐지가 반영된다).
 - 실행은 백그라운드로 돌고, 진행·결과는 Claude가 `gpcm_status`로 확인해 알려준다.
 - 결과 엑셀은 **문서\GPCM** 폴더에 저장된다. 시트 구성은 앱과 동일하다

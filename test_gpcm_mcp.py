@@ -605,6 +605,47 @@ check('극단 베타도 버리지 않는다', comp4['Beta_5Y_Raw'] > M.BETA_SANI
 check('극단 베타는 경고로 남는다', any('통상 범위' in r['Message'] for r in q4.rows),
       [r['Message'][:40] for r in q4.rows])
 
+# --- 13. 법인세율 자동 산출 · 기준일 표기 · 버전 --------------------------------
+stub_pipeline()
+M.fetch_pl_df = lambda d, c, y, r: (PL.copy(), 'CFS', 'OK')
+
+# 세율을 안 주면 피평가회사 세전이익으로 정한다
+r5 = W.run_gpcm(['005930'], '2024.1Q')
+W._jobs[r5['job_id']]['thread'].join(timeout=60)
+s5 = W.gpcm_status(r5['job_id'])
+basis = s5.get('tax_rate_basis')
+check('세율을 비우면 자동 산출한다', basis is not None, s5.get('state'))
+check('근거(종목·세전이익·사업연도·세율)를 함께 보고한다',
+      basis and {'ticker', 'pretaxIncome100M', 'fiscalYear', 'rate_pct'} <= set(basis), basis)
+check('사업연도는 기준일 연도', basis and basis['fiscalYear'] == 2024, basis)
+check('세율이 그 해 세율표와 일치',
+      basis and abs(basis['rate_pct'] / 100 -
+                    M.get_korean_marginal_tax_rate(basis['pretaxIncome100M'], 2024)) < 1e-9, basis)
+dq_msgs = ' '.join(r['Message'] for r in W._jobs[r5['job_id']].get('quality_rows', []))
+
+# 직접 지정하면 그 값을 쓴다 (자동 산출하지 않는다)
+r6 = W.run_gpcm(['005930'], '2024.1Q', tax_rate=22.0)
+W._jobs[r6['job_id']]['thread'].join(timeout=60)
+s6 = W.gpcm_status(r6['job_id'])
+check('직접 지정하면 자동 산출하지 않는다', 'tax_rate_basis' not in s6, s6.get('tax_rate_basis'))
+
+# 피평가회사가 목록에 없으면 거절
+expect_error('target_ticker 가 목록에 없으면 거절',
+             lambda: W.run_gpcm(['005930'], '2024.1Q', target_ticker='000660'), 'tickers 안에 없습니다')
+
+# 기준일 표기 — 분기 표기도 받는다
+check('as_of 가 분기 표기를 분기말로 읽는다',
+      W._as_of_date('2025.4Q').strftime('%Y-%m-%d') == '2025-12-31')
+check('as_of 가 날짜 표기도 받는다',
+      W._as_of_date('2026-06-30').strftime('%Y-%m-%d') == '2026-06-30')
+expect_error('as_of 형식 오류는 거절', lambda: W._as_of_date('2026/06/30'), '형식입니다')
+
+# 버전 — 두 설치 경로가 같은 판인지 확인할 근거
+d3 = W.gpcm_doctor()
+check('진단이 버전과 실행 위치를 알려준다',
+      d3.get('버전') not in (None, 'unknown') and d3.get('실행 위치'), (d3.get('버전'), d3.get('실행 위치')))
+check('버전이 manifest 와 일치', d3['버전'] == manifest['version'], (d3['버전'], manifest['version']))
+
 print()
 print(f"잘못된 항목 {len(fails)}건")
 sys.exit(1 if fails else 0)
