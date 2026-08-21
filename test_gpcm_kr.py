@@ -185,9 +185,13 @@ _ph = _gl2.split("[Sheet 11] Price_History")[1].split("[Sheet")[0]
 _ph_code = '\n'.join(l for l in _ph.splitlines() if not l.strip().startswith('#'))
 chk('해외 일별 주가는 앞값으로 채우지 않는다', '.ffill()' not in _ph_code,
     [l.strip() for l in _ph_code.splitlines() if 'ffill' in l])
-chk('결측은 NaN 이 아니라 빈칸으로 쓴다', 'None if pd.isna(v)' in _ph)
-chk('시트에 수정주가·거래일 기준을 밝힌다',
-    '수정주가' in _ph and '거래일만' in _ph)
+# Abs 는 dropna 로 실거래일만 남기고, Rel 은 남더라도 NaN 대신 빈칸으로 쓴다
+chk('결측은 NaN 이 아니라 빈칸으로 쓴다',
+    'dropna()' in _ph and 'pd.isna(rv)' in _ph)
+chk('시트에 수정주가·실거래일 기준을 밝힌다',
+    '수정주가' in _ph and '실제 거래된 날만' in _ph)
+chk('해외도 종목별 독립 표로 쓴다 (한 표에 날짜를 맞추지 않는다)',
+    'for b, col in enumerate(df_abs.columns)' in _ph and 'df_abs[col].dropna()' in _ph)
 chk('베타·주가 모두 auto_adjust 계열을 쓴다', "bundle['price_series'] = hist_adj" in _gl2)
 
 print()

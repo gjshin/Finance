@@ -726,19 +726,26 @@ wbB = load_workbook(sB['file'])
 check('Price_Daily 시트가 생긴다', 'Price_Daily' in wbB.sheetnames, wbB.sheetnames)
 if 'Price_Daily' in wbB.sheetnames:
     ws = wbB['Price_Daily']
-    hdr = [ws.cell(4, c).value for c in range(1, 4)]
-    check('첫 열은 Date, 그 뒤가 종목', hdr[0] == 'Date' and '005930' in str(hdr[1]), hdr)
-    rows = sum(1 for r in range(5, ws.max_row + 1) if ws.cell(r, 1).value)
+    # 회사마다 독립 테이블: [회사명] 아래 Date | 종가, 그 다음 블록은 3열 뒤
+    check('블록 머리에 회사명·티커', '005930' in str(ws.cell(4, 1).value), ws.cell(4, 1).value)
+    check('블록 첫 열이 Date, 둘째가 종가',
+          (ws.cell(5, 1).value, ws.cell(5, 2).value) == ('Date', '종가'),
+          (ws.cell(5, 1).value, ws.cell(5, 2).value))
+    check('둘째 블록은 지수', '지수' in str(ws.cell(4, 4).value), ws.cell(4, 4).value)
+    rows = sum(1 for r in range(6, ws.max_row + 1) if ws.cell(r, 1).value)
     check('1Y 는 약 250 거래일', 200 < rows < 300, rows)
-    last = max(ws.cell(r, 1).value for r in range(5, ws.max_row + 1) if ws.cell(r, 1).value)
+    last = max(ws.cell(r, 1).value for r in range(6, ws.max_row + 1) if ws.cell(r, 1).value)
     check('기준일 이후 데이터는 안 들어간다', last <= '2024-03-31', last)
-    check('종가가 숫자로 들어간다', isinstance(ws.cell(5, 2).value, float), ws.cell(5, 2).value)
-    check('날짜/종목 고정틀', ws.freeze_panes == 'B5', ws.freeze_panes)
+    check('종가가 숫자로 들어간다', isinstance(ws.cell(6, 2).value, float), ws.cell(6, 2).value)
+    # 이게 이번 변경의 핵심 — 회사별 표라 값 칸에 빈칸이 없어야 한다
+    holes = [r for r in range(6, 6 + rows) if ws.cell(r, 1).value and ws.cell(r, 2).value is None]
+    check('값 칸에 빈칸이 없다', not holes, holes[:5])
+    check('헤더 고정틀', ws.freeze_panes == 'A6', ws.freeze_panes)
 
 rC = W.run_gpcm(['005930'], '2024.1Q', daily_prices='5Y')
 W._jobs[rC['job_id']]['thread'].join(timeout=60)
 wsC = load_workbook(W.gpcm_status(rC['job_id'])['file'])['Price_Daily']
-rowsC = sum(1 for r in range(5, wsC.max_row + 1) if wsC.cell(r, 1).value)
+rowsC = sum(1 for r in range(6, wsC.max_row + 1) if wsC.cell(r, 1).value)
 check('5Y 가 1Y 보다 행이 많다', rowsC > rows, (rowsC, rows))
 
 print()

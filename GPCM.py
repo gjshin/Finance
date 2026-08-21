@@ -2441,37 +2441,40 @@ def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_a
             _cut = df_abs.index.max() - timedelta(days=_span_days)
             df_abs = df_abs.loc[df_abs.index >= _cut]
             df_rel = df_rel.loc[df_rel.index >= _cut]
-        common_index = df_abs.index
         sc(ws_ph.cell(1,1,f'Stock Price History ({daily_price_span}, daily)'), fo=fT)
         ws_ph.merge_cells(start_row=1,start_column=1,end_row=1,end_column=10)
-        sc(ws_ph.cell(2,1,'수정주가(배당·분할 반영, auto_adjust) · 거래일만 표시 — '
-                          '빈칸은 그 종목이 거래되지 않은 날(휴장·정지·상장 전)이다. '
-                          'Abs=수정주가, Rel=공통 첫 거래일=100 재기준화'), fo=fS)
+        sc(ws_ph.cell(2,1,'수정주가(배당·분할 반영, auto_adjust) · 표마다 그 종목이 실제 거래된 날만 '
+                          '담겨 있다 — 종목별로 행 수가 다르다. Abs=수정주가, '
+                          'Rel=공통 첫 거래일=100 재기준화'), fo=fS)
         ws_ph.merge_cells(start_row=2,start_column=1,end_row=2,end_column=10)
-        r=3
-        ws_ph.cell(r,1,'Date'); sc(ws_ph.cell(r,1), fo=fH, fi=pH, al=aC, bd=BD); ws_ph.column_dimensions['A'].width=12
-        c_idx=2
-        for col in df_abs.columns:
-            sc(ws_ph.cell(r,c_idx,f"{ticker_to_name.get(col,col)} (Abs)"), fo=fH, fi=PatternFill('solid',fgColor='607D8B'), al=aC, bd=BD)
-            ws_ph.column_dimensions[get_column_letter(c_idx)].width=16; c_idx+=1
-        sc(ws_ph.cell(r,c_idx,""), fi=pW); ws_ph.column_dimensions[get_column_letter(c_idx)].width=2; c_idx+=1
-        ws_ph.cell(r,c_idx,'Date'); sc(ws_ph.cell(r,c_idx), fo=fH, fi=pH, al=aC, bd=BD); rel_start=c_idx; c_idx+=1
-        for col in df_rel.columns:
-            sc(ws_ph.cell(r,c_idx,f"{ticker_to_name.get(col,col)} (Rel)"), fo=fH, fi=pH, al=aC, bd=BD)
-            ws_ph.column_dimensions[get_column_letter(c_idx)].width=16; c_idx+=1
-        r=4
-        for date in common_index:
-            dv=date.date(); ws_ph.cell(r,1,dv).number_format='yyyy-mm-dd'; sc(ws_ph.cell(r,1), fo=fA, al=aC, bd=BD); cc=2
-            for v in df_abs.loc[date]:
-                ws_ph.cell(r,cc, None if pd.isna(v) else float(v)).number_format='#,##0.00'
-                sc(ws_ph.cell(r,cc), fo=fA, al=aR, bd=BD); cc+=1
-            cc+=1; ws_ph.cell(r,cc,dv).number_format='yyyy-mm-dd'; sc(ws_ph.cell(r,cc), fo=fA, al=aC, bd=BD); cc+=1
-            for v in df_rel.loc[date]:
-                ws_ph.cell(r,cc, None if pd.isna(v) else float(v)).number_format='#,##0'
-                sc(ws_ph.cell(r,cc), fo=fA, al=aR, bd=BD); cc+=1
-            r+=1
-        
-        # Monthly Chart Data
+
+        # 종목마다 독립 표로 쓴다. 한 표에 날짜를 맞추면 시장이 다른 종목 때문에
+        # 빈칸이 생기고, 그 빈칸이 휴장인지 정지인지 읽는 사람이 매번 판단해야 한다.
+        for b, col in enumerate(df_abs.columns):
+            s_abs = df_abs[col].dropna()
+            if s_abs.empty:
+                continue
+            s_rel = df_rel[col].reindex(s_abs.index) if col in df_rel.columns else None
+            c0 = b * 4 + 1                      # Date·Abs·Rel 3열 + 간격 1열
+            ws_ph.merge_cells(start_row=4, start_column=c0, end_row=4, end_column=c0+2)
+            sc(ws_ph.cell(4, c0, f"{ticker_to_name.get(col, col)} ({col})"),
+               fo=fH, fi=PatternFill('solid', fgColor='607D8B'), al=aC, bd=BD)
+            for j, title in enumerate(('Date', 'Abs', 'Rel')):
+                sc(ws_ph.cell(5, c0+j, title), fo=fH, fi=pH, al=aC, bd=BD)
+            for i, (dt, v) in enumerate(s_abs.items(), start=6):
+                ws_ph.cell(i, c0, dt.date()).number_format='yyyy-mm-dd'
+                sc(ws_ph.cell(i, c0), fo=fA, al=aC, bd=BD)
+                ws_ph.cell(i, c0+1, float(v)).number_format='#,##0.00'
+                sc(ws_ph.cell(i, c0+1), fo=fA, al=aR, bd=BD)
+                rv = None if s_rel is None else s_rel.loc[dt]
+                ws_ph.cell(i, c0+2, None if rv is None or pd.isna(rv) else float(rv)).number_format='#,##0'
+                sc(ws_ph.cell(i, c0+2), fo=fA, al=aR, bd=BD)
+            ws_ph.column_dimensions[get_column_letter(c0)].width = 12
+            ws_ph.column_dimensions[get_column_letter(c0+1)].width = 14
+            ws_ph.column_dimensions[get_column_letter(c0+2)].width = 10
+            ws_ph.column_dimensions[get_column_letter(c0+3)].width = 2
+        ws_ph.freeze_panes = 'A6'
+        r = 6 + max((len(df_abs[c].dropna()) for c in df_abs.columns), default=0)
         chart_start=r+2; df_m=df_rel.resample('ME').last().dropna(how='all')
         cr=chart_start; sc(ws_ph.cell(cr,1,'[ Chart Data - Monthly Sampled ]'), fo=fNOTE); cr+=1
         hdr_row=cr; sc(ws_ph.cell(cr,1,'Year-Month'), fo=Font(name='Arial',size=8,bold=True,color=C_MG), al=aC)

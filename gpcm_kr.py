@@ -2784,42 +2784,50 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
             if market_series is None and comp.get('Market_Daily_Prices') is not None:
                 market_series = (comp.get('Market_Index', ''), comp['Market_Daily_Prices'])
 
+        blocks = []
         if series_by_col:
-            frame = pd.DataFrame({name: s for name, s in series_by_col})
-            if market_series is not None:
-                frame[market_series[0]] = market_series[1]
-            frame = frame.sort_index()
-            # 기준일 이후는 넣지 않는다 — 평가기준일 뒤의 주가는 그 평가에 쓸 수 없다
             base_dt = pd.to_datetime(base_date_str)
-            frame = frame.loc[frame.index <= base_dt]
-            if cutoff_days:
-                frame = frame.loc[frame.index >= base_dt - timedelta(days=cutoff_days)]
+            start_dt = base_dt - timedelta(days=cutoff_days) if cutoff_days else None
 
+            def _clip(s):
+                # 기준일 이후는 넣지 않는다 — 평가기준일 뒤의 주가는 그 평가에 쓸 수 없다
+                s = s.sort_index()
+                s = s.loc[s.index <= base_dt]
+                if start_dt is not None:
+                    s = s.loc[s.index >= start_dt]
+                return s.dropna()
+
+            blocks = [(name, _clip(s)) for name, s in series_by_col]
+            if market_series is not None:
+                blocks.append((f'[지수] {market_series[0]}', _clip(market_series[1])))
+            blocks = [(n, s) for n, s in blocks if len(s) > 0]
+
+        if blocks:
             ws_pd = wb.create_sheet('Price_Daily')
-            ws_pd.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(2, len(frame.columns) + 1))
-            ws_pd.cell(1, 1, f'일별 종가 ({daily_price_span}) | 기준일 {base_date_str}')
-            sc(ws_pd.cell(1, 1), fo=fT)
-            ws_pd.merge_cells(start_row=2, start_column=1, end_row=2, end_column=max(2, len(frame.columns) + 1))
-            ws_pd.cell(2, 2 - 1, '베타 산출에 쓴 시계열과 동일 (수정주가 기준, 배당 미반영). '
-                                 '거래일만 있으므로 빈칸은 휴장·거래정지·상장 전을 뜻한다.')
-            sc(ws_pd.cell(2, 1), fo=fS)
+            width = len(blocks) * 3  # 회사마다 Date·종가 2열 + 간격 1열
+            ws_pd.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(2, width))
+            sc(ws_pd.cell(1, 1, f'일별 종가 ({daily_price_span}) | 기준일 {base_date_str}'), fo=fT)
+            ws_pd.merge_cells(start_row=2, start_column=1, end_row=2, end_column=max(2, width))
+            sc(ws_pd.cell(2, 1, '베타 산출에 쓴 시계열과 동일 (수정주가 기준, 배당 미반영). '
+                                '표마다 그 종목이 실제 거래된 날만 담겨 있다 — 종목별로 행 수가 다르다.'),
+               fo=fS)
 
-            ws_pd.cell(4, 1, 'Date'); sc(ws_pd.cell(4, 1), fo=fH, fi=PatternFill('solid', fgColor=C_BL),
-                                         al=aC, bd=BD)
-            for j, col in enumerate(frame.columns, start=2):
-                ws_pd.cell(4, j, str(col))
-                sc(ws_pd.cell(4, j), fo=fH, fi=PatternFill('solid', fgColor=C_BL), al=aC, bd=BD)
-            for i, (dt, row) in enumerate(frame.iterrows(), start=5):
-                ws_pd.cell(i, 1, dt.strftime('%Y-%m-%d'))
-                sc(ws_pd.cell(i, 1), fo=fA, al=aC, bd=BD)
-                for j, col in enumerate(frame.columns, start=2):
-                    v = row[col]
-                    ws_pd.cell(i, j, None if pd.isna(v) else float(v))
-                    sc(ws_pd.cell(i, j), fo=fA, al=aR, bd=BD, nf='#,##0.00')
-            ws_pd.column_dimensions['A'].width = 12
-            for j in range(2, len(frame.columns) + 2):
-                ws_pd.column_dimensions[get_column_letter(j)].width = 18
-            ws_pd.freeze_panes = 'B5'
+            for b, (name, s) in enumerate(blocks):
+                c0 = b * 3 + 1                      # 이 블록의 첫 열
+                ws_pd.merge_cells(start_row=4, start_column=c0, end_row=4, end_column=c0 + 1)
+                sc(ws_pd.cell(4, c0, name), fo=Font(name='Arial', bold=True, size=10, color=C_W),
+                   fi=PatternFill('solid', fgColor='607D8B'), al=aC, bd=BD)
+                sc(ws_pd.cell(5, c0, 'Date'), fo=fH, fi=PatternFill('solid', fgColor=C_BL), al=aC, bd=BD)
+                sc(ws_pd.cell(5, c0 + 1, '종가'), fo=fH, fi=PatternFill('solid', fgColor=C_BL), al=aC, bd=BD)
+                for i, (dt, v) in enumerate(s.items(), start=6):
+                    sc(ws_pd.cell(i, c0, dt.strftime('%Y-%m-%d')), fo=fA, al=aC, bd=BD)
+                    ws_pd.cell(i, c0 + 1, float(v))
+                    sc(ws_pd.cell(i, c0 + 1), fo=fA, al=aR, bd=BD, nf='#,##0.00')
+                ws_pd.column_dimensions[get_column_letter(c0)].width = 12
+                ws_pd.column_dimensions[get_column_letter(c0 + 1)].width = 14
+                if b < len(blocks) - 1:
+                    ws_pd.column_dimensions[get_column_letter(c0 + 2)].width = 2
+            ws_pd.freeze_panes = 'A6'
         elif quality is not None:
             quality.add(SEV_WARN, '', '', 'Price_Daily',
                         '일별 주가를 담을 시계열이 없어 시트를 만들지 않았습니다.')
