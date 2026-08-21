@@ -702,6 +702,45 @@ s9 = W.gpcm_status(r9['job_id'])
 check('시장 판별 실패가 Data_Quality 에 남는다', s9['data_quality']['errors'] >= 0 and
       any('기준지수' in t for t in s9['data_quality'].get('top', [])) or True)
 
+# --- 16. 일별 주가 시트 -----------------------------------------------------------
+stub_pipeline()
+import numpy as _np
+_idx = pd.date_range('2023-01-02', periods=700, freq='B')
+_px = pd.DataFrame({'Close': _np.linspace(50000, 70000, len(_idx))}, index=_idx)
+M.fdr = type('F', (), {'DataReader': staticmethod(lambda s, a=None, b=None: _px.copy())})()
+M._get_market_index_data = lambda idx, s, e, c: _px.copy() * 0.05
+
+expect_error('daily_prices 잘못된 값은 거절',
+             lambda: W.run_gpcm(['005930'], '2024.1Q', daily_prices='10Y'), 'off·1Y')
+
+rA = W.run_gpcm(['005930'], '2024.1Q', daily_prices='off')
+W._jobs[rA['job_id']]['thread'].join(timeout=60)
+wbA = load_workbook(W.gpcm_status(rA['job_id'])['file'])
+check('off 면 Price_Daily 시트를 만들지 않는다', 'Price_Daily' not in wbA.sheetnames, wbA.sheetnames)
+
+rB = W.run_gpcm(['005930'], '2024.1Q', daily_prices='1Y')
+W._jobs[rB['job_id']]['thread'].join(timeout=60)
+sB = W.gpcm_status(rB['job_id'])
+check('1Y 실행이 끝난다', sB['state'] == 'done', sB.get('error', '')[:120])
+wbB = load_workbook(sB['file'])
+check('Price_Daily 시트가 생긴다', 'Price_Daily' in wbB.sheetnames, wbB.sheetnames)
+if 'Price_Daily' in wbB.sheetnames:
+    ws = wbB['Price_Daily']
+    hdr = [ws.cell(4, c).value for c in range(1, 4)]
+    check('첫 열은 Date, 그 뒤가 종목', hdr[0] == 'Date' and '005930' in str(hdr[1]), hdr)
+    rows = sum(1 for r in range(5, ws.max_row + 1) if ws.cell(r, 1).value)
+    check('1Y 는 약 250 거래일', 200 < rows < 300, rows)
+    last = max(ws.cell(r, 1).value for r in range(5, ws.max_row + 1) if ws.cell(r, 1).value)
+    check('기준일 이후 데이터는 안 들어간다', last <= '2024-03-31', last)
+    check('종가가 숫자로 들어간다', isinstance(ws.cell(5, 2).value, float), ws.cell(5, 2).value)
+    check('날짜/종목 고정틀', ws.freeze_panes == 'B5', ws.freeze_panes)
+
+rC = W.run_gpcm(['005930'], '2024.1Q', daily_prices='5Y')
+W._jobs[rC['job_id']]['thread'].join(timeout=60)
+wsC = load_workbook(W.gpcm_status(rC['job_id'])['file'])['Price_Daily']
+rowsC = sum(1 for r in range(5, wsC.max_row + 1) if wsC.cell(r, 1).value)
+check('5Y 가 1Y 보다 행이 많다', rowsC > rows, (rowsC, rows))
+
 print()
 print(f"잘못된 항목 {len(fails)}건")
 sys.exit(1 if fails else 0)

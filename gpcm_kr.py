@@ -57,6 +57,9 @@ warnings.filterwarnings('ignore')
 RCODE_MAP = {'1Q': '11013', '2Q': '11012', '3Q': '11014', '4Q': '11011'}
 QUARTER_INFO = {'1Q': '03-31', '2Q': '06-30', '3Q': '09-30', '4Q': '12-31'}
 
+# 일별 주가 시트에 담을 구간. 베타용 5년 시계열을 잘라 쓰므로 추가 조회가 없다.
+DAILY_PRICE_SPANS = {'off': None, '1Y': 365, '2Y': 365 * 2, '3Y': 365 * 3, '5Y': 365 * 5}
+
 BETA_5Y_DAYS = 365 * 5 + 20
 BETA_2Y_DAYS = 365 * 2 + 20
 # 창(window)을 다 채웠을 때의 관측치 — 미달이면 경고한다(제외는 하지 않는다)
@@ -1769,6 +1772,11 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                 if market_prices_5y.index.tz is not None:
                     market_prices_5y.index = market_prices_5y.index.tz_localize(None)
 
+                # 일별 원본을 그대로 보관한다 — 월간·주간은 이걸 리샘플한 것이라
+                # 추가 조회 비용이 없다. Price_Daily 시트가 이걸 쓴다.
+                temp_metrics['Stock_Daily_Prices'] = stock_prices_5y.dropna()
+                temp_metrics['Market_Daily_Prices'] = market_prices_5y.dropna()
+
                 stock_monthly_prices = stock_prices_5y.resample('ME').last().dropna()
                 market_monthly_prices = market_prices_5y.resample('ME').last().dropna()
 
@@ -2046,7 +2054,7 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
     }
     return target_wacc_data, avg_debt_ratio
 
-def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summary_data, raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name, target_wacc_data, beta_type_input, notes_list, avg_debt_ratio, base_date_str, df_screen, target_periods, quality, peer_selection=None):
+def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summary_data, raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name, target_wacc_data, beta_type_input, notes_list, avg_debt_ratio, base_date_str, df_screen, target_periods, quality, peer_selection=None, daily_price_span='off'):
     # 2. 엑셀 생성 (메모리)
     output = io.BytesIO()
     wb = Workbook()
@@ -2757,6 +2765,65 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
     # === Data_Quality Sheet — 자동 수집이 채우지 못한 자리 ===
     # 못 가져온 값은 0으로 남고 나머지 계산은 계속 돌아간다. 파일만 받아 본 사람이
     # 그 0을 '정말 0'으로 읽지 않도록, 어디가 비었는지 여기에 모아 둔다.
+
+    # === Price_Daily Sheet — 일별 종가 (베타 검산·주가 추이 확인용) ===============
+    # 베타에 쓴 것과 같은 시계열이다. 종목을 열로 두어 행 수를 종목 수와 무관하게 유지한다
+    # (5년이면 약 1,230행). 조회를 새로 하지 않고 이미 받아온 원본을 자른다.
+    if daily_price_span and daily_price_span != 'off':
+        cutoff_days = DAILY_PRICE_SPANS.get(daily_price_span)
+        series_by_col = []          # (헤더, Series)
+        market_series = None
+        for ticker in target_code_list:
+            comp = next((c for c in screen_summary_data if c['Ticker'] == ticker), None)
+            if not comp:
+                continue
+            s = comp.get('Stock_Daily_Prices')
+            if s is None or len(s) == 0:
+                continue
+            series_by_col.append((f"{comp.get('Company', ticker)} ({ticker})", s))
+            if market_series is None and comp.get('Market_Daily_Prices') is not None:
+                market_series = (comp.get('Market_Index', ''), comp['Market_Daily_Prices'])
+
+        if series_by_col:
+            frame = pd.DataFrame({name: s for name, s in series_by_col})
+            if market_series is not None:
+                frame[market_series[0]] = market_series[1]
+            frame = frame.sort_index()
+            # 기준일 이후는 넣지 않는다 — 평가기준일 뒤의 주가는 그 평가에 쓸 수 없다
+            base_dt = pd.to_datetime(base_date_str)
+            frame = frame.loc[frame.index <= base_dt]
+            if cutoff_days:
+                frame = frame.loc[frame.index >= base_dt - timedelta(days=cutoff_days)]
+
+            ws_pd = wb.create_sheet('Price_Daily')
+            ws_pd.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(2, len(frame.columns) + 1))
+            ws_pd.cell(1, 1, f'일별 종가 ({daily_price_span}) | 기준일 {base_date_str}')
+            sc(ws_pd.cell(1, 1), fo=fT)
+            ws_pd.merge_cells(start_row=2, start_column=1, end_row=2, end_column=max(2, len(frame.columns) + 1))
+            ws_pd.cell(2, 2 - 1, '베타 산출에 쓴 시계열과 동일 (수정주가 기준, 배당 미반영). '
+                                 '거래일만 있으므로 빈칸은 휴장·거래정지·상장 전을 뜻한다.')
+            sc(ws_pd.cell(2, 1), fo=fS)
+
+            ws_pd.cell(4, 1, 'Date'); sc(ws_pd.cell(4, 1), fo=fH, fi=PatternFill('solid', fgColor=C_BL),
+                                         al=aC, bd=BD)
+            for j, col in enumerate(frame.columns, start=2):
+                ws_pd.cell(4, j, str(col))
+                sc(ws_pd.cell(4, j), fo=fH, fi=PatternFill('solid', fgColor=C_BL), al=aC, bd=BD)
+            for i, (dt, row) in enumerate(frame.iterrows(), start=5):
+                ws_pd.cell(i, 1, dt.strftime('%Y-%m-%d'))
+                sc(ws_pd.cell(i, 1), fo=fA, al=aC, bd=BD)
+                for j, col in enumerate(frame.columns, start=2):
+                    v = row[col]
+                    ws_pd.cell(i, j, None if pd.isna(v) else float(v))
+                    sc(ws_pd.cell(i, j), fo=fA, al=aR, bd=BD, nf='#,##0.00')
+            ws_pd.column_dimensions['A'].width = 12
+            for j in range(2, len(frame.columns) + 2):
+                ws_pd.column_dimensions[get_column_letter(j)].width = 18
+            ws_pd.freeze_panes = 'B5'
+        elif quality is not None:
+            quality.add(SEV_WARN, '', '', 'Price_Daily',
+                        '일별 주가를 담을 시계열이 없어 시트를 만들지 않았습니다.')
+
     ws_dq = wb.create_sheet('Data_Quality')
     ws_dq.sheet_properties.tabColor = 'EF6C00'
 
@@ -3021,6 +3088,11 @@ with st.sidebar:
         size_premium_options = srp_options()
         size_premium_choice = st.selectbox("기업 규모 선택", list(size_premium_options.keys()), index=0)
         size_premium_input = size_premium_options[size_premium_choice]
+
+        daily_span_choice = st.selectbox(
+            "일별 주가 시트", ['off', '1Y', '2Y', '3Y', '5Y'], index=4,
+            help="Price_Daily 시트에 종목별 일별 종가를 담습니다. 베타에 쓴 시계열과 같은 "
+                 "자료라 새로 조회하지 않습니다. off 면 시트를 만들지 않습니다.")
 
         beta_basis_choice = st.selectbox(
             "베타 기준지수", list(BETA_BASIS.values()), index=0,
@@ -3294,7 +3366,8 @@ if run_btn:
                 # 2. 엑셀 생성 (메모리)
                 output = export_gpcm_excel(
                     base_period_str, base_qtr, target_code_list, screen_summary_data, raw_bs_rows, raw_pl_rows, all_mkt, ticker_to_name,
-                    target_wacc_data, beta_type_input, notes_list, avg_debt_ratio, base_date_str, df_screen, target_periods, quality, peer_selection)
+                    target_wacc_data, beta_type_input, notes_list, avg_debt_ratio, base_date_str, df_screen, target_periods, quality, peer_selection,
+                    daily_price_span=daily_span_choice)
                 st.success("분석 완료! 아래 버튼을 눌러 리포트를 다운로드하세요.")
                 st.download_button(
                     label="📥 Report Download (Excel)",

@@ -173,6 +173,13 @@ _gl_basis = dict(_re.findall(r"'(KOSPI|MARKET)':\s*'([^']+)'", _gl2.split('BETA_
 chk('해외판 BETA_BASIS 가 국내판과 동일', _gl_basis == M.BETA_BASIS, (_gl_basis, M.BETA_BASIS))
 chk('해외판 기본값도 코스피 일괄', "beta_basis='KOSPI'" in _gl2)
 
+chk('일별 주가 구간 목록이 국내·해외 동일',
+    _re.findall(r"DAILY_PRICE_SPANS = \{([^}]*)\}", _gl2)[0].strip() ==
+    _re.findall(r"DAILY_PRICE_SPANS = \{([^}]*)\}",
+                (Path(_os.path.dirname(_os.path.abspath(__file__))) / 'gpcm_kr.py').read_text(encoding='utf-8'))[0].strip(),
+    _re.findall(r"DAILY_PRICE_SPANS = \{([^}]*)\}", _gl2))
+chk('해외판도 기준일 이후를 안 담는다 (조회 상한이 기준일)', 'base_dt + timedelta(days=1)' in _gl2)
+
 print()
 print(f"잘못된 항목 {fails}건")
 sys.exit(1 if fails else 0)

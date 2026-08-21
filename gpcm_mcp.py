@@ -270,7 +270,8 @@ def _run_job(job: dict[str, Any], p: dict[str, Any]) -> None:
         book: io.BytesIO = M.export_gpcm_excel(
             base_period, base_qtr, p["tickers"], summary, raw_bs, raw_pl, all_mkt,
             names, wacc_data, p["beta_type"], notes, avg_debt_ratio, base_date_str,
-            M.pd.DataFrame(all_multiples), p["periods"], quality)
+            M.pd.DataFrame(all_multiples), p["periods"], quality,
+            daily_price_span=p.get("daily_prices", "off"))
 
         out = Path(job["file"])
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -377,6 +378,7 @@ def run_gpcm(
     rate_source: str = "",
     target_ticker: str = "",
     beta_benchmark: str = "KOSPI",
+    daily_prices: str = "5Y",
 ) -> dict[str, Any]:
     """GPCM 밸류에이션을 백그라운드로 실행해 엑셀 파일을 만든다.
 
@@ -420,6 +422,9 @@ def run_gpcm(
             직접 넣으면 그 값을 쓰고, 자동 산출은 하지 않는다.
         target_ticker: 세율을 정할 피평가회사 종목코드. 비우면 tickers 의 첫 번째.
         beta_type: WACC 에 쓸 베타. "5Y"(5년 월간) 또는 "2Y"(2년 주간).
+        daily_prices: 일별 종가를 담을 Price_Daily 시트 구간. "off"·"1Y"·"2Y"·"3Y"·"5Y".
+            기본 "5Y". 베타에 쓴 시계열을 그대로 자르는 것이라 조회가 새로 늘지 않는다.
+            **묻지 말고 기본값을 쓴다** — 사용자가 필요 없다고 하면 "off".
         beta_benchmark: 베타 기준지수. "KOSPI"(기본, 전 종목 코스피 일괄) 또는
             "MARKET"(소속시장 — 코스닥 종목은 ^KQ11). 기본이 코스피인 이유는
             피어 무차입베타를 평균해 하나의 WACC 을 만들기 때문이다 — 모든 β 가
@@ -446,6 +451,10 @@ def run_gpcm(
     basis = (beta_benchmark or "KOSPI").strip().upper()
     if basis not in ("KOSPI", "MARKET"):
         raise RuntimeError(f'beta_benchmark 는 "KOSPI" 또는 "MARKET" 입니다: {beta_benchmark}')
+    span = (daily_prices or "5Y").strip()
+    span = "off" if span.lower() == "off" else span.upper()
+    if span not in ("off", "1Y", "2Y", "3Y", "5Y"):
+        raise RuntimeError(f'daily_prices 는 off·1Y·2Y·3Y·5Y 중 하나입니다: {daily_prices}')
     target = (target_ticker or "").strip() or codes[0]
     if target not in codes:
         raise RuntimeError(
@@ -490,7 +499,7 @@ def run_gpcm(
                 "tax_rate": None if tax_rate is None else tax_rate / 100,
                 "target": target,
                 "beta_type": beta_type, "rate_source": rate_source.strip(),
-                "beta_benchmark": basis,
+                "beta_benchmark": basis, "daily_prices": span,
             },
         }
         _jobs[job_id] = job

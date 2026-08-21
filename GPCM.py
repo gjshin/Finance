@@ -81,6 +81,9 @@ def _to_price_series(df, col='Close'):
 # 한국 종목의 베타 기준지수 선택. 국내판(gpcm_kr.BETA_BASIS)과 같은 값·라벨을 쓴다
 # — 두 앱이 같은 회사를 다른 기준으로 재면 안 된다. 국내판을 임포트하면 그쪽
 # 사이드바가 실행되므로 값을 복사해 두고, 테스트로 동일성을 고정한다.
+# 일별 주가 시트 구간. 국내판(gpcm_kr.DAILY_PRICE_SPANS)과 같은 값이어야 한다.
+DAILY_PRICE_SPANS = {'off': None, '1Y': 365, '2Y': 365 * 2, '3Y': 365 * 3, '5Y': 365 * 5}
+
 BETA_BASIS = {
     'KOSPI': '코스피 일괄 (^KS11)',
     'MARKET': '소속시장 지수 (코스피=^KS11, 코스닥=^KQ11)',
@@ -1300,7 +1303,7 @@ def get_gpcm_data(tickers_list, target_periods, mrp=0.08, kd_pretax=0.035, size_
 
 
 
-def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs, price_rel_dfs, base_period_str, target_periods, ticker_to_name, target_wacc_data, beta_type="5Y", data_quality_rows=None, target_inputs=None):
+def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_abs_dfs, price_rel_dfs, base_period_str, target_periods, ticker_to_name, target_wacc_data, beta_type="5Y", data_quality_rows=None, target_inputs=None, daily_price_span='5Y'):
     output = io.BytesIO()
     wb = Workbook(); wb.remove(wb.active)
 
@@ -2424,13 +2427,19 @@ def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_a
     ws_dq.freeze_panes = f'A{dq_hdr+1}'
 
     # [Sheet 11] Price_History (Set tab color to black)
-    if price_abs_dfs:
+    if price_abs_dfs and daily_price_span != 'off':
         ws_ph = wb.create_sheet('Price_History')
         ws_ph.sheet_properties.tabColor = "000000" # Black tab
         df_abs = pd.concat(price_abs_dfs, axis=1).sort_index().ffill()
         df_rel = pd.concat(price_rel_dfs, axis=1).sort_index().ffill()
+        # 요청 구간만 남긴다 — 종전에는 10년치를 통째로 써서 파일이 불필요하게 컸다
+        _span_days = DAILY_PRICE_SPANS.get(daily_price_span)
+        if _span_days and not df_abs.empty:
+            _cut = df_abs.index.max() - timedelta(days=_span_days)
+            df_abs = df_abs.loc[df_abs.index >= _cut]
+            df_rel = df_rel.loc[df_rel.index >= _cut]
         common_index = df_abs.index
-        sc(ws_ph.cell(1,1,'Stock Price History (10 Years)'), fo=fT)
+        sc(ws_ph.cell(1,1,f'Stock Price History ({daily_price_span}, daily)'), fo=fT)
         ws_ph.merge_cells(start_row=1,start_column=1,end_row=1,end_column=10)
         r=3
         ws_ph.cell(r,1,'Date'); sc(ws_ph.cell(r,1), fo=fH, fi=pH, al=aC, bd=BD); ws_ph.column_dimensions['A'].width=12
@@ -3029,6 +3038,11 @@ PYT.VI"""
     size_premium_input = size_premium_options[size_premium_choice]
 
     st.markdown("**Beta 계산 기준 선택**")
+    daily_span_input = st.selectbox(
+        "일별 주가 시트", list(DAILY_PRICE_SPANS.keys()), index=4,
+        help="Price_History 시트에 담을 일별 종가 구간입니다. 이미 받아온 시계열을 자르는 "
+             "것이라 조회가 늘지 않습니다. off 면 시트를 만들지 않습니다.")
+
     beta_basis_choice = st.selectbox(
         "베타 기준지수 (한국 종목)", list(BETA_BASIS.values()), index=0,
         help="한국 종목(.KS/.KQ)에만 적용됩니다. 기본은 코스피 일괄 — 피어 무차입베타를 "
@@ -3241,7 +3255,8 @@ if btn_run:
                 all_period_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel,
                 base_period_str, target_periods, t_map, target_wacc_data,
                 beta_type=beta_type_input, data_quality_rows=dq_rows,
-                target_inputs=target_inputs_dict)
+                target_inputs=target_inputs_dict,
+                daily_price_span=daily_span_input)
 
             st.download_button(
                 label="📥 GPCM Report Download (Excel)",
