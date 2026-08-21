@@ -180,6 +180,16 @@ chk('일별 주가 구간 목록이 국내·해외 동일',
     _re.findall(r"DAILY_PRICE_SPANS = \{([^}]*)\}", _gl2))
 chk('해외판도 기준일 이후를 안 담는다 (조회 상한이 기준일)', 'base_dt + timedelta(days=1)' in _gl2)
 
+# 해외 Price_History — 영업일 기준 수정주가 (앞값 채움 금지)
+_ph = _gl2.split("[Sheet 11] Price_History")[1].split("[Sheet")[0]
+_ph_code = '\n'.join(l for l in _ph.splitlines() if not l.strip().startswith('#'))
+chk('해외 일별 주가는 앞값으로 채우지 않는다', '.ffill()' not in _ph_code,
+    [l.strip() for l in _ph_code.splitlines() if 'ffill' in l])
+chk('결측은 NaN 이 아니라 빈칸으로 쓴다', 'None if pd.isna(v)' in _ph)
+chk('시트에 수정주가·거래일 기준을 밝힌다',
+    '수정주가' in _ph and '거래일만' in _ph)
+chk('베타·주가 모두 auto_adjust 계열을 쓴다', "bundle['price_series'] = hist_adj" in _gl2)
+
 print()
 print(f"잘못된 항목 {fails}건")
 sys.exit(1 if fails else 0)

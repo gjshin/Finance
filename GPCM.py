@@ -2430,8 +2430,11 @@ def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_a
     if price_abs_dfs and daily_price_span != 'off':
         ws_ph = wb.create_sheet('Price_History')
         ws_ph.sheet_properties.tabColor = "000000" # Black tab
-        df_abs = pd.concat(price_abs_dfs, axis=1).sort_index().ffill()
-        df_rel = pd.concat(price_rel_dfs, axis=1).sort_index().ffill()
+        # 앞값으로 채우지 않는다(종전 .ffill()). 시장이 다른 종목을 섞으면 한쪽만
+        # 열린 날에도 전일 종가가 찍혀 "그날도 거래된 것처럼" 보였다.
+        # 실제 거래일에만 값이 있어야 일별 종가 기록으로 쓸 수 있다.
+        df_abs = pd.concat(price_abs_dfs, axis=1).sort_index()
+        df_rel = pd.concat(price_rel_dfs, axis=1).sort_index()
         # 요청 구간만 남긴다 — 종전에는 10년치를 통째로 써서 파일이 불필요하게 컸다
         _span_days = DAILY_PRICE_SPANS.get(daily_price_span)
         if _span_days and not df_abs.empty:
@@ -2441,6 +2444,10 @@ def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_a
         common_index = df_abs.index
         sc(ws_ph.cell(1,1,f'Stock Price History ({daily_price_span}, daily)'), fo=fT)
         ws_ph.merge_cells(start_row=1,start_column=1,end_row=1,end_column=10)
+        sc(ws_ph.cell(2,1,'수정주가(배당·분할 반영, auto_adjust) · 거래일만 표시 — '
+                          '빈칸은 그 종목이 거래되지 않은 날(휴장·정지·상장 전)이다. '
+                          'Abs=수정주가, Rel=공통 첫 거래일=100 재기준화'), fo=fS)
+        ws_ph.merge_cells(start_row=2,start_column=1,end_row=2,end_column=10)
         r=3
         ws_ph.cell(r,1,'Date'); sc(ws_ph.cell(r,1), fo=fH, fi=pH, al=aC, bd=BD); ws_ph.column_dimensions['A'].width=12
         c_idx=2
@@ -2455,9 +2462,13 @@ def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_a
         r=4
         for date in common_index:
             dv=date.date(); ws_ph.cell(r,1,dv).number_format='yyyy-mm-dd'; sc(ws_ph.cell(r,1), fo=fA, al=aC, bd=BD); cc=2
-            for v in df_abs.loc[date]: ws_ph.cell(r,cc,v).number_format='#,##0.00'; sc(ws_ph.cell(r,cc), fo=fA, al=aR, bd=BD); cc+=1
+            for v in df_abs.loc[date]:
+                ws_ph.cell(r,cc, None if pd.isna(v) else float(v)).number_format='#,##0.00'
+                sc(ws_ph.cell(r,cc), fo=fA, al=aR, bd=BD); cc+=1
             cc+=1; ws_ph.cell(r,cc,dv).number_format='yyyy-mm-dd'; sc(ws_ph.cell(r,cc), fo=fA, al=aC, bd=BD); cc+=1
-            for v in df_rel.loc[date]: ws_ph.cell(r,cc,v).number_format='#,##0'; sc(ws_ph.cell(r,cc), fo=fA, al=aR, bd=BD); cc+=1
+            for v in df_rel.loc[date]:
+                ws_ph.cell(r,cc, None if pd.isna(v) else float(v)).number_format='#,##0'
+                sc(ws_ph.cell(r,cc), fo=fA, al=aR, bd=BD); cc+=1
             r+=1
         
         # Monthly Chart Data
