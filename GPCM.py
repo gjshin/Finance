@@ -2499,7 +2499,10 @@ def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_a
             s=Series(Reference(ws_ph, min_col=i+2, min_row=hdr_row, max_row=data_last), title_from_data=True)
             s.graphicalProperties.line.solidFill=colors[i%len(colors)]; s.graphicalProperties.line.width=20000; s.smooth=False
             chart.series.append(s)
-        ws_ph.add_chart(chart, f"{get_column_letter(rel_start+len(df_m.columns)+1)}3")
+        # 종목별 표가 4열씩(Date·Abs·Rel·간격) 차지하므로 그 오른쪽에 붙인다.
+        # 리샘플 뒤의 df_m 이 아니라 df_abs 로 세는 이유: 데이터가 없어 건너뛴
+        # 종목도 열 자리는 비워 둔 채 지나가므로 df_abs 의 열 수가 곧 블록 수다.
+        ws_ph.add_chart(chart, f"{get_column_letter(len(df_abs.columns) * 4 + 2)}3")
 
     # Temp 시트 삭제
     if 'Temp' in wb.sheetnames:
