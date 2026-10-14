@@ -2077,7 +2077,7 @@ def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_a
                        pWACC_CALC, '0.00%')
     r_wacc = wacc_line(r_wacc, 'de', 'Target D/E Ratio',
                        f"=IF(B{wacc_rows['dv']}<1,B{wacc_rows['dv']}/(1-B{wacc_rows['dv']}),0)",
-                       '= (D/V) ÷ (1 − D/V)', pWACC_CALC, '0.0000')
+                       '(D/V) ÷ (1 − D/V)', pWACC_CALC, '0.0000')
 
     r_wacc += 1
     r_wacc = wacc_section(r_wacc, '[ 3 ] Target WACC')
@@ -2346,7 +2346,7 @@ def create_excel(all_period_data, raw_bs_rows, raw_pl_rows, market_rows, price_a
         c.value = (f'=IFERROR({cl_}{base_row}*(1+$B${adj_rows["prem"]})'
                    f'*(1-$B${adj_rows["dlom"]}),"")')
         sc(c, fo=Font(name='Arial', bold=True, size=10), fi=pRESULT, bd=BD, al=aWR, nf=NF_M)
-    sc(ws_iv.cell(r_iv, 8, '= Base × (1 + 프리미엄) × (1 − DLOM)'), fo=fWNOTE, bd=BD, al=aWL)
+    sc(ws_iv.cell(r_iv, 8, 'Base × (1 + 프리미엄) × (1 − DLOM)'), fo=fWNOTE, bd=BD, al=aWL)
     adj_row = r_iv
     r_iv += 1
 

@@ -4,7 +4,7 @@
 과거에 분기→보고서코드 매핑이 뒤집혀 있어 '연간'을 고르면 1분기보고서를 가져왔다
 (매출이 1/4로 나오는데 오류는 나지 않아 알아채기 어려웠다).
 """
-import sys, types, pandas as pd, numpy as np
+import re, sys, types, pandas as pd, numpy as np
 from pathlib import Path
 sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
 import gpcm_kr as M
@@ -97,19 +97,47 @@ chk('오검출 방지: 품목별 수익 태그는 안 쓴다',
 print()
 print("엑셀 Tax Rate 수식")
 print("-" * 66)
-OLD_2025 = '=IF(AE6<=2, 0.099, IF(AE6<=200, 0.209, IF(AE6<=3000, 0.231, 0.264)))'
-chk('FY2025 수식이 종전과 글자까지 같다', M.korean_tax_rate_formula('AE6', 2025) == OLD_2025,
+# 결손(0 이하)은 파이썬과 같이 2구간 세율 — 종전 수식은 음수를 첫 구간으로 읽었다
+F_2025 = ('=IF(AE6<=0, 0.209, IF(AE6<=2, 0.099, IF(AE6<=200, 0.209, '
+          'IF(AE6<=3000, 0.231, 0.264))))')
+chk('FY2025 수식 (결손 → 2구간)', M.korean_tax_rate_formula('AE6', 2025) == F_2025,
     M.korean_tax_rate_formula('AE6', 2025))
-chk('FY2024 도 동일', M.korean_tax_rate_formula('AE6', 2024) == OLD_2025)
+chk('FY2024 도 동일', M.korean_tax_rate_formula('AE6', 2024) == F_2025)
 chk('FY2026 은 개정 세율(11%/22%/24.2%/27.5%)',
     M.korean_tax_rate_formula('AE6', 2026) ==
-    '=IF(AE6<=2, 0.11, IF(AE6<=200, 0.22, IF(AE6<=3000, 0.242, 0.275)))',
+    '=IF(AE6<=0, 0.22, IF(AE6<=2, 0.11, IF(AE6<=200, 0.22, IF(AE6<=3000, 0.242, 0.275))))',
     M.korean_tax_rate_formula('AE6', 2026))
 for fy in (2024, 2025, 2026):
     br = M.get_korean_tax_brackets(fy)
     f = M.korean_tax_rate_formula('X1', fy)
     chk(f'FY{fy} 수식 세율이 파이썬 표와 일치',
         all(f'{r:g}' in f for _, r in br), f)
+
+
+def _eval_tax_formula(formula, x):
+    """중첩 IF(셀<=상한, 세율, …) 수식을 값 x 로 풀어 본다 (엑셀 비교와 같은 순서)."""
+    expr = formula.lstrip('=').replace('X1', repr(float(x)))
+    while expr.startswith('IF('):
+        m = re.match(r'IF\(([-\d.e+]+)<=([-\d.e+]+), ([-\d.e+]+), (.*)\)$', expr)
+        a, b, c, rest = m.groups()
+        if float(a) <= float(b):
+            return float(c)
+        expr = rest
+    return float(expr)
+
+
+# 같은 파일 안에서 엑셀 셀과 파이썬 요약이 갈리면 안 된다 (결손 피어에서 한 번 갈렸다)
+for fy in (2024, 2025, 2026):
+    f = M.korean_tax_rate_formula('X1', fy)
+    for x in (-2588.1, -0.5, 0, 1, 2, 2.5, 150, 200, 2522.9, 3000, 3001, 50000):
+        xl, py = _eval_tax_formula(f, x), M.get_korean_marginal_tax_rate(x, fy)
+        chk(f'FY{fy} 세전이익 {x}억: 엑셀 수식 = 파이썬', abs(xl - py) < 1e-12, (xl, py))
+
+# 설명 문구가 '=' 로 시작하면 엑셀이 수식으로 읽어 오류(#NAME?)를 띄운다
+for src in ('gpcm_kr.py', 'GPCM.py'):
+    text = (Path(__file__).resolve().parent / src).read_text(encoding='utf-8')
+    bad = re.findall(r"['\"]= [^'\"]*['\"]", text)
+    chk(f'{src}: "= " 로 시작하는 설명 문구 없음', not bad, bad)
 
 # --- 베타 기준지수 ---------------------------------------------------------------
 print()
