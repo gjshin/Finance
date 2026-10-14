@@ -11,6 +11,7 @@ install_mcp.ps1
 test_gpcm_kr.py
 test_gpcm_kr_quality.py
 test_gpcm_mcp.py
+test_gpcm_global.py
 README.md
 _먼저읽어보세요.md
 .gitattributes

@@ -457,6 +457,12 @@ def korean_tax_rate_formula(cell_ref, fiscal_year):
     종전에는 FY2023~25 세율이 수식에 박혀 있어, 2025년 세법개정(FY2026~)이
     반영되지 않았다 — 같은 워크북 안에서 엑셀 세율과 파이썬 세율이 갈렸다.
     get_korean_marginal_tax_rate 와 같은 표를 써서 두 값이 항상 맞물리게 한다.
+
+    결손(세전이익 0 이하)·미확보 기업은 get_korean_marginal_tax_rate 와 같이 2구간
+    세율(2억 초과~200억)을 쓴다. 종전 수식은 음수를 첫 구간(2억 이하)으로 읽어
+    결손 기업만 엑셀(11%)과 파이썬(22%)이 갈렸다 — 같은 파일 안에서 WACC 셀 값과
+    요약 문자·gpcm_status 가 0.01%p 어긋났다. 빈 셀은 엑셀에서 0으로 비교되므로
+    파이썬의 미확보(NaN)와 같은 결과가 된다.
     """
     brackets = get_korean_tax_brackets(fiscal_year)
     finite = [(u, r) for u, r in brackets if u is not None]
@@ -464,6 +470,7 @@ def korean_tax_rate_formula(cell_ref, fiscal_year):
     formula = f'{last_rate:g}'
     for upper, rate in reversed(finite):
         formula = f'IF({cell_ref}<={upper:g}, {rate:g}, {formula})'
+    formula = f'IF({cell_ref}<=0, {brackets[1][1]:g}, {formula})'
     return '=' + formula
 
 
@@ -2478,7 +2485,7 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
     ws_wacc.cell(r_wacc, 1, 'Target D/E Ratio')
     ws_wacc.cell(r_wacc, 2).value = f'=B{row_debt_ratio}/(1-B{row_debt_ratio})'
     ws_wacc.cell(r_wacc, 3, f"{target_wacc_data['Target_DE_Ratio']:.4f}")
-    ws_wacc.cell(r_wacc, 4, '= D/V ÷ (1 - D/V)')
+    ws_wacc.cell(r_wacc, 4, 'D/V ÷ (1 - D/V)')  # '=' 로 시작하면 엑셀이 수식으로 읽어 오류 표시
     sc(ws_wacc.cell(r_wacc, 1), fo=fA, bd=BD)
     sc(ws_wacc.cell(r_wacc, 2), fo=fA, fi=pWACC_CALC, bd=BD, al=Alignment(horizontal='right'), nf='0.0000')
     sc(ws_wacc.cell(r_wacc, 3), fo=fA, bd=BD, al=Alignment(horizontal='center'))
