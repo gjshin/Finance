@@ -66,6 +66,7 @@ BETA_2Y_DAYS = 365 * 2 + 20
 FULL_MONTHLY_OBS = 60   # 5년 × 12개월
 FULL_WEEKLY_OBS = 104   # 2년 × 52주
 BETA_SANITY_LIMIT = 3.0  # 통상 범위. 넘으면 경고만 하고 값은 그대로 둔다
+LOW_R2_INFO = 0.1        # 결정계수가 이보다 낮으면 Data_Quality 에 정보로 남긴다(배제 기준 아님)
 MIN_MONTHLY_PTS = 12
 MIN_WEEKLY_PTS = 50
 
@@ -126,6 +127,64 @@ def _slice_from(df, start_date_str):
         return df[idx >= start]
     except Exception:
         return df
+
+
+def weekly_pair_2y(stock_daily, market_daily, base_date_str, n_returns=FULL_WEEKLY_OBS):
+    """2년 주간 베타용 주간 종가 한 쌍 — 기준일이 속한 주까지 정확히 n_returns+1 주.
+
+    종전에는 '기준일 − 750일'부터 금요일 기준으로 리샘플해 관측치가 107개가 됐고,
+    마지막 주가 기준일 뒤 금요일(예: 2026-07-03)로 찍혀 기준일 이후 자료처럼 보였다.
+    - 종목과 지수가 함께 거래된 날만 남긴 뒤(inner join) 주마다 마지막 거래일 종가를 쓴다.
+      날짜도 그 실제 거래일이라 마지막 주는 기준일(또는 그 직전 거래일)로 찍힌다.
+    - 창은 달력 기준으로 고정한다: 기준일이 속한 주와 그 앞 n_returns 주. 그 사이
+      거래정지 주가 있으면 관측치가 줄어든다 — 창을 늘려 메우지 않는다(경고는 호출부).
+    """
+    empty = pd.Series(dtype=float)
+    if stock_daily is None or market_daily is None or len(stock_daily) == 0 or len(market_daily) == 0:
+        return empty, empty
+    s = pd.Series(stock_daily).copy()
+    m = pd.Series(market_daily).copy()
+    for x in (s, m):
+        if not isinstance(x.index, pd.DatetimeIndex):
+            x.index = pd.to_datetime(x.index)
+        if x.index.tz is not None:
+            x.index = x.index.tz_localize(None)
+    df = pd.concat([s.rename('s'), m.rename('m')], axis=1, join='inner').dropna().sort_index()
+    base_dt = pd.to_datetime(base_date_str)
+    df = df[df.index <= base_dt]
+    if df.empty:
+        return empty, empty
+    weeks = df.index.to_period('W-FRI')
+    last = df.groupby(weeks).tail(1)
+    lw = last.index.to_period('W-FRI')
+    base_wk = base_dt.to_period('W-FRI')
+    last = last[(lw >= base_wk - n_returns) & (lw <= base_wk)]
+    return last['s'], last['m']
+
+
+_PREF_NAME_RE = re.compile(r'(\d?우[A-Z]?|우\(.+\))$')
+
+def find_listed_preferred(ticker: str, df_krx: pd.DataFrame):
+    """보통주 종목코드에 딸린 상장 우선주 [(코드, 이름), ...].
+
+    우선주 코드는 보통주 앞 5자리를 공유한다(001680 → 001685, 264900 → 26490K).
+    이름이 보통주 이름으로 시작하고 '우'·'우B'·'2우B' 등으로 끝나야 한다 — 앞 5자리만
+    같은 다른 회사를 잡지 않기 위해서다.
+    """
+    if df_krx is None or df_krx.empty or 'Code' not in df_krx.columns:
+        return []
+    codes = df_krx['Code'].astype(str)
+    base = df_krx[codes == ticker]
+    if base.empty:
+        return []
+    base_name = str(base.iloc[0].get('Name') or '').strip()
+    cand = df_krx[(codes.str[:5] == ticker[:5]) & (codes != ticker)]
+    out = []
+    for _, r in cand.iterrows():
+        name = str(r.get('Name') or '').strip()
+        if base_name and name.startswith(base_name) and _PREF_NAME_RE.search(name[len(base_name):] or name):
+            out.append((str(r['Code']), name))
+    return out
 
 
 def _get_market_index_data(market_idx, start, end, cache):
@@ -585,18 +644,74 @@ def get_krx_industry_listing():
     get_krx_listing()이 쓰는 'KRX'는 가격·시총 목록이라 업종이 없다. 업종으로
     Peer 후보를 추리려면 이쪽이 필요하다. 인증키는 필요 없다.
 
-    반환: Code, Name, Market, Sector(업종), Industry(주요제품), SettleMonth(결산월)
+    반환: Code, Name, Market, Sector(업종), Industry(주요제품), SettleMonth(결산월),
+          Dept(코스닥 소속부), ListingDate(상장일)
     실패하면 빈 DataFrame — 호출부는 종목코드 직접 입력으로 되돌아간다.
     """
     for attempt in range(2):
         try:
-            df = fdr.StockListing('KRX-DESC')
-            if df is not None and not df.empty and 'Sector' in df.columns:
+            df = normalize_krx_desc(fdr.StockListing('KRX-DESC'))
+            if df is not None and not df.empty:
                 return df
         except Exception:
             if attempt < 1:
                 time.sleep(1.0)
-    return pd.DataFrame(columns=['Code', 'Name', 'Market', 'Sector', 'Industry', 'SettleMonth'])
+    return pd.DataFrame(columns=['Code', 'Name', 'Market', 'Sector', 'Industry', 'SettleMonth', 'Dept'])
+
+
+KRX_DESC_CACHE_URL = ('https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/'
+                      'refs/heads/master/data/listing/desc/{date}.csv')
+
+
+def normalize_krx_desc(df):
+    """FinanceDataReader 'KRX-DESC' 열 구성을 하나로 맞춘다.
+
+    라이브러리가 읽는 사본(거래소 상장법인목록을 날마다 올려둔 것)의 열이 바뀌었다:
+        예전  Sector=업종,  Industry=주요제품
+        지금  Sector=코스닥 소속부, Industry=업종, Products=주요제품
+    예전 구성으로 읽으면 업종 자리에 '중견기업부' 같은 소속부가 들어가고, 유가증권시장은
+    전부 업종 미상이 된다(2026-10 확인). 'Products' 열이 있으면 새 구성으로 본다.
+    반환 열: Sector=업종, Industry=주요제품, Dept=소속부 (나머지 열은 그대로).
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    if 'Products' in df.columns:
+        df = df.rename(columns={'Sector': 'Dept'})
+        df = df.rename(columns={'Industry': 'Sector', 'Products': 'Industry'})
+    elif 'Dept' not in df.columns:
+        df['Dept'] = None
+    if 'Sector' not in df.columns:
+        return None
+    if 'Code' in df.columns:
+        df['Code'] = df['Code'].astype(str).str.zfill(6)
+    return df
+
+
+def get_krx_listing_as_of(as_of, max_back_days=10):
+    """평가기준일 당시의 상장법인목록(업종·주요제품 포함) 사본을 받는다.
+
+    사본은 거래일마다 한 파일씩 있다(2026년 1분기부터). 기준일이 휴장일이면 그 직전
+    거래일 파일을 쓴다. 기준일 당시 명단이라 그 뒤 상장폐지·신규상장을 보정할 필요가 없다.
+    반환: (DataFrame, 사용한 파일 날짜 'YYYY-MM-DD', 주소). 없으면 (None, None, 마지막 시도 주소).
+    공식 거래소 원본이 아니라 라이브러리 제작자가 올린 사본이다 — 조서에 주소와 날짜를 남길 것.
+    """
+    base = pd.to_datetime(as_of)
+    url = None
+    for back in range(max_back_days + 1):
+        d = (base - timedelta(days=back)).strftime('%Y-%m-%d')
+        url = KRX_DESC_CACHE_URL.format(date=d)
+        try:
+            r = requests.get(url, timeout=20)
+            if r.status_code != 200 or len(r.content) < 1000:
+                continue
+            df = pd.read_csv(io.StringIO(r.content.decode('utf-8')), index_col=0, dtype={'Code': str})
+            df = normalize_krx_desc(df.reset_index(drop=True))
+            if df is not None and not df.empty:
+                return df, d, url
+        except Exception:
+            continue
+    return None, None, url
 
 
 def peer_candidate_rows(df_ind, sector: str):
@@ -694,7 +809,8 @@ def fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code:
 
 
 def _fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code: str):
-    meta = {'shares': None, 'rcept_no': None, 'stlm_dt': None, 'se': None, 'status': None, 'message': None}
+    meta = {'shares': None, 'rcept_no': None, 'stlm_dt': None, 'se': None, 'status': None, 'message': None,
+            'pref_shares': None}
     try:
         params = {
             'crtfc_key': api_key,
@@ -720,6 +836,16 @@ def _fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code
             c1 = df[df['se'].astype(str).str.contains('보통', na=False)]
             c2 = df[df['se'].astype(str).str.contains('합계', na=False)]
             pick = c1 if not c1.empty else (c2 if not c2.empty else df)
+            # 우선주 유통주식수 — 상장 우선주 시가총액에 쓴다(보통주 시가총액과 같은 보고서 기준)
+            cp = df[df['se'].astype(str).str.contains('우선', na=False)]
+            if not cp.empty:
+                prow = cp.iloc[0].to_dict()
+                ps = _to_int(prow.get('distb_stock_co'))
+                if ps is None:
+                    pi, pt = _to_int(prow.get('istc_totqy')), _to_int(prow.get('tesstk_co'))
+                    if pi is not None and pt is not None:
+                        ps = pi - pt
+                meta['pref_shares'] = ps
         else:
             pick = df
 
@@ -742,6 +868,44 @@ def _fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code
         meta['status'] = meta['status'] or 'ERR'
         meta['message'] = str(e)
         return None, meta
+
+def get_preferred_market_value(ticker: str, bds: str, df_krx: pd.DataFrame, sh_meta: dict | None):
+    """상장 우선주 시가총액(억원)과 근거.
+
+    공시 재무상태표는 자본금을 합계 한 줄로만 주는 경우가 많아(예: 대상·크라운제과)
+    '우선주자본금' 계정으로는 우선주가 0으로 잡혔다. 상장 우선주가 있으면 기준일 종가 ×
+    유통주식수로 시가를 구해 자기자본가치에 더한다.
+    - 주식수: 우선주 종류가 하나면 보통주와 같은 DART 보고서의 우선주 유통주식수,
+      여러 종류면 DART 가 합계만 주므로 KRX 목록의 종류별 상장주식수(조회일 기준).
+    - 한 종류라도 종가·주식수를 못 구하면 0을 돌려 장부(우선주자본금)로 되돌아가게 한다 —
+      일부만 더한 값은 그럴듯하게 틀린다.
+    반환: (억원, 근거 dict 또는 None). 상장 우선주가 없으면 (0.0, None).
+    """
+    prefs = find_listed_preferred(ticker, df_krx)
+    if not prefs:
+        return 0.0, None
+    dart_pref = (sh_meta or {}).get('pref_shares')
+    items, problems, total = [], [], 0.0
+    for code, name in prefs:
+        price, pdate = get_stock_price(code, bds)
+        if len(prefs) == 1 and dart_pref:
+            shares, src = dart_pref, 'DART 우선주 유통주식수'
+        else:
+            row = df_krx[df_krx['Code'].astype(str) == code]
+            shares = _to_int(row.iloc[0].get('Stocks')) if not row.empty else None
+            src = 'KRX 상장주식수(조회일)'
+        if price is None or not shares:
+            problems.append(f"{name}({code}) " + ('종가' if price is None else '주식수') + ' 조회 실패')
+            continue
+        val = price * shares / 1e8
+        total += val
+        items.append({'code': code, 'name': name, 'close': price, 'date': pdate,
+                      'shares': shares, 'source': src, 'value_100m': round(val, 1)})
+    info = {'items': items, 'problems': problems}
+    if problems:
+        return 0.0, info
+    return round(total, 1), info
+
 
 def get_outstanding_shares(api_key, corp_code: str, ticker: str, bsns_year: int, reprt_code: str, df_krx: pd.DataFrame, cache=None):
     # 1. DART API 조회 (요청한 기준년도/분기)
@@ -1470,7 +1634,7 @@ GPCM_COL_DEFS = [
     ('Company', 'Company', 18), ('Ticker', 'Ticker', 10), ('BaseDate', 'Base Date', 11),
     ('Curr', 'Curr', 6), ('PLSource', 'PL Source', 13),
     ('Cash', 'Cash', 13), ('IBD', 'IBD', 13), ('NOA', 'NOA', 13), ('NetDebt', 'Net Debt', 13),
-    ('NCI', 'NCI', 12), ('Pref', '우선주(장부)', 13), ('Equity', 'Equity', 13), ('EV', 'EV', 15),
+    ('NCI', 'NCI', 12), ('Pref', '우선주(시가·장부)', 14), ('Equity', 'Equity', 13), ('EV', 'EV', 15),
     ('Revenue', 'Revenue', 13), ('EBIT', 'EBIT', 13), ('DA', 'D&A', 10),
     ('EBITDA', 'EBITDA', 13), ('NI', 'NI', 13),
     ('Price', 'Price', 12), ('Shares', 'Shares', 15), ('MktCap', 'Mkt Cap', 15),
@@ -1590,6 +1754,19 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
 
                     period_metrics['Market_Cap'] = mkt_100m
 
+                    # 상장 우선주 시가 — 있으면 자기자본가치에 장부(우선주자본금) 대신 쓴다
+                    pref_mkt_100m, pref_info = get_preferred_market_value(ticker, bds, df_krx, sh_meta)
+                    if pref_info and pref_info['problems']:
+                        quality.add(SEV_WARN, ticker, display_name, f'우선주 {tp}',
+                                    '상장 우선주가 있지만 ' + ', '.join(pref_info['problems']) +
+                                    ' — 우선주는 장부(우선주자본금)로 반영했습니다. 시가와 차이를 확인하세요.')
+                    elif pref_mkt_100m > 0:
+                        quality.add(SEV_INFO, ticker, display_name, f'우선주 {tp}',
+                                    '상장 우선주 시가 ' + ', '.join(
+                                        f"{it['name']} {it['close']:,.0f}원×{it['shares']:,}주({it['source']})"
+                                        for it in pref_info['items']) +
+                                    f' = {pref_mkt_100m:,.1f}억원을 자기자본가치에 더했습니다.')
+
                     all_mkt.append({
                         'Company': display_name, 'Ticker': ticker, 'Period': tp,
                         'Price_Date': price_date or bds, 'Close': price,
@@ -1597,6 +1774,11 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                         'Shares_Source': shares_src, 'Shares_RceptNo': sh_meta.get('rcept_no'),
                         'Shares_StlmDt': sh_meta.get('stlm_dt'), 'Shares_Se': sh_meta.get('se'),
                         'DART_Status': sh_meta.get('status'), 'DART_Message': sh_meta.get('message'),
+                        'Pref_Codes': ', '.join(f"{it['code']} {it['name']}" for it in (pref_info or {}).get('items', [])) or None,
+                        'Pref_Close': ', '.join(f"{it['close']:,.0f}" for it in (pref_info or {}).get('items', [])) or None,
+                        'Pref_Shares': sum(it['shares'] for it in (pref_info or {}).get('items', [])) or None,
+                        'Pref_Market_Cap_100M': pref_mkt_100m,
+                        'Pref_Source': ', '.join(sorted({it['source'] for it in (pref_info or {}).get('items', [])})) or None,
                     })
 
                 # 2) BS Fetch (finstate_all: 상세) - CFS 우선 → OFS
@@ -1646,6 +1828,11 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                         quality.add(SEV_ERROR, ticker, display_name, f'재무상태표 {tp}',
                                     f'{year}년 {qtr} 재무상태표를 연결·별도 모두 가져오지 못했습니다. '
                                     f'현금·이자부부채·비지배지분·자본이 0으로 처리됩니다.')
+
+                    # 상장 우선주 시가를 구했으면 장부(우선주자본금) 대신 쓴다 — 엑셀 GPCM 시트도 같은 규칙
+                    if pref_mkt_100m > 0:
+                        period_metrics['Preferred_Book'] = period_metrics['Preferred']
+                        period_metrics['Preferred'] = pref_mkt_100m
 
                 # 3) PL Fetch
                 df_is = None
@@ -1809,8 +1996,9 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                 if market_prices_2y.index.tz is not None:
                     market_prices_2y.index = market_prices_2y.index.tz_localize(None)
 
-                stock_weekly_prices = stock_prices_2y.resample('W-FRI').last().dropna()
-                market_weekly_prices = market_prices_2y.resample('W-FRI').last().dropna()
+                # 기준일이 속한 주까지 정확히 105주(수익률 104개), 날짜는 실제 거래일
+                stock_weekly_prices, market_weekly_prices = weekly_pair_2y(
+                    stock_prices_2y, market_prices_2y, base_date_str)
 
                 if len(stock_weekly_prices) >= MIN_WEEKLY_PTS and len(market_weekly_prices) >= MIN_WEEKLY_PTS:
                     temp_metrics['Stock_Weekly_Prices_2Y'] = stock_weekly_prices
@@ -1890,6 +2078,15 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
         # 한계세율 계산 (사업연도별 한국 법인세율표, 지방소득세 포함)
         tax_rate = get_korean_marginal_tax_rate(pretax_income, fiscal_year)
         comp_data['Tax_Rate'] = tax_rate  # 저장 (나중에 Excel 출력용)
+        if quality is not None and (pretax_income is None or pd.isna(pretax_income) or pretax_income <= 0):
+            # 결손 기업은 한계세율이 성립하지 않아 2구간 세율을 쓴다 — 무부채 베타가 세율에 따라 움직이니 보이게 둔다
+            _pt = 0.0 if pretax_income is None or pd.isna(pretax_income) else float(pretax_income)
+            _why = (f'최근 12개월 세전이익이 {_pt:,.1f}억원(결손)이라' if _pt < 0 else
+                    '최근 12개월 세전이익이 0이거나 수집되지 않아')
+            quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Tax Rate',
+                        f'{_why} 무부채화 세율을 '
+                        f'{tax_rate * 100:.1f}%(2억 초과~200억 구간)로 적용했습니다. '
+                        f'결손 기업은 한계세율이 성립하지 않으니 적용 세율을 확인하세요.')
 
         # Beta 계산 (간단히 수익률 기반)
         stock_monthly_5y = comp_data.get('Stock_Monthly_Prices_5Y')
@@ -2007,6 +2204,13 @@ def calculate_wacc_and_beta(target_code_list, screen_summary_data, target_tax_ra
                     quality.add(SEV_WARN, ticker, comp_data.get('Company', ''), 'Beta',
                                 f'2년 주간 베타 계산이 실패해 평균에서 빠졌습니다: {e}')
 
+        # 시장 설명력 — 배제하지 않고 정보로만 남긴다(gpcm_review 와 같은 기준선)
+        _r2 = comp_data.get('Beta_5Y_R2' if beta_type_input == '5Y' else 'Beta_2Y_R2')
+        if quality is not None and _r2 is not None and _r2 < LOW_R2_INFO:
+            quality.add(SEV_INFO, ticker, comp_data.get('Company', ''), 'Beta',
+                        f'{beta_type_input} 베타의 결정계수가 {_r2:.3f}로 {LOW_R2_INFO} 미만입니다 — '
+                        f'시장 설명력이 낮습니다. 표본에서 빼지 않았으며 판단 재료로만 남깁니다.')
+
     # 평균값 계산
     avg_debt_ratio = np.mean(avg_debt_ratios) if avg_debt_ratios else 0.3
 
@@ -2108,22 +2312,24 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
 
     # Sheet 3: Market_Cap
     ws_mc = wb.create_sheet('Market_Cap')
-    ws_mc.merge_cells('A1:M1'); ws_mc['A1'] = "Market_Cap (Price & Shares)"; sc(ws_mc['A1'], fo=fT)
-    ws_mc.merge_cells('A2:M2'); ws_mc['A2'] = "Logic: 종가(FDR) × 유통주식수(DART) | Unit: 억원"; sc(ws_mc['A2'], fo=fS)
-    cols = [('Company',15), ('Ticker',10), ('Period',10), ('Price_Date',12), ('Close',12),('Shares',16), ('Market_Cap_100M',18),('Shares_Source',12), ('Shares_RcpNo',16), ('Shares_StlmDt',12), ('Shares_Se',10),('DART_Status',10), ('DART_Message',40)]
+    ws_mc.merge_cells('A1:R1'); ws_mc['A1'] = "Market_Cap (Price & Shares)"; sc(ws_mc['A1'], fo=fT)
+    ws_mc.merge_cells('A2:R2'); ws_mc['A2'] = "Logic: 종가(FDR) × 유통주식수(DART) | 상장 우선주: 우선주 종가 × 우선주 유통주식수 → GPCM 시트 우선주 열(없으면 장부 우선주자본금) | Unit: 억원"; sc(ws_mc['A2'], fo=fS)
+    cols = [('Company',15), ('Ticker',10), ('Period',10), ('Price_Date',12), ('Close',12),('Shares',16), ('Market_Cap_100M',18),('Shares_Source',12), ('Shares_RcpNo',16), ('Shares_StlmDt',12), ('Shares_Se',10),('DART_Status',10), ('DART_Message',40),
+            ('Pref_Listed',22), ('Pref_Close',12), ('Pref_Shares',14), ('Pref_Market_Cap_100M',18), ('Pref_Source',22)]
     header_row = 4
     ws_mc.append([]); ws_mc.append([c[0] for c in cols])
     for i, (_, w) in enumerate(cols): ws_mc.column_dimensions[get_column_letter(i+1)].width = w; sc(ws_mc.cell(header_row, i+1), fo=fH, fi=pH, al=aC, bd=BD)
     r = header_row + 1
     if all_mkt:
         for rd in all_mkt:
-            vals = [rd.get('Company'), rd.get('Ticker'), rd.get('Period'), rd.get('Price_Date'), rd.get('Close'),rd.get('Outstanding_Shares'), rd.get('Market_Cap_100M'),rd.get('Shares_Source'), rd.get('Shares_RceptNo'), rd.get('Shares_StlmDt'), rd.get('Shares_Se'),rd.get('DART_Status'), rd.get('DART_Message')]
+            vals = [rd.get('Company'), rd.get('Ticker'), rd.get('Period'), rd.get('Price_Date'), rd.get('Close'),rd.get('Outstanding_Shares'), rd.get('Market_Cap_100M'),rd.get('Shares_Source'), rd.get('Shares_RceptNo'), rd.get('Shares_StlmDt'), rd.get('Shares_Se'),rd.get('DART_Status'), rd.get('DART_Message'),
+                    rd.get('Pref_Codes'), rd.get('Pref_Close'), rd.get('Pref_Shares'), rd.get('Pref_Market_Cap_100M') or 0, rd.get('Pref_Source')]
             for i, v in enumerate(vals):
                 c = ws_mc.cell(r, i+1); c.value = v
-                nf = NP if i==4 else (NI_FMT if i==5 else (NB1 if i==6 else None)); al = aR if i in [4,5,6] else aL
+                nf = NP if i==4 else (NI_FMT if i in (5, 15) else (NB1 if i in (6, 16) else None)); al = aR if i in [4,5,6,14,15,16] else aL
                 sc(c, fo=fA, fi=pW, al=al, nf=nf, bd=BD)
             r += 1
-    ws_mc.auto_filter.ref = f"A{header_row}:M{r-1}"; ws_mc.freeze_panes = f"A{header_row+1}"
+    ws_mc.auto_filter.ref = f"A{header_row}:R{r-1}"; ws_mc.freeze_panes = f"A{header_row+1}"
 
     # Sheet 4: LTM_Calc
     ws_ltm = wb.create_sheet('LTM_Calc')
@@ -2656,7 +2862,10 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
         ws.cell(r, C['NetDebt']).value = f'={L["IBD"]}{r}-{L["Cash"]}{r}-{L["NOA"]}{r}'; sc(ws.cell(r, C['NetDebt']), fo=fFRM, fi=bg, nf=NB, bd=BD)
         ws.cell(r, C['NCI']).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "NCI")'; sc(ws.cell(r, C['NCI']), fo=fLINK, fi=ev_fills['NCI'], nf=NB, bd=BD)
         # 우선주 자본금: 시가총액은 보통주만 반영하므로 자기자본가치에 별도 가산 (EV 구성요소 옆에 둔다)
-        ws.cell(r, C['Pref']).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "Preferred")'; sc(ws.cell(r, C['Pref']), fo=fLINK, fi=ev_fills['Preferred'], nf=NB, bd=BD)
+        # 상장 우선주 시가(Market_Cap!Q)가 있으면 그것, 없으면 장부 우선주자본금(BS_Full)
+        _pm = f'SUMIFS(Market_Cap!Q:Q, Market_Cap!B:B, B{r}, Market_Cap!C:C, C{r})'
+        ws.cell(r, C['Pref']).value = (f'=IF({_pm}>0, {_pm}, '
+                                       f'SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "Preferred"))'); sc(ws.cell(r, C['Pref']), fo=fLINK, fi=ev_fills['Preferred'], nf=NB, bd=BD)
         ws.cell(r, C['Equity']).value = f'=SUMIFS(BS_Full!H:H, BS_Full!B:B, B{r}, BS_Full!C:C, C{r}, BS_Full!G:G, "Equity_Total")'; sc(ws.cell(r, C['Equity']), fo=fLINK, fi=ev_fills['Equity'], nf=NB, bd=BD)
         ws.cell(r, C['EV']).value = f'={L["MktCap"]}{r}+{L["Pref"]}{r}+{L["IBD"]}{r}-{L["Cash"]}{r}+{L["NCI"]}{r}-{L["NOA"]}{r}'; sc(ws.cell(r, C['EV']), fo=fFRM, fi=bg, nf=NB, bd=BD)
         ws.cell(r, C['Revenue']).value = f'=SUMIFS(LTM_Calc!H:H, LTM_Calc!B:B, B{r}, LTM_Calc!C:C, C{r}, LTM_Calc!D:D, "Revenue")'; sc(ws.cell(r, C['Revenue']), fo=fLINK, fi=ev_fills['PL_HL'], nf=NB, bd=BD)
@@ -3206,12 +3415,12 @@ if ui_mode == "GPCM Valuation (기존)":
         '• PL: 요약 손익계산서에서 매출액/영업이익/당기순이익 3개 계정만 엄격 추출',
         '• PL Fetch: finstate(요약) → finstate_all(CFS/OFS) fallback',
         '• Shares: DART(stockTotqySttus) 유통주식수(distb_stock_co) 우선, 미공시 시 DART 과거보고서 fallback',
-        '• EV = Market Cap + 우선주(장부) + IBD − Cash + NCI − NOA',
+        '• EV = Market Cap + 우선주(상장 우선주는 시가, 아니면 장부) + IBD − Cash + NCI − NOA',
         '• Net Debt = IBD − Cash − NOA',
         '• IBD(Option): CB/EB/BW 등 메자닌은 기본적으로 IBD(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
         '• NOA(Option): 투자자산/관계기업 등은 기본적으로 NOA(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
         '• LTM = Current Cumulative + Prior Annual − Prior Same Quarter Cumulative (단, 4Q는 Annual)',
-        '• Beta: 5년 월간 & 2년 주간 수익률 기준 (FinanceDataReader 사용)',
+        '• Beta: 5년 월간(수익률 60개) & 2년 주간 기준 (FinanceDataReader 사용). 2년 주간은 기준일이 속한 주까지 105주(수익률 104개), 각 주 마지막 공통 거래일 종가 — 마지막 날짜는 기준일 또는 그 직전 거래일',
         f'• MRP: 한국공인회계사회 시장위험 프리미엄 가이던스 ({CPA_GUIDANCE_DATE}) {MRP_GUIDANCE[0]*100:.0f}~{MRP_GUIDANCE[1]*100:.0f}% 범위 내 선택',
         f'• Size Premium: 한국공인회계사회 기업규모위험 프리미엄 연구결과 ({CPA_GUIDANCE_DATE}) 시가총액 분위 기준',
         '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1 (조정을 Unlevered 계산 前에 적용)',
@@ -3220,7 +3429,7 @@ if ui_mode == "GPCM Valuation (기존)":
         '• Beta 평균 대상: 조정베타가 0 초과인 회사 (GPCM 시트 Mean 행과 동일 모집단)',
         '• D/E Ratio = IBD / (Market Cap + 우선주 + NCI)',
         '• Debt Ratio (D/V) = IBD / (Market Cap + 우선주 + IBD + NCI)',
-        '• 우선주: BS의 우선주자본금(액면) 기준. 시가총액은 보통주만 반영하므로 자기자본가치에 가산',
+        '• 우선주: 상장 우선주가 있으면 기준일 종가 × 우선주 유통주식수(Market_Cap 시트 Pref 열), 없으면 BS 우선주자본금(액면). 시가총액은 보통주만 반영하므로 자기자본가치에 가산',
         '• Unlevered Beta = Levered Beta / (1 + (1 - Tax Rate) × D/E Ratio)',
         '• Tax Rate: 한국 법인세 한계세율 (지방소득세 포함, 세전순이익 기준, 사업연도별 세율표 적용)',
         '   - FY2023~2025: 2억 이하 9.9% | 2~200억 20.9% | 200~3,000억 23.1% | 3,000억 초과 26.4%',

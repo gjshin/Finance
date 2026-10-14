@@ -109,12 +109,12 @@ _NOTES_STATIC = [
     '• PL: 요약 손익계산서에서 매출액/영업이익/당기순이익 3개 계정만 엄격 추출',
     '• PL Fetch: finstate(요약) → finstate_all(CFS/OFS) fallback',
     '• Shares: DART(stockTotqySttus) 유통주식수(distb_stock_co) 우선, 미공시 시 DART 과거보고서 fallback',
-    '• EV = Market Cap + 우선주(장부) + IBD − Cash + NCI − NOA',
+    '• EV = Market Cap + 우선주(상장 우선주는 시가, 아니면 장부) + IBD − Cash + NCI − NOA',
     '• Net Debt = IBD − Cash − NOA',
     '• IBD(Option): CB/EB/BW 등 메자닌은 기본적으로 IBD(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
     '• NOA(Option): 투자자산/관계기업 등은 기본적으로 NOA(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
     '• LTM = Current Cumulative + Prior Annual − Prior Same Quarter Cumulative (단, 4Q는 Annual)',
-    '• Beta: 5년 월간 & 2년 주간 수익률 기준 (FinanceDataReader 사용)',
+    '• Beta: 5년 월간(수익률 60개) & 2년 주간 기준 (FinanceDataReader 사용). 2년 주간은 기준일이 속한 주까지 105주(수익률 104개), 각 주 마지막 공통 거래일 종가 — 마지막 날짜는 기준일 또는 그 직전 거래일',
     '• MRP: 한국공인회계사회 시장위험 프리미엄 가이던스 (2026.06.05) 7~9% 범위 내 선택',
     '• Size Premium: 한국공인회계사회 기업규모위험 프리미엄 연구결과 (2026.06.05) 시가총액 분위 기준',
     '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1 (조정을 Unlevered 계산 前에 적용)',
@@ -122,7 +122,7 @@ _NOTES_STATIC = [
     '• Beta 평균 대상: 조정베타가 0 초과인 회사 (엑셀 GPCM 시트 Mean 행과 동일 모집단)',
     '• D/E Ratio = IBD / (Market Cap + 우선주 + NCI)',
     '• Debt Ratio (D/V) = IBD / (Market Cap + 우선주 + IBD + NCI)',
-    '• 우선주: BS의 우선주자본금(액면) 기준. 시가총액은 보통주만 반영하므로 자기자본가치에 가산',
+    '• 우선주: 상장 우선주가 있으면 기준일 종가 × 우선주 유통주식수(Market_Cap 시트 Pref 열), 없으면 BS 우선주자본금(액면). 시가총액은 보통주만 반영하므로 자기자본가치에 가산',
     '• Unlevered Beta = Levered Beta / (1 + (1 - Tax Rate) × D/E Ratio)',
     '• Tax Rate: 한국 법인세 한계세율 (지방소득세 포함, 세전순이익 기준, 사업연도별 세율표 적용)',
     '   - FY2023~2025: 2억 이하 9.9% | 2~200억 20.9% | 200~3,000억 23.1% | 3,000억 초과 26.4%',
@@ -420,7 +420,9 @@ def run_gpcm(
         tax_rate: 타겟 법인세율 %. **비우면 자동** — 피평가회사의 세전이익(LTM)을
             사업연도 한계세율표(지방소득세 포함)에 넣어 정한다. 한국 법인 전제.
             직접 넣으면 그 값을 쓰고, 자동 산출은 하지 않는다.
-        target_ticker: 세율을 정할 피평가회사 종목코드. 비우면 tickers 의 첫 번째.
+        target_ticker: 피평가회사 종목코드(세율 기준). 비우면 tickers 의 첫 번째.
+            상장 피평가회사는 **반드시 tickers 에 포함**한다 — 베타 표본은 피평가회사 포함이
+            원칙이고, 빠져 있으면 실행하지 않는다.
         beta_type: WACC 에 쓸 베타. "5Y"(5년 월간) 또는 "2Y"(2년 주간).
         daily_prices: 일별 종가를 담을 Price_Daily 시트 구간. "off"·"1Y"·"2Y"·"3Y"·"5Y".
             기본 "5Y". 베타에 쓴 시계열을 그대로 자르는 것이라 조회가 새로 늘지 않는다.
@@ -459,7 +461,7 @@ def run_gpcm(
     if target not in codes:
         raise RuntimeError(
             f"target_ticker({target})가 tickers 안에 없습니다. "
-            "피평가회사도 목록에 넣어야 세율을 그 회사 기준으로 정합니다.")
+            "피평가회사는 베타 표본에 반드시 포함합니다 — tickers 에 넣고 다시 실행하세요.")
 
     periods = _build_periods(start_period, end_period)
 
@@ -736,27 +738,66 @@ def gpcm_review(job_id: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
-def list_krx_companies(query: str = "", december_only: bool = False) -> dict[str, Any]:
-    """오늘 상장돼 있는 회사 명단을 KRX 에서 직접 받아 업종·주요제품과 함께 준다.
+def list_krx_companies(query: str = "", december_only: bool = False,
+                       as_of: str = "", save: bool = False) -> dict[str, Any]:
+    """상장회사 명단을 업종·주요제품과 함께 준다 — 비교기업 모집단의 원본.
 
-    이 PC 에서 KRX 에 바로 물어보므로 **상장폐지가 반영된 진짜 오늘 명단**이다.
-    dcfpeer 의 peergroup_get_population_latest 가 KRX 403 으로 폴백 중일 때
-    이 도구를 대신 쓴다. 역할 구분: **모집단 명단은 여기(실시간)**, 분기말 스냅샷
-    재현성·사업내용 요약은 dcfpeer, 재무·공시는 mydart.
+    출처는 거래소 상장법인목록과 같은 내용의 사본이다(FinanceDataReader 가 날마다
+    GitHub 에 올려두는 파일). 공식 거래소 원본이 아니므로 조서에는 meta.source(주소·파일
+    날짜)를 남기고, 사용자가 거래소에서 직접 받은 상장법인목록이 있으면 그것과 대사한다.
 
-    재현되지 않는다 — 조서에 쓸 때는 조회일과 목록 자체를 기록한다.
+    역할 구분: **모집단 명단은 여기**, 분기말 스냅샷 재현 해시는 dcfpeer(대사용),
+    재무·공시는 mydart. dcfpeer 의 업종 이름표는 코드와 어긋나 있으니 업종명은 여기 것을 쓴다.
 
     Args:
-        query: 업종명·주요제품·회사명에 부분일치하는 검색어 (예: "반도체", "이차전지").
+        query: 업종명·주요제품·회사명에 부분일치하는 검색어 (예: "식품 제조", "라면").
             **비워서 부르면 업종별 종목수 집계만** 돌려준다 — 무엇으로 좁힐지 고르는 용도.
         december_only: True면 12월 결산 회사만 (결산월이 다르면 비교기간이 어긋난다).
+        as_of: 평가기준일. "2026-06-30" · "20260630" · "2026.2Q" 모두 된다. 주면 **그날 당시
+            명단**(사본은 2026년 1분기부터)을 받는다 — 그 뒤 상장폐지·신규상장 보정이 필요 없다.
+            휴장일이면 직전 거래일 파일. 비우면 오늘 명단.
+        save: True면 받은 명단 **전체**를 엑셀로 문서 > GPCM 폴더에 저장하고 경로를 돌려준다
+            (선정조서 Raw_상장법인목록 원본). query 와 무관하게 전체를 저장한다.
     """
-    df = _roster()
+    M = _load()
+    src: dict[str, Any] = {}
+    if (as_of or "").strip():
+        a = as_of.strip()
+        if _PERIOD_RE.match(a):
+            y, q = _parse_period(a)
+            a = M.get_base_date_str(y, q)
+        elif re.fullmatch(r"\d{8}", a):
+            a = f"{a[:4]}-{a[4:6]}-{a[6:]}"
+        df, used, url = M.get_krx_listing_as_of(a)
+        if df is None:
+            raise RuntimeError(
+                f"{a} 당시 명단 사본을 찾지 못했습니다(사본은 2026년 1분기부터, 마지막 시도: {url}). "
+                "사용자에게 거래소(KIND) 상장법인목록을 직접 받아 첨부해 달라고 요청하세요.")
+        src = {"basis": f"{used} 당시 상장법인목록 사본", "fileDate": used, "url": url,
+               "asOfRequested": a}
+    else:
+        df = _roster()
+        src = {"basis": "오늘 기준 상장법인목록 사본 — 재현되지 않는다. 조회일과 목록을 기록할 것",
+               "fileDate": datetime.now().strftime("%Y-%m-%d"),
+               "url": "FinanceDataReader StockListing('KRX-DESC')"}
+
     meta: dict[str, Any] = {
         "retrievedAt": datetime.now().strftime("%Y-%m-%d"),
         "listedUniverse": int(len(df)),
-        "basis": "오늘 기준 KRX 상장회사목록 — 재현되지 않는다. 조회일과 목록을 기록할 것",
+        "byMarket": {str(k): int(v) for k, v in df["Market"].value_counts().items()} if "Market" in df.columns else {},
+        "source": src,
     }
+
+    if save:
+        cols = {"Code": "종목코드", "Name": "회사명", "Market": "시장", "Sector": "업종",
+                "Industry": "주요제품", "ListingDate": "상장일", "SettleMonth": "결산월", "Dept": "소속부"}
+        out = df[[c for c in cols if c in df.columns]].rename(columns=cols).sort_values("종목코드")
+        out["조회일"] = meta["retrievedAt"]
+        out["출처"] = src.get("url")
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        path = OUTPUT_DIR / f"상장법인목록_{src.get('fileDate')}.xlsx"
+        out.to_excel(path, index=False)
+        meta["savedFile"] = str(path)
 
     if december_only:
         df = df[df["SettleMonth"].astype(str).str.contains("12", na=False)]
@@ -782,17 +823,20 @@ def list_krx_companies(query: str = "", december_only: bool = False) -> dict[str
     if len(sub) > MAX_COMPANIES:
         raise RuntimeError(
             f'"{q}" 매칭이 {len(sub)}개입니다(상한 {MAX_COMPANIES}). '
-            "업종명을 더 구체적으로 넣거나 december_only 로 좁히세요.")
+            "업종명을 더 구체적으로 넣거나, save=True 로 전체를 파일로 받아 거르세요.")
 
     companies = []
     for _, r in sub.iterrows():
         settle = str(r.get("SettleMonth") or "").strip()
+        ld = r.get("ListingDate")
         companies.append({
             "code": str(r.get("Code") or "").zfill(6),
             "name": str(r.get("Name") or ""),
             "market": str(r.get("Market") or ""),
             "sector": str(r.get("Sector") or ""),
             "product": str(r.get("Industry") or "").strip(),
+            "dept": "" if str(r.get("Dept")) in ("None", "nan", "NaN", "") else str(r.get("Dept")),
+            "listedDate": str(ld)[:10] if ld is not None and str(ld) not in ("", "NaT", "nan") else "",
             "settleMonth": settle,
             "fiscalMonthNot12": bool(settle) and "12" not in settle,
         })
