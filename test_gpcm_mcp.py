@@ -342,6 +342,20 @@ check('기간 표기(2026.2Q)도 받는다',
       W.check_trading_gaps(['000001'], as_of='2024.2Q')['meta']['windowEnd'] == '2024-06-30')
 check('YYYYMMDD 도 받는다',
       W.check_trading_gaps(['000001'], as_of=_asof.strftime('%Y%m%d'))['meta']['windowEnd'] == _asof.strftime('%Y-%m-%d'))
+# 창 시작일 당일 시세가 있고 바로 다음 5거래일이 비면 — 시작일을 빠뜨리면 상장 전으로 오인한다
+_d2 = pd.bdate_range('2023-01-02', '2024-06-28')
+_ws = (pd.Timestamp('2024-06-28') - pd.Timedelta(days=365 + 20)).normalize()   # years=1 창 시작일
+_gap = [d for d in _d2 if d > _ws][:5]
+class FakeFdrEdge:
+    def DataReader(self, symbol, start=None, end=None):
+        if symbol == 'KS11':   return _px(_d2)
+        return _px(_d2.difference(pd.DatetimeIndex(_gap)))
+M.fdr = FakeFdrEdge()
+_g3 = W.check_trading_gaps(['000008'], years=1, as_of='2024-06-28')['results'][0]
+check('창 시작일 바로 뒤 결측도 잡는다 (시작일 당일 시세를 빠뜨리지 않음)',
+      _ws in _d2 and _g3['flag'] and _g3['observedFrom'] == _ws.strftime('%Y-%m-%d')
+      and _g3['suspectedHalts'][0]['tradingDays'] == 5, (_ws, _g3))
+M.fdr = FakeFdrAsOf()
 check('평가기준일 기준이라고 밝힌다', '평가기준일' in g2['meta']['windowBasis'] and '아니다' not in g2['meta']['windowBasis'], g2['meta'])
 
 # --- 8. 시장금리 조회 (WACC 입력값의 근거) -------------------------------------

@@ -903,7 +903,7 @@ def check_trading_gaps(tickers: list[str], years: int = 5, as_of: str = "") -> d
     market = m.fdr.DataReader("KS11", start, end)
     if market is None or market.empty:
         raise RuntimeError("KOSPI 지수 시계열을 받지 못해 거래일 기준을 만들 수 없습니다.")
-    lo, hi = pd_ts(start), pd_ts(end)
+    lo, hi = pd_ts(start).normalize(), pd_ts(end)  # 시작일은 그날 0시부터 — 일별 지수는 자정 날짜라 경계일 시세가 빠지지 않게
     # 데이터 원천이 창 밖 날짜를 덧붙여 줘도 창 안만 본다 (기준일 뒤 구간이 섞이지 않게)
     market_days = sorted(d.normalize() for d in market.index if lo <= d <= hi)
 
