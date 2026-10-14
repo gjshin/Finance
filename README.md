@@ -164,7 +164,7 @@ run_gpcm으로 005930, 000660, 042700 돌려줘. 기간은 2025.4Q
 - 도구 7개:
   - `run_gpcm`(실행) · `gpcm_status`(진행·결과) · `gpcm_review`(배수 이상치·베타 신뢰도 검토)
   - `get_wacc_inputs`(기준일 국고채·회사채 금리를 출처와 함께)
-  - `gpcm_doctor`(버전·인증키·연결 한 번에 점검) · `check_trading_gaps`(거래정지 흔적)
+  - `gpcm_doctor`(버전·인증키·연결 한 번에 점검) · `check_trading_gaps`(거래정지 흔적 — `as_of` 에 평가기준일을 넣으면 베타 관측 구간과 같은 창)
   - `list_krx_companies`(오늘
   상장사 명단 — 업종·주요제품 포함. 이 PC에서 KRX에 직접 물어 상장폐지가 반영된다).
 - 실행은 백그라운드로 돌고, 진행·결과는 Claude가 `gpcm_status`로 확인해 알려준다.

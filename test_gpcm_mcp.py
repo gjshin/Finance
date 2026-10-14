@@ -328,6 +328,47 @@ check('늦은 상장은 정지로 오인하지 않는다', by['000003']['flag'] 
 check('최근 결측은 현재 정지 중으로 표시', by['000004']['currentlySuspended'] is True, by['000004'])
 check('조회 실패는 failed 로 드러난다', g.get('failed') == ['000005'], g.get('failed'))
 check('자동 배제 금지 안내가 실린다', '자동 배제' in g['meta']['note'])
+check('as_of 없이 부르면 오늘 기준이라고 밝힌다', '평가기준일이 아니다' in g['meta']['windowBasis'], g['meta'])
+
+# 평가기준일 창: 기준일에서 끝나고, 원천이 기준일 뒤 날짜를 덧붙여도 창 안만 본다
+_asof = days[69]                       # 70번째 거래일을 평가기준일로
+_seen_end = {}
+class FakeFdrAsOf(FakeFdr):
+    def DataReader(self, symbol, start=None, end=None):
+        _seen_end[symbol] = end
+        if symbol == '000006':               return _px(days[:75].append(days[85:]))   # 기준일 뒤 10거래일 결측
+        if symbol == '000007':               return _px(days[:62])                     # 기준일 직전 8거래일 결측(그 뒤 재개 전)
+        return super().DataReader(symbol, start, end)
+
+M.fdr = FakeFdrAsOf()
+g2 = W.check_trading_gaps(['000002', '000006', '000007'], as_of=_asof.strftime('%Y-%m-%d'))
+by2 = {x['code']: x for x in g2['results']}
+check('창 끝 = 평가기준일', g2['meta']['windowEnd'] == _asof.strftime('%Y-%m-%d'), g2['meta'])
+check('원천 조회도 평가기준일까지만 요청', _seen_end.get('KS11') is not None
+      and _seen_end['KS11'].strftime('%Y-%m-%d') == _asof.strftime('%Y-%m-%d'), _seen_end.get('KS11'))
+check('창 안 결측은 그대로 잡는다', by2['000002']['flag'] and by2['000002']['suspectedHalts'][0]['tradingDays'] == 10, by2['000002'])
+check('기준일 뒤 결측은 잡지 않는다', by2['000006']['flag'] is False, by2['000006'])
+check('기준일까지 이어진 결측은 기준일 당시 정지로 표시',
+      by2['000007']['currentlySuspended'] is True and by2['000007']['suspectedHalts'][-1]['tradingDays'] == 8, by2['000007'])
+check('기간 표기(2026.2Q)도 받는다',
+      W.check_trading_gaps(['000001'], as_of='2024.2Q')['meta']['windowEnd'] == '2024-06-30')
+check('YYYYMMDD 도 받는다',
+      W.check_trading_gaps(['000001'], as_of=_asof.strftime('%Y%m%d'))['meta']['windowEnd'] == _asof.strftime('%Y-%m-%d'))
+# 창 시작일 당일 시세가 있고 바로 다음 5거래일이 비면 — 시작일을 빠뜨리면 상장 전으로 오인한다
+_d2 = pd.bdate_range('2023-01-02', '2024-06-28')
+_ws = (pd.Timestamp('2024-06-28') - pd.Timedelta(days=365 + 20)).normalize()   # years=1 창 시작일
+_gap = [d for d in _d2 if d > _ws][:5]
+class FakeFdrEdge:
+    def DataReader(self, symbol, start=None, end=None):
+        if symbol == 'KS11':   return _px(_d2)
+        return _px(_d2.difference(pd.DatetimeIndex(_gap)))
+M.fdr = FakeFdrEdge()
+_g3 = W.check_trading_gaps(['000008'], years=1, as_of='2024-06-28')['results'][0]
+check('창 시작일 바로 뒤 결측도 잡는다 (시작일 당일 시세를 빠뜨리지 않음)',
+      _ws in _d2 and _g3['flag'] and _g3['observedFrom'] == _ws.strftime('%Y-%m-%d')
+      and _g3['suspectedHalts'][0]['tradingDays'] == 5, (_ws, _g3))
+M.fdr = FakeFdrAsOf()
+check('평가기준일 기준이라고 밝힌다', '평가기준일' in g2['meta']['windowBasis'] and '아니다' not in g2['meta']['windowBasis'], g2['meta'])
 
 # --- 8. 시장금리 조회 (WACC 입력값의 근거) -------------------------------------
 class FakeRateFdr:
