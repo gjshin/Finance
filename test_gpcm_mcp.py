@@ -1,3 +1,4 @@
+import re
 """gpcm_mcp.py 회귀 테스트 — Streamlit 없이 MCP 도구 경로를 검증한다.
 
 이 환경은 DART·KRX가 차단돼 있어 test_gpcm_kr_quality.py 와 같은 스텁 패턴을 쓴다:
@@ -263,6 +264,9 @@ W._roster_memo.update(at=0.0, df=None)
 
 # --- 7-b. 기준일 당시 명단 · 전체 저장 (0.8.5) ------------------------------------
 _AS = IND.copy(); _AS['Dept'] = None; _AS['ListingDate'] = '2000-01-01'
+_AS = pd.concat([_AS, pd.DataFrame([{'Code': '222225', 'Name': '농심우', 'Market': 'KOSPI', 'Sector': None,
+                                      'Industry': None, 'SettleMonth': None, 'Dept': None, 'ListingDate': None}])],
+                ignore_index=True)   # 사본에는 우선주 등 종목 행(업종 없음)도 있다
 _seen = {}
 def _fake_asof(a, max_back_days=10):
     _seen['as_of'] = a
@@ -283,6 +287,14 @@ try:
     _x = pd.read_excel(_f, dtype={'종목코드': str})
     check('저장 파일은 query 와 무관하게 전체 + 업종·주요제품·출처 열',
           len(_x) == len(_AS) and {'업종', '주요제품', '조회일', '출처'} <= set(_x.columns), list(_x.columns))
+    check('저장 파일에 종류 열(회사 / 우선주 등 종목)',
+          dict(zip(_x['종목코드'], _x['종류'])).get('222225') == '우선주 등 종목(업종 없음)'
+          and (_x['종류'] == '회사').sum() == 4, _x[['종목코드', '종류']].values.tolist())
+    check('회사 수는 우선주 등 종목 행을 뺀다',
+          r['meta']['listedUniverse'] == 4 and r['meta']['issueRowsExcluded'] == 1
+          and r['meta']['byMarket'] == {'KOSPI': 3, 'KOSDAQ': 1} and r['meta']['stage0Companies'] == 4, r['meta'])
+    r2 = W.list_krx_companies('농심', as_of='2026-06-30')
+    check('검색 결과에도 우선주 등 종목 행은 나오지 않는다', [c['code'] for c in r2['companies']] == ['222222'], r2['companies'])
     M.get_krx_listing_as_of = lambda a, max_back_days=10: (None, None, 'https://example/missing.csv')
     expect_error('사본이 없으면 직접 받은 상장법인목록을 요청하라고 알린다',
                  lambda: W.list_krx_companies('라면', as_of='2025-06-30'), '상장법인목록')
@@ -692,6 +704,11 @@ check('세율이 그 해 세율표와 일치',
       basis and abs(basis['rate_pct'] / 100 -
                     M.get_korean_marginal_tax_rate(basis['pretaxIncome100M'], 2024)) < 1e-9, basis)
 dq_msgs = ' '.join(r['Message'] for r in W._jobs[r5['job_id']].get('quality_rows', []))
+_dq5 = load_workbook(s5['file'])['Data_Quality']
+_tax_msg = [str(_dq5.cell(rr, 5).value) for rr in range(5, _dq5.max_row + 1)
+            if _dq5.cell(rr, 4).value == 'Tax Rate' and '타겟 법인세율' in str(_dq5.cell(rr, 5).value)]
+check('세율 설명의 세전이익은 소수 첫째 자리·천 단위 쉼표로 적는다',
+      _tax_msg and re.search(r'세전이익 -?[\d,]+\.\d억원', _tax_msg[0]) is not None, _tax_msg)
 
 # 직접 지정하면 그 값을 쓴다 (자동 산출하지 않는다)
 r6 = W.run_gpcm(['005930'], '2024.1Q', tax_rate=22.0)

@@ -323,7 +323,7 @@ try:
                                             df_asof=_krx_asof_multi, asof_date='2026-06-30')
     chk('여러 종류면 기준일 명단의 종류별 상장주식수를 쓴다',
         [it['shares'] for it in _i6['items'] if it['code'] == '005385'] == [11]
-        and all('기준일 명단' in it['source'] for it in _i6['items']), _i6)
+        and all(it['source'] == 'KRX 상장주식수' for it in _i6['items']) and _i6['roster'] == '기준일 명단(2026-06-30)', _i6)
 finally:
     M.get_stock_price = _orig_price
 _src = open(Path(__file__).resolve().parent / 'gpcm_kr.py', encoding='utf-8').read()

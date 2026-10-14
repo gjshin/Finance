@@ -937,7 +937,7 @@ def get_preferred_market_value(ticker: str, bds: str, df_krx: pd.DataFrame, sh_m
         else:
             row = roster[roster['Code'].astype(str) == code]
             shares = _to_int(row.iloc[0].get('Stocks')) if not row.empty and 'Stocks' in row.columns else None
-            src = f'KRX 상장주식수({roster_label})'
+            src = 'KRX 상장주식수'
         if price is None or not shares:
             problems.append(f"{name}({code}) " + ('종가' if price is None else '주식수') + ' 조회 실패')
             continue
@@ -3633,7 +3633,7 @@ if run_btn:
                     quality.add(SEV_INFO, target_code_list[0],
                                 (t_row or {}).get('Company', ''), 'Tax Rate',
                                 f'타겟 법인세율을 세전이익 '
-                                f'{"미상" if t_pretax is None else round(float(t_pretax), 1)}억원과 '
+                                f'{"미상" if t_pretax is None else format(float(t_pretax), ",.1f")}억원과 '
                                 f'FY{base_year} 한계세율표로 {tax_rate_used*100:.2f}% 로 정했습니다 '
                                 f'(한국 법인 전제, 지방소득세 포함).')
 
