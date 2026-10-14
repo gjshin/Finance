@@ -136,8 +136,11 @@ def weekly_pair_2y(stock_daily, market_daily, base_date_str, n_returns=FULL_WEEK
     마지막 주가 기준일 뒤 금요일(예: 2026-07-03)로 찍혀 기준일 이후 자료처럼 보였다.
     - 종목과 지수가 함께 거래된 날만 남긴 뒤(inner join) 주마다 마지막 거래일 종가를 쓴다.
       날짜도 그 실제 거래일이라 마지막 주는 기준일(또는 그 직전 거래일)로 찍힌다.
-    - 창은 달력 기준으로 고정한다: 기준일이 속한 주와 그 앞 n_returns 주. 그 사이
-      거래정지 주가 있으면 관측치가 줄어든다 — 창을 늘려 메우지 않는다(경고는 호출부).
+    - 창은 달력 기준으로 고정한다: 기준일 이전 **지수의 마지막 거래일**이 속한 주와 그 앞
+      n_returns 주. 기준일이 주말·휴장일이면(예: 2024-03-31 일요일) 기준일 자체는 다음 주
+      (토~금)에 속해 그대로 쓰면 한 주가 비고 수익률이 103개가 된다 — 그래서 지수 거래일로 맞춘다.
+      종목이 아니라 지수로 맞추는 이유: 종목이 기준일 직전 거래정지면 창이 뒤로 밀리면 안 된다.
+      그 사이 거래정지 주가 있으면 관측치가 줄어든다 — 창을 늘려 메우지 않는다(경고는 호출부).
     """
     empty = pd.Series(dtype=float)
     if stock_daily is None or market_daily is None or len(stock_daily) == 0 or len(market_daily) == 0:
@@ -157,7 +160,10 @@ def weekly_pair_2y(stock_daily, market_daily, base_date_str, n_returns=FULL_WEEK
     weeks = df.index.to_period('W-FRI')
     last = df.groupby(weeks).tail(1)
     lw = last.index.to_period('W-FRI')
-    base_wk = base_dt.to_period('W-FRI')
+    m_days = m.dropna().index
+    m_days = m_days[m_days <= base_dt]
+    anchor = m_days.max() if len(m_days) else df.index.max()
+    base_wk = anchor.to_period('W-FRI')
     last = last[(lw >= base_wk - n_returns) & (lw <= base_wk)]
     return last['s'], last['m']
 
@@ -688,6 +694,42 @@ def normalize_krx_desc(df):
     return df
 
 
+KRX_PRICE_CACHE_URL = ('https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/'
+                       'refs/heads/master/data/listing/krx/{date}.csv')
+
+
+def _read_dated_cache(url_tmpl, as_of, max_back_days=10):
+    """날짜별 사본 파일을 기준일부터 거꾸로 찾아 처음 있는 것을 읽는다. (원본 표, 날짜, 주소)."""
+    base = pd.to_datetime(as_of)
+    url = None
+    for back in range(max_back_days + 1):
+        d = (base - timedelta(days=back)).strftime('%Y-%m-%d')
+        url = url_tmpl.format(date=d)
+        try:
+            r = requests.get(url, timeout=20)
+            if r.status_code != 200 or len(r.content) < 1000:
+                continue
+            df = pd.read_csv(io.StringIO(r.content.decode('utf-8-sig')), index_col=0, dtype={'Code': str})
+            return df.reset_index(drop=True), d, url
+        except Exception:
+            continue
+    return None, None, url
+
+
+def get_krx_price_listing_as_of(as_of, max_back_days=10):
+    """평가기준일 당시 종목 시세 명단(우선주 종목 포함, 종가·상장주식수) 사본을 받는다.
+
+    상장법인목록(회사 단위)과 달리 종목 단위라 우선주가 따로 한 줄씩 있다. 과거 기준일에
+    오늘 명단으로 우선주를 찾으면 그 사이 상장폐지된 우선주를 놓치므로 이것을 먼저 쓴다.
+    사본은 2026년 1분기부터 있다. 반환: (DataFrame, 파일 날짜, 주소) — 없으면 (None, None, 주소).
+    """
+    df, d, url = _read_dated_cache(KRX_PRICE_CACHE_URL, as_of, max_back_days)
+    if df is None or df.empty or 'Code' not in df.columns or 'Name' not in df.columns:
+        return None, None, url
+    df['Code'] = df['Code'].astype(str).str.zfill(6)
+    return df, d, url
+
+
 def get_krx_listing_as_of(as_of, max_back_days=10):
     """평가기준일 당시의 상장법인목록(업종·주요제품 포함) 사본을 받는다.
 
@@ -696,22 +738,13 @@ def get_krx_listing_as_of(as_of, max_back_days=10):
     반환: (DataFrame, 사용한 파일 날짜 'YYYY-MM-DD', 주소). 없으면 (None, None, 마지막 시도 주소).
     공식 거래소 원본이 아니라 라이브러리 제작자가 올린 사본이다 — 조서에 주소와 날짜를 남길 것.
     """
-    base = pd.to_datetime(as_of)
-    url = None
-    for back in range(max_back_days + 1):
-        d = (base - timedelta(days=back)).strftime('%Y-%m-%d')
-        url = KRX_DESC_CACHE_URL.format(date=d)
-        try:
-            r = requests.get(url, timeout=20)
-            if r.status_code != 200 or len(r.content) < 1000:
-                continue
-            df = pd.read_csv(io.StringIO(r.content.decode('utf-8')), index_col=0, dtype={'Code': str})
-            df = normalize_krx_desc(df.reset_index(drop=True))
-            if df is not None and not df.empty:
-                return df, d, url
-        except Exception:
-            continue
-    return None, None, url
+    df, d, url = _read_dated_cache(KRX_DESC_CACHE_URL, as_of, max_back_days)
+    if df is None:
+        return None, None, url
+    df = normalize_krx_desc(df)
+    if df is None or df.empty:
+        return None, None, url
+    return df, d, url
 
 
 def peer_candidate_rows(df_ind, sector: str):
@@ -869,31 +902,42 @@ def _fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code
         meta['message'] = str(e)
         return None, meta
 
-def get_preferred_market_value(ticker: str, bds: str, df_krx: pd.DataFrame, sh_meta: dict | None):
+def get_preferred_market_value(ticker: str, bds: str, df_krx: pd.DataFrame, sh_meta: dict | None,
+                               df_asof: pd.DataFrame | None = None, asof_date: str | None = None):
     """상장 우선주 시가총액(억원)과 근거.
 
     공시 재무상태표는 자본금을 합계 한 줄로만 주는 경우가 많아(예: 대상·크라운제과)
     '우선주자본금' 계정으로는 우선주가 0으로 잡혔다. 상장 우선주가 있으면 기준일 종가 ×
     유통주식수로 시가를 구해 자기자본가치에 더한다.
+    - 우선주 찾기: 기준일 당시 종목 명단(df_asof)이 있으면 그것으로, 없으면 조회일 명단(df_krx)으로.
+      조회일 명단은 기준일 뒤 상장폐지된 우선주를 못 찾으므로 근거에 어느 명단인지 남긴다.
     - 주식수: 우선주 종류가 하나면 보통주와 같은 DART 보고서의 우선주 유통주식수,
-      여러 종류면 DART 가 합계만 주므로 KRX 목록의 종류별 상장주식수(조회일 기준).
+      여러 종류면 DART 가 합계만 주므로 명단의 종류별 상장주식수.
     - 한 종류라도 종가·주식수를 못 구하면 0을 돌려 장부(우선주자본금)로 되돌아가게 한다 —
       일부만 더한 값은 그럴듯하게 틀린다.
-    반환: (억원, 근거 dict 또는 None). 상장 우선주가 없으면 (0.0, None).
+    반환: (억원, 근거 dict 또는 None).
+      상장 우선주가 없고 DART 우선주도 없으면 (0.0, None).
+      DART 에 우선주가 있는데 명단에 상장 우선주가 없으면 (0.0, {'unlisted_pref_shares': n, ...}).
     """
-    prefs = find_listed_preferred(ticker, df_krx)
-    if not prefs:
-        return 0.0, None
+    use_asof = df_asof is not None and not df_asof.empty
+    roster = df_asof if use_asof else df_krx
+    roster_label = f'기준일 명단({asof_date})' if use_asof else '조회일 명단(기준일 명단 없음)'
+    prefs = find_listed_preferred(ticker, roster)
     dart_pref = (sh_meta or {}).get('pref_shares')
+    if not prefs:
+        if dart_pref:
+            return 0.0, {'items': [], 'problems': [], 'unlisted_pref_shares': dart_pref,
+                         'roster': roster_label, 'asof_roster': use_asof}
+        return 0.0, None
     items, problems, total = [], [], 0.0
     for code, name in prefs:
         price, pdate = get_stock_price(code, bds)
         if len(prefs) == 1 and dart_pref:
             shares, src = dart_pref, 'DART 우선주 유통주식수'
         else:
-            row = df_krx[df_krx['Code'].astype(str) == code]
-            shares = _to_int(row.iloc[0].get('Stocks')) if not row.empty else None
-            src = 'KRX 상장주식수(조회일)'
+            row = roster[roster['Code'].astype(str) == code]
+            shares = _to_int(row.iloc[0].get('Stocks')) if not row.empty and 'Stocks' in row.columns else None
+            src = f'KRX 상장주식수({roster_label})'
         if price is None or not shares:
             problems.append(f"{name}({code}) " + ('종가' if price is None else '주식수') + ' 조회 실패')
             continue
@@ -901,7 +945,7 @@ def get_preferred_market_value(ticker: str, bds: str, df_krx: pd.DataFrame, sh_m
         total += val
         items.append({'code': code, 'name': name, 'close': price, 'date': pdate,
                       'shares': shares, 'source': src, 'value_100m': round(val, 1)})
-    info = {'items': items, 'problems': problems}
+    info = {'items': items, 'problems': problems, 'roster': roster_label, 'asof_roster': use_asof}
     if problems:
         return 0.0, info
     return round(total, 1), info
@@ -1685,6 +1729,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
 
     screen_summary_data = []
     all_multiples = []
+    pref_roster_cache = {}   # 기준일 → 그날 종목 명단(우선주 찾기용)
     quality = QualityLog()
 
     total_tickers = len(target_code_list)
@@ -1754,8 +1799,13 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
 
                     period_metrics['Market_Cap'] = mkt_100m
 
-                    # 상장 우선주 시가 — 있으면 자기자본가치에 장부(우선주자본금) 대신 쓴다
-                    pref_mkt_100m, pref_info = get_preferred_market_value(ticker, bds, df_krx, sh_meta)
+                    # 상장 우선주 시가 — 있으면 자기자본가치에 장부(우선주자본금) 대신 쓴다.
+                    # 우선주는 기준일 당시 종목 명단으로 찾는다(오늘 명단은 그 사이 상장폐지된 우선주를 놓친다).
+                    if bds not in pref_roster_cache:
+                        pref_roster_cache[bds] = get_krx_price_listing_as_of(bds)
+                    _pr_df, _pr_date, _ = pref_roster_cache[bds]
+                    pref_mkt_100m, pref_info = get_preferred_market_value(
+                        ticker, bds, df_krx, sh_meta, df_asof=_pr_df, asof_date=_pr_date)
                     if pref_info and pref_info['problems']:
                         quality.add(SEV_WARN, ticker, display_name, f'우선주 {tp}',
                                     '상장 우선주가 있지만 ' + ', '.join(pref_info['problems']) +
@@ -1765,7 +1815,17 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                                     '상장 우선주 시가 ' + ', '.join(
                                         f"{it['name']} {it['close']:,.0f}원×{it['shares']:,}주({it['source']})"
                                         for it in pref_info['items']) +
-                                    f' = {pref_mkt_100m:,.1f}억원을 자기자본가치에 더했습니다.')
+                                    f' = {pref_mkt_100m:,.1f}억원을 자기자본가치에 더했습니다.'
+                                    f" (우선주 찾은 명단: {pref_info['roster']})")
+                    elif pref_info and pref_info.get('unlisted_pref_shares'):
+                        _msg = (f"DART 우선주 유통주식 {pref_info['unlisted_pref_shares']:,}주가 있으나 "
+                                f"{pref_info['roster']}에 상장 우선주가 없습니다 — 비상장 우선주(상환전환우선주 등)로 보고 "
+                                f"장부(우선주자본금)로 반영했습니다.")
+                        if not pref_info.get('asof_roster'):
+                            _msg += (' 기준일 당시 명단이 없어 조회일 명단으로 찾았으므로, 기준일 뒤 상장폐지된 '
+                                     '상장 우선주였다면 시가가 빠졌습니다 — 거래소 상장폐지 현황을 확인하세요.')
+                        quality.add(SEV_INFO if pref_info.get('asof_roster') else SEV_WARN,
+                                    ticker, display_name, f'우선주 {tp}', _msg)
 
                     all_mkt.append({
                         'Company': display_name, 'Ticker': ticker, 'Period': tp,
@@ -1778,7 +1838,9 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                         'Pref_Close': ', '.join(f"{it['close']:,.0f}" for it in (pref_info or {}).get('items', [])) or None,
                         'Pref_Shares': sum(it['shares'] for it in (pref_info or {}).get('items', [])) or None,
                         'Pref_Market_Cap_100M': pref_mkt_100m,
-                        'Pref_Source': ', '.join(sorted({it['source'] for it in (pref_info or {}).get('items', [])})) or None,
+                        'Pref_Source': (', '.join(sorted({it['source'] for it in pref_info['items']}))
+                                        + f" · {pref_info['roster']}"
+                                        if pref_info and pref_info.get('items') else None),
                     })
 
                 # 2) BS Fetch (finstate_all: 상세) - CFS 우선 → OFS
@@ -1996,7 +2058,7 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                 if market_prices_2y.index.tz is not None:
                     market_prices_2y.index = market_prices_2y.index.tz_localize(None)
 
-                # 기준일이 속한 주까지 정확히 105주(수익률 104개), 날짜는 실제 거래일
+                # 기준일(주말·휴장이면 직전 지수 거래일)이 속한 주까지 정확히 105주(수익률 104개), 날짜는 실제 거래일
                 stock_weekly_prices, market_weekly_prices = weekly_pair_2y(
                     stock_prices_2y, market_prices_2y, base_date_str)
 
@@ -3420,7 +3482,7 @@ if ui_mode == "GPCM Valuation (기존)":
         '• IBD(Option): CB/EB/BW 등 메자닌은 기본적으로 IBD(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
         '• NOA(Option): 투자자산/관계기업 등은 기본적으로 NOA(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
         '• LTM = Current Cumulative + Prior Annual − Prior Same Quarter Cumulative (단, 4Q는 Annual)',
-        '• Beta: 5년 월간(수익률 60개) & 2년 주간 기준 (FinanceDataReader 사용). 2년 주간은 기준일이 속한 주까지 105주(수익률 104개), 각 주 마지막 공통 거래일 종가 — 마지막 날짜는 기준일 또는 그 직전 거래일',
+        '• Beta: 5년 월간(수익률 60개) & 2년 주간 기준 (FinanceDataReader 사용). 2년 주간은 기준일(주말·휴장이면 직전 지수 거래일)이 속한 주까지 105주(수익률 104개), 각 주 마지막 공통 거래일 종가 — 마지막 날짜는 기준일 또는 그 직전 거래일',
         f'• MRP: 한국공인회계사회 시장위험 프리미엄 가이던스 ({CPA_GUIDANCE_DATE}) {MRP_GUIDANCE[0]*100:.0f}~{MRP_GUIDANCE[1]*100:.0f}% 범위 내 선택',
         f'• Size Premium: 한국공인회계사회 기업규모위험 프리미엄 연구결과 ({CPA_GUIDANCE_DATE}) 시가총액 분위 기준',
         '• Adjusted Beta = 2/3 × Raw Beta + 1/3 × 1 (조정을 Unlevered 계산 前에 적용)',
@@ -3429,7 +3491,7 @@ if ui_mode == "GPCM Valuation (기존)":
         '• Beta 평균 대상: 조정베타가 0 초과인 회사 (GPCM 시트 Mean 행과 동일 모집단)',
         '• D/E Ratio = IBD / (Market Cap + 우선주 + NCI)',
         '• Debt Ratio (D/V) = IBD / (Market Cap + 우선주 + IBD + NCI)',
-        '• 우선주: 상장 우선주가 있으면 기준일 종가 × 우선주 유통주식수(Market_Cap 시트 Pref 열), 없으면 BS 우선주자본금(액면). 시가총액은 보통주만 반영하므로 자기자본가치에 가산',
+        '• 우선주: 상장 우선주가 있으면 기준일 종가 × 우선주 유통주식수(Market_Cap 시트 Pref 열), 없으면 BS 우선주자본금(액면). 우선주는 기준일 당시 종목 명단으로 찾고(없으면 조회일 명단 — Data_Quality 경고), 시가총액은 보통주만 반영하므로 자기자본가치에 가산',
         '• Unlevered Beta = Levered Beta / (1 + (1 - Tax Rate) × D/E Ratio)',
         '• Tax Rate: 한국 법인세 한계세율 (지방소득세 포함, 세전순이익 기준, 사업연도별 세율표 적용)',
         '   - FY2023~2025: 2억 이하 9.9% | 2~200억 20.9% | 200~3,000억 23.1% | 3,000억 초과 26.4%',

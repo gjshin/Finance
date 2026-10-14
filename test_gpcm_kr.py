@@ -261,6 +261,15 @@ chk('정지 구간이 있으면 창을 늘려 메우지 않고 관측치가 준�
 _hol = _st.drop(pd.Timestamp('2026-06-30'))                  # 기준일 휴장 가정
 _hs, _ = M.weekly_pair_2y(_hol, _mk, '2026-06-30')
 chk('기준일이 휴장이면 직전 거래일로 찍힌다', _hs.index[-1] == pd.Timestamp('2026-06-29'), _hs.index[-1])
+_d2 = pd.bdate_range('2021-01-01', '2024-04-10')
+_st2 = pd.Series(100 * np.cumprod(1 + _rng.normal(0, 0.01, len(_d2))), index=_d2)
+_mk2 = pd.Series(100 * np.cumprod(1 + _rng.normal(0, 0.01, len(_d2))), index=_d2)
+_es, _em = M.weekly_pair_2y(_st2, _mk2, '2024-03-31')               # 일요일 분기말
+chk('기준일이 일요일이어도 수익률 104개(한 주가 비지 않는다)', len(_es) == 105 and len(_em) == 105, len(_es))
+chk('일요일 기준일 → 마지막은 직전 금요일', _es.index[-1] == pd.Timestamp('2024-03-29'), _es.index[-1])
+_ss, _ = M.weekly_pair_2y(_st.drop(_st.loc['2026-06-15':'2026-06-30'].index), _mk, '2026-06-30')
+chk('기준일 직전 종목 거래정지면 창을 뒤로 밀지 않고 관측치가 준다(지수 거래일 기준)',
+    len(_ss) == 102 and _ss.index[-1] == pd.Timestamp('2026-06-12'), (len(_ss), _ss.index[-1]))
 chk('수집부가 이 함수를 쓴다(금요일 리샘플 제거)',
     "weekly_pair_2y(" in open(Path(__file__).resolve().parent / 'gpcm_kr.py', encoding='utf-8').read()
     and "stock_prices_2y.resample('W-FRI')" not in open(Path(__file__).resolve().parent / 'gpcm_kr.py', encoding='utf-8').read())
@@ -298,6 +307,23 @@ try:
         _v2 == 0 and _i2['problems'], (_v2, _i2))
     _v3, _i3 = M.get_preferred_market_value('004370', '2026-06-30', _krx, {})
     chk('상장 우선주가 없으면 (0, None)', _v3 == 0 and _i3 is None)
+    # 기준일 명단: 오늘은 상장폐지돼 조회일 명단에 없는 우선주도 찾는다
+    _krx_now = _krx[_krx['Code'] != '001685']
+    _v4, _i4 = M.get_preferred_market_value('001680', '2026-06-30', _krx_now, {'pref_shares': 1_370_223},
+                                            df_asof=_krx, asof_date='2026-06-30')
+    chk('기준일 명단으로 찾으면 그 뒤 상장폐지된 우선주도 잡는다', _v4 > 0 and _i4['asof_roster'], (_v4, _i4))
+    chk('근거에 기준일 명단 날짜', _i4['roster'] == '기준일 명단(2026-06-30)', _i4.get('roster'))
+    _v5, _i5 = M.get_preferred_market_value('001680', '2026-06-30', _krx_now, {'pref_shares': 1_370_223})
+    chk('기준일 명단이 없고 조회일 명단에도 없으면 0 + 비상장 우선주 근거(경고용)',
+        _v5 == 0 and _i5['unlisted_pref_shares'] == 1_370_223 and not _i5['asof_roster'], _i5)
+    _krx_asof_multi = _krx.copy()
+    _krx_asof_multi.loc[_krx_asof_multi['Code'] == '005385', 'Stocks'] = 11
+    _prices.update({'005389': (100.0, '2026-06-30')})
+    _v6, _i6 = M.get_preferred_market_value('005380', '2026-06-30', _krx, {'pref_shares': 62_000_000},
+                                            df_asof=_krx_asof_multi, asof_date='2026-06-30')
+    chk('여러 종류면 기준일 명단의 종류별 상장주식수를 쓴다',
+        [it['shares'] for it in _i6['items'] if it['code'] == '005385'] == [11]
+        and all('기준일 명단' in it['source'] for it in _i6['items']), _i6)
 finally:
     M.get_stock_price = _orig_price
 _src = open(Path(__file__).resolve().parent / 'gpcm_kr.py', encoding='utf-8').read()
@@ -305,6 +331,8 @@ chk('GPCM 시트 우선주 = 시가 있으면 시가, 없으면 장부',
     "_pm = f'SUMIFS(Market_Cap!Q:Q" in _src and "=IF({_pm}>0, {_pm}" in _src)
 chk('파이썬 계산도 같은 규칙(시가가 있으면 Preferred 를 시가로 바꾼다)',
     "period_metrics['Preferred'] = pref_mkt_100m" in _src)
+chk('수집부는 기준일 종목 명단으로 우선주를 찾는다',
+    "get_krx_price_listing_as_of(bds)" in _src and "df_asof=_pr_df" in _src)
 
 # --- 0.8.5: Data_Quality — 결손 피어 경고, 결정계수 정보 ---------------------------
 print()

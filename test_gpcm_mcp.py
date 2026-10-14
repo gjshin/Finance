@@ -779,6 +779,8 @@ check('5Y 가 1Y 보다 행이 많다', rowsC > rows, (rowsC, rows))
 
 # --- 10. 상장 우선주 시가 (0.8.5) — 수집 → Market_Cap·GPCM 시트·Data_Quality ----------
 _orig_listing, _orig_sh = M.get_krx_listing, M.get_outstanding_shares
+_orig_prl = M.get_krx_price_listing_as_of
+M.get_krx_price_listing_as_of = lambda a, max_back_days=10: (None, None, 'https://example/none.csv')
 M.get_krx_listing = lambda: pd.DataFrame({'Code': ['005930', '005935'], 'Name': ['테스트', '테스트우'],
                                           'Stocks': [100, 10]})
 M.get_outstanding_shares = lambda *a, **k: (1_000_000, 'DART(11012)', {'pref_shares': 200_000})
@@ -799,8 +801,20 @@ try:
     dq = wbP['Data_Quality']
     msgs = [str(dq.cell(r, 5).value) for r in range(5, dq.max_row + 1)]
     check('Data_Quality 에 우선주 시가 반영 정보', any('상장 우선주 시가' in m for m in msgs), msgs[:6])
+    check('우선주 출처에 찾은 명단 표시', '조회일 명단' in str(rowP[17]), rowP[17])
+    # 기준일 명단에만 있는 우선주(그 뒤 상장폐지)
+    M.get_krx_listing = lambda: pd.DataFrame({'Code': ['005930'], 'Name': ['테스트'], 'Stocks': [100]})
+    M.get_krx_price_listing_as_of = lambda a, max_back_days=10: (
+        pd.DataFrame({'Code': ['005930', '005935'], 'Name': ['테스트', '테스트우'], 'Stocks': [100, 10]}),
+        '2024-03-29', 'https://example/2024-03-29.csv')
+    rQ = W.run_gpcm(['005930'], '2024.1Q')
+    W._jobs[rQ['job_id']]['thread'].join(timeout=60)
+    rowQ = [c.value for c in load_workbook(W.gpcm_status(rQ['job_id'])['file'])['Market_Cap'][5]]
+    check('기준일 명단으로 찾은 우선주 시가가 들어간다', rowQ[16] == round(70000 * 200_000 / 1e8, 1)
+          and '기준일 명단(2024-03-29)' in str(rowQ[17]), rowQ[13:])
 finally:
     M.get_krx_listing, M.get_outstanding_shares = _orig_listing, _orig_sh
+    M.get_krx_price_listing_as_of = _orig_prl
 
 print()
 print(f"잘못된 항목 {len(fails)}건")
