@@ -847,8 +847,14 @@ def list_krx_companies(query: str = "", december_only: bool = False,
 GAP_MIN_TRADING_DAYS = 5
 
 
+def pd_ts(value):
+    """datetime → pandas Timestamp (날짜 비교용). pandas 는 gpcm_kr 로드 뒤에만 쓴다."""
+    import pandas as pd
+    return pd.Timestamp(value)
+
+
 @mcp.tool()
-def check_trading_gaps(tickers: list[str], years: int = 5) -> dict[str, Any]:
+def check_trading_gaps(tickers: list[str], years: int = 5, as_of: str = "") -> dict[str, Any]:
     """베타 관측기간 중 거래정지 이력이 있는지 종목별로 점검한다 — 판단 재료다.
 
     KOSPI 지수 거래일을 기준으로, 종목 시세가 연속 5거래일 이상 비어 있는
@@ -863,6 +869,10 @@ def check_trading_gaps(tickers: list[str], years: int = 5) -> dict[str, Any]:
     Args:
         tickers: 종목코드 6자리 목록. 최대 30개.
         years: 점검 창(년). 기본 5 — Weekly-2Y만 쓰면 2로 줄여도 된다.
+        as_of: **평가기준일**. "2026-06-30" · "20260630" · "2026.2Q" 모두 된다.
+            창은 이 날짜에서 끝나고 years 만큼 거슬러 올라간다 — run_gpcm 의 베타
+            관측 구간과 같은 기간을 보려면 반드시 넣는다. 비우면 오늘 기준(기준일
+            뒤 구간이 섞이고 창 앞쪽이 잘린다 — meta.windowBasis 에 그렇게 적힌다).
     """
     from datetime import timedelta
 
@@ -876,13 +886,26 @@ def check_trading_gaps(tickers: list[str], years: int = 5) -> dict[str, Any]:
         raise RuntimeError(f"{len(codes)}개는 너무 많습니다(상한 {MAX_TICKERS}).")
 
     m = _load()
-    end = datetime.now()
+    text = (as_of or "").strip()
+    if re.fullmatch(r"\d{8}", text):
+        text = f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    if text:
+        end = m.as_of_date(text)  # "2026-06-30"·"2026.2Q" — get_wacc_inputs 와 같은 해석
+        basis = f"평가기준일 {end:%Y-%m-%d} 기준 {int(years)}년"
+    else:
+        end = datetime.now()
+        basis = (f"오늘({end:%Y-%m-%d}) 기준 {int(years)}년 — 평가기준일이 아니다. "
+                 "베타 구간과 맞추려면 as_of 에 평가기준일을 넣어 다시 부른다")
+    # 기준일 당일 시세까지 포함되도록 끝을 그날 끝으로 둔다
+    end = end.replace(hour=23, minute=59, second=59, microsecond=0)
     start = end - timedelta(days=365 * max(1, int(years)) + 20)
 
     market = m.fdr.DataReader("KS11", start, end)
     if market is None or market.empty:
         raise RuntimeError("KOSPI 지수 시계열을 받지 못해 거래일 기준을 만들 수 없습니다.")
-    market_days = sorted(d.normalize() for d in market.index)
+    lo, hi = pd_ts(start), pd_ts(end)
+    # 데이터 원천이 창 밖 날짜를 덧붙여 줘도 창 안만 본다 (기준일 뒤 구간이 섞이지 않게)
+    market_days = sorted(d.normalize() for d in market.index if lo <= d <= hi)
 
     results: list[dict[str, Any]] = []
     failed: list[str] = []
@@ -894,7 +917,10 @@ def check_trading_gaps(tickers: list[str], years: int = 5) -> dict[str, Any]:
         if px is None or px.empty:
             failed.append(code)
             continue
-        stock_days = {d.normalize() for d in px.index}
+        stock_days = {d.normalize() for d in px.index if lo <= d <= hi}
+        if not stock_days:
+            failed.append(code)
+            continue
         first = min(stock_days)
 
         gaps: list[dict[str, Any]] = []
@@ -911,7 +937,7 @@ def check_trading_gaps(tickers: list[str], years: int = 5) -> dict[str, Any]:
             else:
                 run.append(d)
         currently_suspended = False
-        if len(run) >= GAP_MIN_TRADING_DAYS:  # 창 끝까지 이어진 결측 = 현재 정지 중
+        if len(run) >= GAP_MIN_TRADING_DAYS:  # 창 끝(기준일 또는 오늘)까지 이어진 결측 = 그 시점 정지 중
             gaps.append({"from": run[0].strftime("%Y-%m-%d"),
                          "to": run[-1].strftime("%Y-%m-%d"),
                          "tradingDays": len(run)})
@@ -928,6 +954,10 @@ def check_trading_gaps(tickers: list[str], years: int = 5) -> dict[str, Any]:
     output: dict[str, Any] = {
         "meta": {
             "windowYears": int(years),
+            "windowStart": f"{start:%Y-%m-%d}",
+            "windowEnd": f"{end:%Y-%m-%d}",
+            "windowBasis": basis,
+            "currentlySuspended": "창 끝(windowEnd)까지 결측이 이어진 종목 — as_of 를 넣었으면 기준일 당시 정지 중",
             "threshold": f"KOSPI 지수 거래일 기준 연속 {GAP_MIN_TRADING_DAYS}일 이상 결측",
             "note": "판단 재료다 — 자동 배제하지 말고 사용자에게 구간과 함께 표시하라. "
                     "결측은 데이터 누락일 수도 있으니, 이력이 나온 회사는 매매거래정지 "
