@@ -244,7 +244,7 @@ def _run_job(job: dict[str, Any], p: dict[str, Any]) -> None:
                 "rate_pct": round(tax_rate * 100, 2),
             }
             quality.add(M.SEV_INFO, p["target"], (row or {}).get("Company", ""), 'Tax Rate',
-                        f'타겟 법인세율을 세전이익 {pretax if pretax is not None else "미상"}억원과 '
+                        f'타겟 법인세율을 세전이익 {"미상" if pretax is None else format(float(pretax), ",.1f")}억원과 '
                         f'FY{base_year} 한계세율표로 {tax_rate*100:.2f}% 로 정했습니다 '
                         f'(한국 법인 전제, 지방소득세 포함).')
 
@@ -757,7 +757,12 @@ def list_krx_companies(query: str = "", december_only: bool = False,
             명단**(사본은 2026년 1분기부터)을 받는다 — 그 뒤 상장폐지·신규상장 보정이 필요 없다.
             휴장일이면 직전 거래일 파일. 비우면 오늘 명단.
         save: True면 받은 명단 **전체**를 엑셀로 문서 > GPCM 폴더에 저장하고 경로를 돌려준다
-            (선정조서 Raw_상장법인목록 원본). query 와 무관하게 전체를 저장한다.
+            (선정조서 Raw_상장법인목록 원본). query 와 무관하게 전체를 저장한다. 사본에는 우선주 등
+            종목도 한 줄씩 있어(업종 칸 비어 있음) '종류' 열로 구분한다.
+
+    [회사 수] meta.listedUniverse·byMarket 은 회사 단위(우선주 등 종목 행 제외, 뺀 수는
+    issueRowsExcluded). 비교기업 선정 0단계 수는 meta.stage0Companies(유가증권 + 코스닥,
+    코스닥 글로벌 포함, 코넥스 제외)를 그대로 쓴다. 검색 결과에도 회사만 나온다.
     """
     M = _load()
     src: dict[str, Any] = {}
@@ -781,17 +786,27 @@ def list_krx_companies(query: str = "", december_only: bool = False,
                "fileDate": datetime.now().strftime("%Y-%m-%d"),
                "url": "FinanceDataReader StockListing('KRX-DESC')"}
 
+    # 사본에는 우선주 등 종목도 한 줄씩 들어 있다(업종 칸이 비어 있음) — 회사 수에서 뺀다
+    is_issue = df["Sector"].fillna("").astype(str).str.strip() == "" if "Sector" in df.columns \
+        else M.pd.Series(False, index=df.index)
+    co = df[~is_issue]
+    by_market = {str(k): int(v) for k, v in co["Market"].value_counts().items()} if "Market" in co.columns else {}
     meta: dict[str, Any] = {
         "retrievedAt": datetime.now().strftime("%Y-%m-%d"),
-        "listedUniverse": int(len(df)),
-        "byMarket": {str(k): int(v) for k, v in df["Market"].value_counts().items()} if "Market" in df.columns else {},
+        "listedUniverse": int(len(co)),
+        "byMarket": by_market,
+        "stage0Companies": sum(v for k, v in by_market.items() if k in ("KOSPI", "KOSDAQ", "KOSDAQ GLOBAL")),
+        "issueRowsExcluded": int(is_issue.sum()),
+        "countNote": "회사 단위(업종 칸이 빈 우선주 등 종목 행 제외). stage0Companies = 유가증권 + 코스닥(글로벌 포함), 코넥스 제외",
         "source": src,
     }
 
     if save:
         cols = {"Code": "종목코드", "Name": "회사명", "Market": "시장", "Sector": "업종",
                 "Industry": "주요제품", "ListingDate": "상장일", "SettleMonth": "결산월", "Dept": "소속부"}
-        out = df[[c for c in cols if c in df.columns]].rename(columns=cols).sort_values("종목코드")
+        out = df[[c for c in cols if c in df.columns]].rename(columns=cols)
+        out["종류"] = ["우선주 등 종목(업종 없음)" if x else "회사" for x in is_issue]
+        out = out.sort_values("종목코드")
         out["조회일"] = meta["retrievedAt"]
         out["출처"] = src.get("url")
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -799,6 +814,7 @@ def list_krx_companies(query: str = "", december_only: bool = False,
         out.to_excel(path, index=False)
         meta["savedFile"] = str(path)
 
+    df = co   # 이후 집계·검색은 회사만
     if december_only:
         df = df[df["SettleMonth"].astype(str).str.contains("12", na=False)]
 
