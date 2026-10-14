@@ -222,6 +222,141 @@ chk('해외도 종목별 독립 표로 쓴다 (한 표에 날짜를 맞추지 �
     'for b, col in enumerate(df_abs.columns)' in _ph and 'df_abs[col].dropna()' in _ph)
 chk('베타·주가 모두 auto_adjust 계열을 쓴다', "bundle['price_series'] = hist_adj" in _gl2)
 
+# --- 0.8.5: 상장사 명단 열 구성 (사본의 열이 바뀌었다) -----------------------------
+print()
+print("상장사 명단 열 구성")
+print("-" * 66)
+_new = pd.DataFrame([{'Code': '4370', 'Name': '농심', 'Market': 'KOSPI', 'Sector': None,
+                      'Industry': '기타 식품 제조업', 'Products': '라면,스낵', 'SettleMonth': '12월'},
+                     {'Code': '0013V0', 'Name': '삼진식품', 'Market': 'KOSDAQ', 'Sector': '중견기업부',
+                      'Industry': '수산물 가공 및 저장 처리업', 'Products': '어묵', 'SettleMonth': '12월'}])
+_n = M.normalize_krx_desc(_new)
+chk('새 구성: 업종은 Industry 열에서', _n.loc[0, 'Sector'] == '기타 식품 제조업', _n.to_dict('records'))
+chk('새 구성: 주요제품은 Products 열에서', _n.loc[0, 'Industry'] == '라면,스낵')
+chk('새 구성: 소속부는 Dept 로 옮긴다(업종 자리에 소속부가 들어가면 안 된다)',
+    _n.loc[1, 'Dept'] == '중견기업부' and _n.loc[1, 'Sector'] == '수산물 가공 및 저장 처리업')
+chk('종목코드 6자리 유지(영문 포함 코드 그대로)', list(_n['Code']) == ['004370', '0013V0'], list(_n['Code']))
+_old = pd.DataFrame([{'Code': '004370', 'Name': '농심', 'Market': 'KOSPI', 'Sector': '기타 식품 제조업',
+                      'Industry': '라면,스낵', 'SettleMonth': '12월'}])
+_o = M.normalize_krx_desc(_old)
+chk('예전 구성은 그대로 읽는다', _o.loc[0, 'Sector'] == '기타 식품 제조업' and _o.loc[0, 'Industry'] == '라면,스낵')
+
+# --- 0.8.5: 2년 주간 베타 창 — 정확히 104개, 마지막 날짜는 실제 거래일 ---------------
+print()
+print("2년 주간 베타 창")
+print("-" * 66)
+_days = pd.bdate_range('2024-01-01', '2026-07-10')
+_rng = np.random.default_rng(0)
+_st = pd.Series(100 * np.cumprod(1 + _rng.normal(0, 0.01, len(_days))), index=_days)
+_mk = pd.Series(100 * np.cumprod(1 + _rng.normal(0, 0.01, len(_days))), index=_days)
+_ws, _wm = M.weekly_pair_2y(_st, _mk, '2026-06-30')
+chk('주간 종가 105개 → 수익률 104개', len(_ws) == 105 and len(_wm) == 105, len(_ws))
+chk('마지막 날짜는 기준일(화요일), 기준일 뒤 금요일이 아니다',
+    _ws.index[-1] == pd.Timestamp('2026-06-30'), _ws.index[-1])
+chk('기준일 뒤 자료 없음', (_ws.index <= pd.Timestamp('2026-06-30')).all())
+chk('종목·지수 날짜가 같다', list(_ws.index) == list(_wm.index))
+_gap = _st.drop(_st.loc['2025-03-03':'2025-03-21'].index)   # 3주 거래정지
+_gs, _gm = M.weekly_pair_2y(_gap, _mk, '2026-06-30')
+chk('정지 구간이 있으면 창을 늘려 메우지 않고 관측치가 준다', len(_gs) == 102, len(_gs))
+_hol = _st.drop(pd.Timestamp('2026-06-30'))                  # 기준일 휴장 가정
+_hs, _ = M.weekly_pair_2y(_hol, _mk, '2026-06-30')
+chk('기준일이 휴장이면 직전 거래일로 찍힌다', _hs.index[-1] == pd.Timestamp('2026-06-29'), _hs.index[-1])
+_d2 = pd.bdate_range('2021-01-01', '2024-04-10')
+_st2 = pd.Series(100 * np.cumprod(1 + _rng.normal(0, 0.01, len(_d2))), index=_d2)
+_mk2 = pd.Series(100 * np.cumprod(1 + _rng.normal(0, 0.01, len(_d2))), index=_d2)
+_es, _em = M.weekly_pair_2y(_st2, _mk2, '2024-03-31')               # 일요일 분기말
+chk('기준일이 일요일이어도 수익률 104개(한 주가 비지 않는다)', len(_es) == 105 and len(_em) == 105, len(_es))
+chk('일요일 기준일 → 마지막은 직전 금요일', _es.index[-1] == pd.Timestamp('2024-03-29'), _es.index[-1])
+_ss, _ = M.weekly_pair_2y(_st.drop(_st.loc['2026-06-15':'2026-06-30'].index), _mk, '2026-06-30')
+chk('기준일 직전 종목 거래정지면 창을 뒤로 밀지 않고 관측치가 준다(지수 거래일 기준)',
+    len(_ss) == 102 and _ss.index[-1] == pd.Timestamp('2026-06-12'), (len(_ss), _ss.index[-1]))
+chk('수집부가 이 함수를 쓴다(금요일 리샘플 제거)',
+    "weekly_pair_2y(" in open(Path(__file__).resolve().parent / 'gpcm_kr.py', encoding='utf-8').read()
+    and "stock_prices_2y.resample('W-FRI')" not in open(Path(__file__).resolve().parent / 'gpcm_kr.py', encoding='utf-8').read())
+
+# --- 0.8.5: 상장 우선주 시가 -------------------------------------------------------
+print()
+print("상장 우선주 시가")
+print("-" * 66)
+_krx = pd.DataFrame([
+    {'Code': '001680', 'Name': '대상', 'Stocks': 34_000_000},
+    {'Code': '001685', 'Name': '대상우', 'Stocks': 1_370_223},
+    {'Code': '264900', 'Name': '크라운제과', 'Stocks': 13_000_000},
+    {'Code': '26490K', 'Name': '크라운제과우', 'Stocks': 772_939},
+    {'Code': '005380', 'Name': '현대차', 'Stocks': 200_000_000},
+    {'Code': '005385', 'Name': '현대차우', 'Stocks': 24_000_000},
+    {'Code': '005387', 'Name': '현대차2우B', 'Stocks': 36_000_000},
+    {'Code': '005389', 'Name': '현대차3우B', 'Stocks': 2_000_000},
+    {'Code': '004370', 'Name': '농심', 'Stocks': 6_000_000},
+    {'Code': '004379', 'Name': '농심다른회사', 'Stocks': 1},   # 앞 5자리만 같은 가짜
+])
+chk('대상 → 대상우(001685)', M.find_listed_preferred('001680', _krx) == [('001685', '대상우')])
+chk('크라운제과 → 영문 포함 코드 26490K', M.find_listed_preferred('264900', _krx) == [('26490K', '크라운제과우')])
+chk('여러 종류(우·2우B·3우B)를 모두 찾는다', len(M.find_listed_preferred('005380', _krx)) == 3)
+chk('앞 5자리만 같은 다른 이름은 잡지 않는다', M.find_listed_preferred('004370', _krx) == [])
+_prices = {'001685': (14580.0, '2026-06-30'), '26490K': (7240.0, '2026-06-30'),
+           '005385': (100.0, '2026-06-30'), '005387': (100.0, '2026-06-30')}
+_orig_price = M.get_stock_price
+M.get_stock_price = lambda code, d: _prices.get(code, (None, None))
+try:
+    _v, _i = M.get_preferred_market_value('001680', '2026-06-30', _krx, {'pref_shares': 1_370_223})
+    chk('한 종류: DART 우선주 유통주식수 × 기준일 종가', abs(_v - round(14580 * 1_370_223 / 1e8, 1)) < 1e-9, (_v, _i))
+    chk('근거에 DART 출처', _i['items'][0]['source'].startswith('DART'), _i)
+    _v2, _i2 = M.get_preferred_market_value('005380', '2026-06-30', _krx, {'pref_shares': 62_000_000})
+    chk('한 종류라도 종가를 못 구하면 0 → 장부로 되돌아간다(일부만 더하지 않는다)',
+        _v2 == 0 and _i2['problems'], (_v2, _i2))
+    _v3, _i3 = M.get_preferred_market_value('004370', '2026-06-30', _krx, {})
+    chk('상장 우선주가 없으면 (0, None)', _v3 == 0 and _i3 is None)
+    # 기준일 명단: 오늘은 상장폐지돼 조회일 명단에 없는 우선주도 찾는다
+    _krx_now = _krx[_krx['Code'] != '001685']
+    _v4, _i4 = M.get_preferred_market_value('001680', '2026-06-30', _krx_now, {'pref_shares': 1_370_223},
+                                            df_asof=_krx, asof_date='2026-06-30')
+    chk('기준일 명단으로 찾으면 그 뒤 상장폐지된 우선주도 잡는다', _v4 > 0 and _i4['asof_roster'], (_v4, _i4))
+    chk('근거에 기준일 명단 날짜', _i4['roster'] == '기준일 명단(2026-06-30)', _i4.get('roster'))
+    _v5, _i5 = M.get_preferred_market_value('001680', '2026-06-30', _krx_now, {'pref_shares': 1_370_223})
+    chk('기준일 명단이 없고 조회일 명단에도 없으면 0 + 비상장 우선주 근거(경고용)',
+        _v5 == 0 and _i5['unlisted_pref_shares'] == 1_370_223 and not _i5['asof_roster'], _i5)
+    _krx_asof_multi = _krx.copy()
+    _krx_asof_multi.loc[_krx_asof_multi['Code'] == '005385', 'Stocks'] = 11
+    _prices.update({'005389': (100.0, '2026-06-30')})
+    _v6, _i6 = M.get_preferred_market_value('005380', '2026-06-30', _krx, {'pref_shares': 62_000_000},
+                                            df_asof=_krx_asof_multi, asof_date='2026-06-30')
+    chk('여러 종류면 기준일 명단의 종류별 상장주식수를 쓴다',
+        [it['shares'] for it in _i6['items'] if it['code'] == '005385'] == [11]
+        and all('기준일 명단' in it['source'] for it in _i6['items']), _i6)
+finally:
+    M.get_stock_price = _orig_price
+_src = open(Path(__file__).resolve().parent / 'gpcm_kr.py', encoding='utf-8').read()
+chk('GPCM 시트 우선주 = 시가 있으면 시가, 없으면 장부',
+    "_pm = f'SUMIFS(Market_Cap!Q:Q" in _src and "=IF({_pm}>0, {_pm}" in _src)
+chk('파이썬 계산도 같은 규칙(시가가 있으면 Preferred 를 시가로 바꾼다)',
+    "period_metrics['Preferred'] = pref_mkt_100m" in _src)
+chk('수집부는 기준일 종목 명단으로 우선주를 찾는다',
+    "get_krx_price_listing_as_of(bds)" in _src and "df_asof=_pr_df" in _src)
+
+# --- 0.8.5: Data_Quality — 결손 피어 경고, 결정계수 정보 ---------------------------
+print()
+print("Data_Quality 보강")
+print("-" * 66)
+_q = M.QualityLog()
+_wk = pd.date_range('2024-07-05', periods=105, freq='W-FRI')
+_mkw = pd.Series(100 * np.cumprod(1 + _rng.normal(0, 0.02, 105)), index=_wk)
+_stw = pd.Series(100 * np.cumprod(1 + _rng.normal(0, 0.02, 105)), index=_wk)   # 시장과 무관 → 결정계수 낮음
+_comp = [{'Ticker': '001680', 'Company': '결손㈜', 'Market_Cap': 5000, 'IBD': 3000, 'NCI': 0,
+          'Preferred': 0, 'Equity': 4000, 'Pretax_Income': -2588.1,
+          'Stock_Weekly_Prices_2Y': _stw, 'Market_Weekly_Prices_2Y': _mkw},
+         {'Ticker': '004370', 'Company': '흑자㈜', 'Market_Cap': 19000, 'IBD': 700, 'NCI': 0,
+          'Preferred': 0, 'Equity': 28000, 'Pretax_Income': 2522.9,
+          'Stock_Weekly_Prices_2Y': _mkw * (1 + _rng.normal(0, 0.001, 105)), 'Market_Weekly_Prices_2Y': _mkw}]
+M.calculate_wacc_and_beta(['001680', '004370'], _comp, 0.242, 0.03925, 0.08, -0.0045, 0.04375, '2Y',
+                          fiscal_year=2026, quality=_q)
+_tax_w = [r for r in _q.rows if r['Item'] == 'Tax Rate']
+chk('결손 피어는 세율 경고(WARN)', len(_tax_w) == 1 and _tax_w[0]['Level'] == 'WARN'
+    and _tax_w[0]['Ticker'] == '001680' and '22.0%' in _tax_w[0]['Message'], _tax_w)
+_r2_i = [r for r in _q.rows if r['Level'] == 'INFO' and '결정계수' in r['Message']]
+chk('결정계수 0.1 미만은 정보(INFO)로만, 흑자·고설명력 회사는 표시 없음',
+    [r['Ticker'] for r in _r2_i] == ['001680'], _r2_i)
+
 print()
 print(f"잘못된 항목 {fails}건")
 sys.exit(1 if fails else 0)

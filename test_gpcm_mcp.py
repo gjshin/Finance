@@ -122,7 +122,7 @@ check('Notes 의 Base Date 가 요청 기간', any(
 gp = wb['GPCM']
 hdr = [c.value for c in gp[5][:len(M.GPCM_COL_DEFS)]]
 check('헤더 순서가 열 정의와 일치', hdr == [h for _, h, _ in M.GPCM_COL_DEFS], hdr[:14])
-check('우선주(장부)가 11열(K) — NCI와 Equity 사이', hdr[10] == '우선주(장부)', hdr[8:13])
+check('우선주(시가·장부)가 11열(K) — NCI와 Equity 사이', hdr[10] == '우선주(시가·장부)', hdr[8:13])
 check('BS & EV Components 섹션이 F4:M4', 'F4:M4' in {str(rng) for rng in gp.merged_cells.ranges}
       and gp.cell(4, 6).value == 'BS & EV Components')
 check('Equity Adj 섹션은 사라짐', all(gp.cell(4, c).value != 'Equity Adj' for c in range(1, 40)))
@@ -260,6 +260,35 @@ W._roster_memo.update(at=0.0, df=None)
 M.get_krx_industry_listing = lambda: pd.DataFrame()
 expect_error('KRX 실패는 명확한 에러 (조용한 폴백 없음)', lambda: W.list_krx_companies('반도체'), 'KRX')
 W._roster_memo.update(at=0.0, df=None)
+
+# --- 7-b. 기준일 당시 명단 · 전체 저장 (0.8.5) ------------------------------------
+_AS = IND.copy(); _AS['Dept'] = None; _AS['ListingDate'] = '2000-01-01'
+_seen = {}
+def _fake_asof(a, max_back_days=10):
+    _seen['as_of'] = a
+    return _AS.copy(), '2026-06-30', 'https://example/desc/2026-06-30.csv'
+_orig_asof = M.get_krx_listing_as_of
+M.get_krx_listing_as_of = _fake_asof
+_orig_out = W.OUTPUT_DIR
+W.OUTPUT_DIR = Path(tempfile.mkdtemp())
+try:
+    r = W.list_krx_companies('라면', as_of='2026.2Q')
+    check('분기 표기를 분기말로 바꿔 조회', _seen.get('as_of') == '2026-06-30', _seen)
+    check('출처(파일 날짜·주소)를 meta 에 남긴다',
+          r['meta']['source']['fileDate'] == '2026-06-30' and 'example' in r['meta']['source']['url'], r['meta'])
+    r = W.list_krx_companies(as_of='20260630', save=True)
+    check('YYYYMMDD 도 받는다', _seen.get('as_of') == '2026-06-30', _seen)
+    _f = Path(r['meta']['savedFile'])
+    check('전체 명단을 엑셀로 저장', _f.exists() and _f.name == '상장법인목록_2026-06-30.xlsx', r['meta'])
+    _x = pd.read_excel(_f, dtype={'종목코드': str})
+    check('저장 파일은 query 와 무관하게 전체 + 업종·주요제품·출처 열',
+          len(_x) == len(_AS) and {'업종', '주요제품', '조회일', '출처'} <= set(_x.columns), list(_x.columns))
+    M.get_krx_listing_as_of = lambda a, max_back_days=10: (None, None, 'https://example/missing.csv')
+    expect_error('사본이 없으면 직접 받은 상장법인목록을 요청하라고 알린다',
+                 lambda: W.list_krx_companies('라면', as_of='2025-06-30'), '상장법인목록')
+finally:
+    M.get_krx_listing_as_of = _orig_asof
+    W.OUTPUT_DIR = _orig_out
 
 # --- 8. 거래정지 이력 점검 (fdr 응답을 흉내 내 검증) -----------------------------
 days = pd.bdate_range('2024-01-01', periods=100)
@@ -747,6 +776,45 @@ W._jobs[rC['job_id']]['thread'].join(timeout=60)
 wsC = load_workbook(W.gpcm_status(rC['job_id'])['file'])['Price_Daily']
 rowsC = sum(1 for r in range(6, wsC.max_row + 1) if wsC.cell(r, 1).value)
 check('5Y 가 1Y 보다 행이 많다', rowsC > rows, (rowsC, rows))
+
+# --- 10. 상장 우선주 시가 (0.8.5) — 수집 → Market_Cap·GPCM 시트·Data_Quality ----------
+_orig_listing, _orig_sh = M.get_krx_listing, M.get_outstanding_shares
+_orig_prl = M.get_krx_price_listing_as_of
+M.get_krx_price_listing_as_of = lambda a, max_back_days=10: (None, None, 'https://example/none.csv')
+M.get_krx_listing = lambda: pd.DataFrame({'Code': ['005930', '005935'], 'Name': ['테스트', '테스트우'],
+                                          'Stocks': [100, 10]})
+M.get_outstanding_shares = lambda *a, **k: (1_000_000, 'DART(11012)', {'pref_shares': 200_000})
+try:
+    rP = W.run_gpcm(['005930'], '2024.1Q')
+    W._jobs[rP['job_id']]['thread'].join(timeout=60)
+    sP = W.gpcm_status(rP['job_id'])
+    wbP = load_workbook(sP['file'])
+    mc = wbP['Market_Cap']
+    hdrP = [c.value for c in mc[4]]
+    rowP = [c.value for c in mc[5]]
+    check('Market_Cap 에 우선주 열(R열까지)', hdrP[13:18] == ['Pref_Listed', 'Pref_Close', 'Pref_Shares',
+                                                        'Pref_Market_Cap_100M', 'Pref_Source'], hdrP[13:])
+    check('우선주 시가 = 종가 × DART 우선주 유통주식수', rowP[16] == round(70000 * 200_000 / 1e8, 1), rowP[13:])
+    check('우선주 출처 = DART', 'DART' in str(rowP[17]), rowP[17])
+    pf = str(wbP['GPCM'].cell(6, 11).value)
+    check('GPCM 우선주 칸은 Market_Cap!Q(시가) 우선, 없으면 장부', pf.startswith('=IF(SUMIFS(Market_Cap!Q:Q') and 'BS_Full' in pf, pf)
+    dq = wbP['Data_Quality']
+    msgs = [str(dq.cell(r, 5).value) for r in range(5, dq.max_row + 1)]
+    check('Data_Quality 에 우선주 시가 반영 정보', any('상장 우선주 시가' in m for m in msgs), msgs[:6])
+    check('우선주 출처에 찾은 명단 표시', '조회일 명단' in str(rowP[17]), rowP[17])
+    # 기준일 명단에만 있는 우선주(그 뒤 상장폐지)
+    M.get_krx_listing = lambda: pd.DataFrame({'Code': ['005930'], 'Name': ['테스트'], 'Stocks': [100]})
+    M.get_krx_price_listing_as_of = lambda a, max_back_days=10: (
+        pd.DataFrame({'Code': ['005930', '005935'], 'Name': ['테스트', '테스트우'], 'Stocks': [100, 10]}),
+        '2024-03-29', 'https://example/2024-03-29.csv')
+    rQ = W.run_gpcm(['005930'], '2024.1Q')
+    W._jobs[rQ['job_id']]['thread'].join(timeout=60)
+    rowQ = [c.value for c in load_workbook(W.gpcm_status(rQ['job_id'])['file'])['Market_Cap'][5]]
+    check('기준일 명단으로 찾은 우선주 시가가 들어간다', rowQ[16] == round(70000 * 200_000 / 1e8, 1)
+          and '기준일 명단(2024-03-29)' in str(rowQ[17]), rowQ[13:])
+finally:
+    M.get_krx_listing, M.get_outstanding_shares = _orig_listing, _orig_sh
+    M.get_krx_price_listing_as_of = _orig_prl
 
 print()
 print(f"잘못된 항목 {len(fails)}건")
