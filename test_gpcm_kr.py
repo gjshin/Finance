@@ -480,6 +480,56 @@ chk('수집부가 기준일과 사본을 주식수 조회에 넘긴다',
 chk('Market_Cap 시트에 상장주식수·자기주식 근거 열', all(k in _src for k in
     ("('KRX_Listed_Shares',16)", "('Treasury',14)", "('Treasury_StlmDt',13)", "('Shares_Check',18)")))
 
+# --- 0.9.1: 우선주를 '종류주식'으로 적는 회사 -----------------------------------
+print()
+print("종류주식 표기")
+print("-" * 66)
+class _Resp2:
+    def __init__(self, js): self._js = js
+    def raise_for_status(self): pass
+    def json(self): return self._js
+def _dart_rows(rows):
+    return lambda *a, **k: _Resp2({'status': '000', 'message': '정상', 'list': rows})
+_orig_get2 = M._DART_SESSION.get
+try:
+    # 한미반도체 2026 반기 실제 표기: '보통주식'·'종류주식'(종류주식은 '-')
+    M._DART_SESSION.get = _dart_rows([
+        {'se': '보통주식', 'istc_totqy': '95,312,200', 'tesstk_co': '459,198', 'distb_stock_co': '94,853,002', 'stlm_dt': '2026-06-30'},
+        {'se': '종류주식', 'istc_totqy': '-', 'tesstk_co': '-', 'distb_stock_co': '-', 'stlm_dt': '2026-06-30'},
+        {'se': '합계', 'istc_totqy': '95,312,200', 'tesstk_co': '459,198', 'distb_stock_co': '94,853,002', 'stlm_dt': '2026-06-30'}])
+    _s, _m = M._fetch_dart_distb_shares('K', 'C', 2026, '11012')
+    chk("'보통주식' 행을 보통주로 읽는다", _s == 94_853_002 and _m['treasury'] == 459_198, _m)
+    chk("빈 '종류주식' 행은 우선주 없음(None)", _m['pref_shares'] is None, _m)
+    # 종류주식에 수량이 있으면 우선주로 읽는다
+    M._DART_SESSION.get = _dart_rows([
+        {'se': '보통주식', 'istc_totqy': '10,000,000', 'tesstk_co': '-', 'distb_stock_co': '10,000,000', 'stlm_dt': '2026-06-30'},
+        {'se': '종류주식', 'istc_totqy': '500,000', 'tesstk_co': '-', 'distb_stock_co': '-', 'stlm_dt': '2026-06-30'}])
+    _s, _m = M._fetch_dart_distb_shares('K', 'C', 2026, '11012')
+    chk("'종류주식' 수량을 우선주 유통주식수로 읽는다(자기주식 '-' = 0)",
+        _m['pref_shares'] == 500_000 and _m['pref_se'] == '종류주식', _m)
+    # '우선주' 행이 있으면 그것이 먼저다
+    M._DART_SESSION.get = _dart_rows([
+        {'se': '보통주', 'istc_totqy': '10,000,000', 'tesstk_co': '-', 'distb_stock_co': '10,000,000', 'stlm_dt': '2026-06-30'},
+        {'se': '우선주', 'istc_totqy': '300,000', 'tesstk_co': '-', 'distb_stock_co': '300,000', 'stlm_dt': '2026-06-30'},
+        {'se': '종류주식', 'istc_totqy': '999', 'tesstk_co': '-', 'distb_stock_co': '999', 'stlm_dt': '2026-06-30'}])
+    _s, _m = M._fetch_dart_distb_shares('K', 'C', 2026, '11012')
+    chk("'우선주' 행이 있으면 그것을 쓴다", _m['pref_shares'] == 300_000, _m)
+finally:
+    M._DART_SESSION.get = _orig_get2
+
+# DART 우선주(종류주식) 합계가 상장 우선주보다 많으면 상장분만 시가로
+M.get_stock_price = lambda code, d: _prices.get(code, (None, None))
+try:
+    _v7, _i7 = M.get_preferred_market_value('001680', '2026-06-30', _krx, {'pref_shares': 2_000_000})
+    chk('DART 합계 > 상장주식수면 상장주식수만 시가로(비상장 종류주식 제외)',
+        _i7['items'][0]['shares'] == 1_370_223 and '비상장분 제외' in _i7['items'][0]['source']
+        and abs(_v7 - round(14580 * 1_370_223 / 1e8, 1)) < 1e-9, _i7)
+    _v8, _i8 = M.get_preferred_market_value('001680', '2026-06-30', _krx, {'pref_shares': 1_300_000})
+    chk('DART ≤ 상장주식수면 DART 유통주식수(자기 우선주 차감)',
+        _i8['items'][0]['shares'] == 1_300_000 and _i8['items'][0]['source'] == 'DART 우선주 유통주식수', _i8)
+finally:
+    M.get_stock_price = _orig_price
+
 print()
 print(f"잘못된 항목 {fails}건")
 sys.exit(1 if fails else 0)
