@@ -108,7 +108,7 @@ _NOTES_STATIC = [
     '• 공통: 연결재무제표 작성 시 CFS 우선, 미존재 시 OFS 기준으로 수집',
     '• PL: 요약 손익계산서에서 매출액/영업이익/당기순이익 3개 계정만 엄격 추출',
     '• PL Fetch: finstate(요약) → finstate_all(CFS/OFS) fallback',
-    '• Shares: DART(stockTotqySttus) 유통주식수(distb_stock_co) 우선, 미공시 시 DART 과거보고서 fallback',
+    '• Shares: 기준일이 결산일인 DART 보고서 유통주식수(distb_stock_co) 우선(기준일 KRX 상장주식수와 대사), 보고서 제출 전이면 기준일 KRX 상장주식수(명단 사본, 2026-03-08부터) − 직전 보고서 자기주식, 사본도 없으면 직전 보고서 유통주식수 — 대체 시 Data_Quality',
     '• EV = Market Cap + 우선주(상장 우선주는 시가, 아니면 장부) + IBD − Cash + NCI − NOA',
     '• Net Debt = IBD − Cash − NOA',
     '• IBD(Option): CB/EB/BW 등 메자닌은 기본적으로 IBD(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
