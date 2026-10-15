@@ -357,6 +357,129 @@ _r2_i = [r for r in _q.rows if r['Level'] == 'INFO' and '결정계수' in r['Mes
 chk('결정계수 0.1 미만은 정보(INFO)로만, 흑자·고설명력 회사는 표시 없음',
     [r['Ticker'] for r in _r2_i] == ['001680'], _r2_i)
 
+# --- 0.9.0: 평가기준일 유통주식수 — KRX 명단 사본 상장주식수 − 자기주식 ---------------
+print()
+print("기준일 유통주식수")
+print("-" * 66)
+# 농심 2026 반기보고서 실제 숫자: 발행 6,082,642 · 자기주식 248,454 · 유통 5,834,188
+_rep = {
+    (2026, '11012'): (5_834_188, {'stlm_dt': '2026-06-30', 'issued': 6_082_642, 'treasury': 248_454,
+                                  'rcept_no': '20260814000362', 'status': '000'}),
+    (2026, '11013'): (5_834_188, {'stlm_dt': '2026-03-31', 'issued': 6_082_642, 'treasury': 248_454,
+                                  'rcept_no': 'R1Q', 'status': '000'}),
+}
+_none = (None, {'status': '013', 'message': '조회된 데이타가 없습니다.'})
+_orig_fd, _orig_tf = M.fetch_dart_distb_shares, M.find_treasury_filings
+M.fetch_dart_distb_shares = lambda key, corp, y, code, cache=None: _rep.get((int(y), str(code)), _none)
+_tf_calls = []
+def _tf(key, corp, after, until, cache=None):
+    _tf_calls.append((after, until)); return _tf_ret
+M.find_treasury_filings = _tf
+_asof = lambda n: pd.DataFrame({'Code': ['004370'], 'Name': ['농심'], 'Stocks': [n]})
+_empty_krx = pd.DataFrame(columns=['Code', 'Stocks'])
+
+try:
+    # ① 기준일이 결산일인 보고서가 있고 사본과 일치 — DART 유통주식수, 경고 없음
+    sh, src, mt = M.get_outstanding_shares('K', 'C', '004370', 2026, '11012', _empty_krx,
+                                           base_date='2026-06-30', df_asof=_asof(6_082_642), asof_date='2026-06-30')
+    chk('결산일 보고서 있으면 DART 유통주식수', sh == 5_834_188 and src == 'DART(11012)', (sh, src))
+    chk('사본 상장주식수와 발행주식수가 같으면 경고 없음', mt['notes'] == [] and mt['check'] == '발행=상장 일치', mt)
+
+    # ② 같은 보고서인데 사본 상장주식수가 다르면 — DART 를 쓰되 경고
+    sh, src, mt = M.get_outstanding_shares('K', 'C', '004370', 2026, '11012', _empty_krx,
+                                           base_date='2026-06-30', df_asof=_asof(6_000_000), asof_date='2026-06-30')
+    chk('발행≠상장이면 DART 를 쓰고 경고', sh == 5_834_188 and len(mt['notes']) == 1
+        and mt['notes'][0][0] == 'WARN' and '+82,642' in mt['notes'][0][1], mt['notes'])
+
+    # ③ 3분기 보고서 제출 전 — 기준일 상장주식수 − 반기보고서 자기주식, 그 사이 공시 없음
+    _tf_ret = []
+    sh, src, mt = M.get_outstanding_shares('K', 'C', '004370', 2026, '11014', _empty_krx,
+                                           base_date='2026-09-30', df_asof=_asof(6_100_000), asof_date='2026-09-30')
+    chk('보고서 제출 전이면 기준일 상장주식수 − 직전 자기주식', sh == 6_100_000 - 248_454
+        and src == 'KRX상장−DART자기주식', (sh, src))
+    chk('자기주식 기준 보고서와 사본 날짜를 근거로 남긴다', mt['treasury_stlm_dt'] == '2026-06-30'
+        and mt['krx_listed'] == 6_100_000 and mt['krx_date'] == '2026-09-30', mt)
+    chk('그 사이 자기주식 공시 조회 구간 = 직전 결산일~기준일', _tf_calls[-1] == ('2026-06-30', '2026-09-30'), _tf_calls)
+    chk('자기주식 공시가 없으면 정보(INFO)', [n[0] for n in mt['notes']] == ['INFO'], mt['notes'])
+
+    # ④ 그 사이 자기주식 공시가 있으면 경고
+    _tf_ret = ['2026-08-20 자기주식취득결과보고서']
+    sh, src, mt = M.get_outstanding_shares('K', 'C', '004370', 2026, '11014', _empty_krx,
+                                           base_date='2026-09-30', df_asof=_asof(6_100_000), asof_date='2026-09-30')
+    chk('그 사이 자기주식 공시가 있으면 경고(WARN)하고 제목을 보인다',
+        mt['notes'][0][0] == 'WARN' and '자기주식취득결과보고서' in mt['notes'][0][1], mt['notes'])
+
+    # ⑤ 공시 조회 실패도 조용히 넘기지 않는다
+    _tf_ret = None
+    sh, src, mt = M.get_outstanding_shares('K', 'C', '004370', 2026, '11014', _empty_krx,
+                                           base_date='2026-09-30', df_asof=_asof(6_100_000), asof_date='2026-09-30')
+    chk('자기주식 공시 조회 실패면 경고', mt['notes'][0][0] == 'WARN' and '조회하지 못했습니다' in mt['notes'][0][1], mt['notes'])
+
+    # ⑥ 사본이 없는 기준일 — 직전 보고서 유통주식수, 경고
+    sh, src, mt = M.get_outstanding_shares('K', 'C', '004370', 2026, '11014', _empty_krx,
+                                           base_date='2026-09-30', df_asof=None, asof_date=None)
+    chk('사본도 없으면 직전 보고서 유통주식수로 대체하고 경고', sh == 5_834_188
+        and src == 'DART(Fallback:2026-11012)' and mt['notes'][0][0] == 'WARN', (sh, src, mt['notes']))
+
+    # ⑦ 결산일이 기준일과 다른 보고서(비12월 결산 등)는 기준일 보고서로 보지 않는다
+    _rep[(2026, '11014')] = (5_900_000, {'stlm_dt': '2026-11-30', 'issued': 6_148_454, 'treasury': 248_454, 'status': '000'})
+    _tf_ret = []
+    sh, src, mt = M.get_outstanding_shares('K', 'C', '004370', 2026, '11014', _empty_krx,
+                                           base_date='2026-09-30', df_asof=_asof(6_100_000), asof_date='2026-09-30')
+    chk('결산일이 기준일 뒤인 보고서는 건너뛰고 기준일 이전 보고서 자기주식을 쓴다',
+        sh == 6_100_000 - 248_454 and mt['treasury_stlm_dt'] == '2026-06-30', (sh, mt.get('treasury_stlm_dt')))
+    del _rep[(2026, '11014')]
+
+    # ⑧ DART 가 전혀 없으면 상장주식수(자기주식 미차감) — 경고
+    M.fetch_dart_distb_shares = lambda *a, **k: _none
+    sh, src, mt = M.get_outstanding_shares('K', 'C', '004370', 2026, '11014', _empty_krx,
+                                           base_date='2026-09-30', df_asof=_asof(6_100_000), asof_date='2026-09-30')
+    chk('DART 가 없으면 상장주식수 그대로, 자기주식 미차감 경고', sh == 6_100_000
+        and src == 'KRX상장(자기주식 미차감)' and mt['notes'][0][0] == 'WARN', (sh, src))
+
+    # ⑨ base_date 없이 부르면 예전 동작(요청 보고서 유통주식수)
+    M.fetch_dart_distb_shares = lambda key, corp, y, code, cache=None: _rep.get((int(y), str(code)), _none)
+    sh, src, mt = M.get_outstanding_shares('K', 'C', '004370', 2026, '11012', _empty_krx)
+    chk('base_date 없이 부르면 예전처럼 DART 유통주식수', sh == 5_834_188 and src == 'DART(11012)', (sh, src))
+finally:
+    M.fetch_dart_distb_shares, M.find_treasury_filings = _orig_fd, _orig_tf
+
+# DART 원문 응답에서 발행·자기주식을 읽는다 — 자기주식 '-' 는 0주
+class _Resp:
+    def __init__(self, js): self._js = js
+    def raise_for_status(self): pass
+    def json(self): return self._js
+_orig_get = M._DART_SESSION.get
+M._DART_SESSION.get = lambda *a, **k: _Resp({'status': '000', 'message': '정상', 'list': [
+    {'se': '보통주', 'istc_totqy': '1,000,000', 'tesstk_co': '-', 'distb_stock_co': '1,000,000', 'stlm_dt': '2026-06-30', 'rcept_no': 'X'},
+    {'se': '합계', 'istc_totqy': '1,000,000', 'tesstk_co': '-', 'distb_stock_co': '1,000,000', 'stlm_dt': '2026-06-30', 'rcept_no': 'X'}]})
+try:
+    _s, _m = M._fetch_dart_distb_shares('K', 'C', 2026, '11012')
+    chk("DART 자기주식 '-' 는 0주로 읽고 발행주식수를 남긴다", _s == 1_000_000 and _m['issued'] == 1_000_000
+        and _m['treasury'] == 0, _m)
+finally:
+    M._DART_SESSION.get = _orig_get
+
+# 자기주식 공시 찾기 — 제목에 자기주식·소각이 들어간 것만, 날짜 형식
+M._DART_SESSION.get = lambda *a, **k: _Resp({'status': '000', 'total_page': 1, 'list': [
+    {'report_nm': '주요사항보고서(자기주식취득결정)', 'rcept_dt': '20260715'},
+    {'report_nm': '분기보고서 (2026.03)', 'rcept_dt': '20260514'},
+    {'report_nm': '주식소각결정', 'rcept_dt': '20260801'}]})
+try:
+    _f = M.find_treasury_filings('K', 'C', '2026-06-30', '2026-09-30')
+    chk('자기주식·소각 공시만 날짜와 함께 고른다',
+        _f == ['2026-07-15 주요사항보고서(자기주식취득결정)', '2026-08-01 주식소각결정'], _f)
+    chk('직전 결산일이 기준일 이후면 빈 목록', M.find_treasury_filings('K', 'C', '2026-09-30', '2026-09-30') == [])
+finally:
+    M._DART_SESSION.get = _orig_get
+
+# 수집부 — 주식수 근거가 Market_Cap 시트 열과 Data_Quality 로 이어진다
+chk('수집부가 기준일과 사본을 주식수 조회에 넘긴다',
+    "base_date=bds, df_asof=_pr_df, asof_date=_pr_date" in _src
+    and "quality.add(_lvl, ticker, display_name, f'주식수 {tp}', _msg)" in _src)
+chk('Market_Cap 시트에 상장주식수·자기주식 근거 열', all(k in _src for k in
+    ("('KRX_Listed_Shares',16)", "('Treasury',14)", "('Treasury_StlmDt',13)", "('Shares_Check',18)")))
+
 print()
 print(f"잘못된 항목 {fails}건")
 sys.exit(1 if fails else 0)

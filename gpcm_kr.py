@@ -843,7 +843,7 @@ def fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code:
 
 def _fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code: str):
     meta = {'shares': None, 'rcept_no': None, 'stlm_dt': None, 'se': None, 'status': None, 'message': None,
-            'pref_shares': None}
+            'pref_shares': None, 'issued': None, 'treasury': None}
     try:
         params = {
             'crtfc_key': api_key,
@@ -887,12 +887,18 @@ def _fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code
         meta['stlm_dt'] = row.get('stlm_dt')
         meta['se'] = row.get('se')
 
+        # 발행주식총수·자기주식 — 기준일 상장주식수와 맞춰 보거나, 거기서 자기주식을 뺄 때 쓴다.
+        # 자기주식이 없으면 DART 는 '-' 로 준다 → 발행주식수가 있으면 0주로 본다.
+        istc = _to_int(row.get('istc_totqy'))
+        tes = _to_int(row.get('tesstk_co'))
+        if tes is None and istc is not None:
+            tes = 0
+        meta['issued'] = istc
+        meta['treasury'] = tes
+
         shares = _to_int(row.get('distb_stock_co'))
-        if shares is None:
-            istc = _to_int(row.get('istc_totqy'))
-            tes = _to_int(row.get('tesstk_co'))
-            if istc is not None and tes is not None:
-                shares = istc - tes
+        if shares is None and istc is not None and tes is not None:
+            shares = istc - tes
 
         meta['shares'] = shares
         return shares, meta
@@ -951,51 +957,180 @@ def get_preferred_market_value(ticker: str, bds: str, df_krx: pd.DataFrame, sh_m
     return round(total, 1), info
 
 
-def get_outstanding_shares(api_key, corp_code: str, ticker: str, bsns_year: int, reprt_code: str, df_krx: pd.DataFrame, cache=None):
-    # 1. DART API 조회 (요청한 기준년도/분기)
-    shares, meta = fetch_dart_distb_shares(api_key, corp_code, bsns_year, reprt_code, cache=cache)
-    if shares is not None and shares > 0:
-        return shares, f"DART({reprt_code})", meta
+REPORT_ORDER = ['11013', '11012', '11014', '11011']  # 1Q → 반기 → 3Q → 사업보고서 (시간순)
+DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
+# 기준일 상장주식수에서 직전 보고서의 자기주식을 뺄 때, 그 사이 자기주식 수가 바뀌었을 수 있는 공시
+TREASURY_EVENT_KW = ('자기주식', '주식소각', '자사주')
 
-    # 2. 직전 보고서들에서 주식수 조회 시도 (요청 분기에 주식수 누락 시)
-    # 시간순: 11013 (1Q), 11012 (반기), 11014 (3Q), 11011 (사업보고서)
-    order = ['11013', '11012', '11014', '11011']
+
+def _reports_back(bsns_year: int, reprt_code: str, n: int = 9):
+    """요청 보고서부터 거꾸로 n개 (연도, 보고서코드)."""
     try:
-        current_idx = order.index(reprt_code)
-    except Exception:
-        current_idx = 3 # 기본 사업보고서 매핑
-
-    cy = bsns_year
-    ci = current_idx - 1
-    
-    # 최근 8개 분기(약 2년치)를 역순으로 훑어 가장 최근 공시된 주식총수를 찾음
-    for _ in range(8):
-        if ci < 0:
-            cy -= 1
-            ci = 3
-        
-        fb_code = order[ci]
-        fb_shares, fb_meta = fetch_dart_distb_shares(api_key, corp_code, cy, fb_code, cache=cache)
-        
-        if fb_shares is not None and fb_shares > 0:
-            # 과거 분기 정보를 찾았을 경우, 해당 출처(년도와 보고서 코드) 명시하여 반환
-            return fb_shares, f"DART(Fallback:{cy}-{fb_code})", fb_meta
-            
+        ci = REPORT_ORDER.index(str(reprt_code))
+    except ValueError:
+        ci = 3
+    cy = int(bsns_year)
+    for _ in range(n):
+        yield cy, REPORT_ORDER[ci]
         ci -= 1
+        if ci < 0:
+            cy, ci = cy - 1, 3
 
-    # 3. KRX 캐시 조회 (작동 안 할 확률 높음)
+
+def krx_listed_shares(ticker: str, df_asof: pd.DataFrame | None):
+    """기준일 종목 명단 사본의 보통주 상장주식수. 자기주식이 포함된 숫자다. 없으면 None."""
+    if df_asof is None or df_asof.empty or 'Code' not in df_asof.columns or 'Stocks' not in df_asof.columns:
+        return None
+    row = df_asof[df_asof['Code'].astype(str).str.zfill(6) == str(ticker).zfill(6)]
+    if row.empty:
+        return None
+    v = _to_int(row.iloc[0].get('Stocks'))
+    return v if v and v > 0 else None
+
+
+def find_treasury_filings(api_key, corp_code: str, after: str, until: str, cache=None):
+    """after 다음 날부터 until 까지 자기주식 취득·처분·소각 관련 공시 ['YYYY-MM-DD 제목', ...].
+
+    조회에 실패하면 None — '없음(빈 목록)'과 구분한다.
+    """
+    try:
+        bgn = (pd.to_datetime(after) + timedelta(days=1)).strftime('%Y%m%d')
+        end = pd.to_datetime(until).strftime('%Y%m%d')
+    except Exception:
+        return None
+    if bgn > end:
+        return []
+    ck = ('treasury_filings', corp_code, bgn, end)
+    if cache is not None and ck in cache:
+        return cache[ck]
+    try:
+        out, page = [], 1
+        while True:
+            resp = _DART_SESSION.get(DART_LIST_URL, params={
+                'crtfc_key': api_key, 'corp_code': corp_code, 'bgn_de': bgn, 'end_de': end,
+                'page_no': page, 'page_count': 100}, timeout=10)
+            resp.raise_for_status()
+            js = resp.json()
+            if js.get('status') == '013':  # 조회된 데이터 없음
+                break
+            if js.get('status') != '000':
+                return None
+            for it in js.get('list', []):
+                nm = str(it.get('report_nm') or '')
+                if any(k in nm for k in TREASURY_EVENT_KW):
+                    d = str(it.get('rcept_dt') or '')
+                    title = re.sub(r'\s+', ' ', nm).strip()
+                    out.append(f"{d[:4]}-{d[4:6]}-{d[6:]} {title}")
+            if page >= int(js.get('total_page') or 1):
+                break
+            page += 1
+    except Exception:
+        return None
+    if cache is not None:
+        cache[ck] = out
+    return out
+
+
+def get_outstanding_shares(api_key, corp_code: str, ticker: str, bsns_year: int, reprt_code: str,
+                           df_krx: pd.DataFrame, cache=None, base_date: str | None = None,
+                           df_asof: pd.DataFrame | None = None, asof_date: str | None = None):
+    """기준일 보통주 유통주식수 (주식수, 출처, 근거 meta).
+
+    1) 기준일이 결산일인 DART 보고서가 있으면 그 유통주식수(발행 − 자기주식). 기준일 상장주식수
+       사본이 있으면 발행주식수와 맞춰 보고, 다르면 경고한다(발행 후 미상장 신주 등).
+    2) 없으면(보고서 제출 전 등) 기준일 상장주식수 사본 − 직전 보고서의 자기주식.
+       그 사이 자기주식 관련 공시가 있으면 경고한다.
+    3) 사본도 없으면(2026-03-08 이전 기준일) 직전 보고서 유통주식수 — 경고.
+    4) 그래도 없으면 상장주식수(자기주식 미차감) — 경고.
+    meta['notes'] 에 [(심각도, 문구)] 를 담는다. 호출부가 Data_Quality 로 옮긴다.
+    base_date 를 주지 않으면 1)의 결산일 확인과 사본 대사를 건너뛴다(예전 동작).
+    """
+    listed = krx_listed_shares(ticker, df_asof)
+    krx_note = f"기준일 상장주식수 {listed:,}주({asof_date} KRX 명단 사본)" if listed else None
+    extra = {'krx_listed': listed, 'krx_date': asof_date if listed else None, 'notes': []}
+
+    def _with(meta, **kw):
+        m = dict(meta or {})
+        m.update(extra)
+        m.update(kw)
+        return m
+
+    # 1) 기준일이 결산일인 보고서
+    shares, meta = fetch_dart_distb_shares(api_key, corp_code, bsns_year, reprt_code, cache=cache)
+    stlm = str((meta or {}).get('stlm_dt') or '')
+    if shares is not None and shares > 0 and (base_date is None or not stlm or stlm == str(base_date)):
+        m = _with(meta, treasury_stlm_dt=meta.get('stlm_dt'))
+        issued = meta.get('issued')
+        if listed and issued:
+            if listed == issued:
+                m['check'] = '발행=상장 일치'
+            else:
+                m['check'] = f'발행−상장 {issued - listed:+,}'
+                m['notes'].append((SEV_WARN,
+                    f"DART 발행주식수 {issued:,}주({stlm} 보고서)와 {krx_note}가 {issued - listed:+,}주 다릅니다. "
+                    f"발행 후 아직 상장되지 않은 신주(CB 전환 등)이거나 사본 날짜 차이일 수 있습니다. "
+                    f"결산일 기준 DART 유통주식수({shares:,}주)를 썼습니다."))
+        return shares, f"DART({reprt_code})", m
+
+    # 기준일 이전 결산일 중 가장 최근 보고서 — 자기주식(2) 또는 유통주식수 대체(3)에 쓴다
+    prior, prior_code = None, None
+    for cy, code in _reports_back(bsns_year, reprt_code):
+        s_, m_ = fetch_dart_distb_shares(api_key, corp_code, cy, code, cache=cache)
+        st_ = str((m_ or {}).get('stlm_dt') or '')
+        if s_ is not None and s_ > 0 and (base_date is None or not st_ or st_ <= str(base_date)):
+            prior, prior_code = (s_, m_), f"{cy}-{code}"
+            break
+
+    # 2) 기준일 상장주식수 − 직전 보고서 자기주식
+    if listed and prior and prior[1].get('treasury') is not None and listed > prior[1]['treasury']:
+        p_shares, p_meta = prior
+        tr, tr_dt = p_meta['treasury'], p_meta.get('stlm_dt')
+        shares = listed - tr
+        m = _with(p_meta, shares=shares, treasury_stlm_dt=tr_dt, check='상장−자기주식')
+        filings = find_treasury_filings(api_key, corp_code, tr_dt, base_date, cache=cache) if base_date and tr_dt else None
+        msg = (f"기준일({base_date})이 결산일인 보고서가 아직 없어 {krx_note}에서 {tr_dt} 보고서의 자기주식 "
+               f"{tr:,}주를 빼 유통주식수 {shares:,}주로 정했습니다.")
+        if filings:
+            shown = ', '.join(filings[:5]) + (f' 외 {len(filings) - 5}건' if len(filings) > 5 else '')
+            m['notes'].append((SEV_WARN, msg + f" 그 사이 자기주식 관련 공시가 있습니다({shown}) — "
+                               f"취득·처분·소각 수량만큼 자기주식이 달라졌을 수 있으니 확인하세요. "
+                               f"소각이면 상장주식수와 자기주식이 함께 줄어 두 번 빠집니다."))
+        elif filings is None:
+            m['notes'].append((SEV_WARN, msg + " 그 사이 자기주식 관련 공시를 조회하지 못했습니다 — DART 에서 확인하세요."))
+        else:
+            m['notes'].append((SEV_INFO, msg + " 그 사이 자기주식 관련 공시는 없습니다."))
+        return shares, 'KRX상장−DART자기주식', m
+
+    # 3) 사본이 없으면 직전 보고서 유통주식수 그대로
+    if prior:
+        p_shares, p_meta = prior
+        m = _with(p_meta, treasury_stlm_dt=p_meta.get('stlm_dt'), check='직전 보고서')
+        why = ('기준일 KRX 명단 사본도 없어(사본은 2026-03-08부터)' if not listed
+               else '직전 보고서의 자기주식 수를 확인하지 못해')
+        m['notes'].append((SEV_WARN,
+            f"기준일({base_date or bsns_year})이 결산일인 보고서가 없고 {why} {p_meta.get('stlm_dt') or prior_code} "
+            f"보고서 유통주식수 {p_shares:,}주를 그대로 썼습니다. 그 사이 증자·전환·자기주식 변동은 반영되지 않았습니다."))
+        return p_shares, f"DART(Fallback:{prior_code})", m
+
+    # 4) DART 가 전혀 없으면 상장주식수 — 자기주식이 빠지지 않은 숫자다
+    if listed:
+        m = _with(meta, shares=listed, check='자기주식 미차감')
+        m['notes'].append((SEV_WARN, f"DART 주식총수 현황을 못 받아 {krx_note}를 그대로 썼습니다. "
+                                     f"자기주식이 빠지지 않아 시가총액이 커졌을 수 있습니다."))
+        return listed, 'KRX상장(자기주식 미차감)', m
     try:
         row = df_krx[df_krx['Code'] == ticker]
         if not row.empty:
             shares_krx = _to_int(row.iloc[0].get('Stocks'))
             if shares_krx is not None and shares_krx > 0:
-                meta_f = dict(meta)
-                meta_f['shares'] = shares_krx
-                return shares_krx, 'KRX', meta_f
+                m = _with(meta, shares=shares_krx, check='오늘 상장주식수')
+                m['notes'].append((SEV_WARN, f"DART 주식총수 현황과 기준일 명단 사본을 모두 못 받아 오늘 기준 상장주식수 "
+                                             f"{shares_krx:,}주를 썼습니다. 기준일 주식수가 아니고 자기주식도 빠지지 않았습니다."))
+                return shares_krx, 'KRX(오늘)', m
     except Exception:
         pass
 
-    return None, 'N/A', meta
+    return None, 'N/A', _with(meta)
 
 # --- BS Matching Logic ---
 IBD_AID_ALWAYS = {
@@ -1780,7 +1915,15 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                 # 1) Market Cap (기준시점만)
                 if role in ('current_cum', 'annual'):
                     price, price_date = get_stock_price(ticker, bds)
-                    shares, shares_src, sh_meta = get_outstanding_shares(api_key_input, corp_code, ticker, year, r_code, df_krx, cache=dart_fs_cache)
+                    # 기준일 당시 종목 명단 사본 — 보통주 상장주식수와 상장 우선주 찾기에 함께 쓴다
+                    if bds not in pref_roster_cache:
+                        pref_roster_cache[bds] = get_krx_price_listing_as_of(bds)
+                    _pr_df, _pr_date, _ = pref_roster_cache[bds]
+                    shares, shares_src, sh_meta = get_outstanding_shares(
+                        api_key_input, corp_code, ticker, year, r_code, df_krx, cache=dart_fs_cache,
+                        base_date=bds, df_asof=_pr_df, asof_date=_pr_date)
+                    for _lvl, _msg in (sh_meta or {}).get('notes') or []:
+                        quality.add(_lvl, ticker, display_name, f'주식수 {tp}', _msg)
 
                     mkt_100m = 0
                     if price is not None and shares is not None and shares > 0:
@@ -1801,9 +1944,6 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
 
                     # 상장 우선주 시가 — 있으면 자기자본가치에 장부(우선주자본금) 대신 쓴다.
                     # 우선주는 기준일 당시 종목 명단으로 찾는다(오늘 명단은 그 사이 상장폐지된 우선주를 놓친다).
-                    if bds not in pref_roster_cache:
-                        pref_roster_cache[bds] = get_krx_price_listing_as_of(bds)
-                    _pr_df, _pr_date, _ = pref_roster_cache[bds]
                     pref_mkt_100m, pref_info = get_preferred_market_value(
                         ticker, bds, df_krx, sh_meta, df_asof=_pr_df, asof_date=_pr_date)
                     if pref_info and pref_info['problems']:
@@ -1834,6 +1974,9 @@ def fetch_financial_data(api_key_input, target_code_list, target_periods, dart, 
                         'Shares_Source': shares_src, 'Shares_RceptNo': sh_meta.get('rcept_no'),
                         'Shares_StlmDt': sh_meta.get('stlm_dt'), 'Shares_Se': sh_meta.get('se'),
                         'DART_Status': sh_meta.get('status'), 'DART_Message': sh_meta.get('message'),
+                        'KRX_Listed': sh_meta.get('krx_listed'), 'KRX_Date': sh_meta.get('krx_date'),
+                        'DART_Issued': sh_meta.get('issued'), 'Treasury': sh_meta.get('treasury'),
+                        'Treasury_StlmDt': sh_meta.get('treasury_stlm_dt'), 'Shares_Check': sh_meta.get('check'),
                         'Pref_Codes': ', '.join(f"{it['code']} {it['name']}" for it in (pref_info or {}).get('items', [])) or None,
                         'Pref_Close': ', '.join(f"{it['close']:,.0f}" for it in (pref_info or {}).get('items', [])) or None,
                         'Pref_Shares': sum(it['shares'] for it in (pref_info or {}).get('items', [])) or None,
@@ -2374,10 +2517,13 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
 
     # Sheet 3: Market_Cap
     ws_mc = wb.create_sheet('Market_Cap')
-    ws_mc.merge_cells('A1:R1'); ws_mc['A1'] = "Market_Cap (Price & Shares)"; sc(ws_mc['A1'], fo=fT)
-    ws_mc.merge_cells('A2:R2'); ws_mc['A2'] = "Logic: 종가(FDR) × 유통주식수(DART) | 상장 우선주: 우선주 종가 × 우선주 유통주식수 → GPCM 시트 우선주 열(없으면 장부 우선주자본금) | Unit: 억원"; sc(ws_mc['A2'], fo=fS)
+    ws_mc.merge_cells('A1:X1'); ws_mc['A1'] = "Market_Cap (Price & Shares)"; sc(ws_mc['A1'], fo=fT)
+    ws_mc.merge_cells('A2:X2'); ws_mc['A2'] = ("Logic: 종가(FDR) × 유통주식수 — 기준일이 결산일인 DART 보고서가 있으면 그 유통주식수(발행−자기주식), "
+                                              "없으면 기준일 상장주식수(KRX 명단 사본) − 직전 보고서 자기주식 | 상장 우선주: 우선주 종가 × 우선주 유통주식수 → "
+                                              "GPCM 시트 우선주 열(없으면 장부 우선주자본금) | Unit: 억원"); sc(ws_mc['A2'], fo=fS)
     cols = [('Company',15), ('Ticker',10), ('Period',10), ('Price_Date',12), ('Close',12),('Shares',16), ('Market_Cap_100M',18),('Shares_Source',12), ('Shares_RcpNo',16), ('Shares_StlmDt',12), ('Shares_Se',10),('DART_Status',10), ('DART_Message',40),
-            ('Pref_Listed',22), ('Pref_Close',12), ('Pref_Shares',14), ('Pref_Market_Cap_100M',18), ('Pref_Source',22)]
+            ('Pref_Listed',22), ('Pref_Close',12), ('Pref_Shares',14), ('Pref_Market_Cap_100M',18), ('Pref_Source',22),
+            ('KRX_Listed_Shares',16), ('KRX_Copy_Date',12), ('DART_Issued',16), ('Treasury',14), ('Treasury_StlmDt',13), ('Shares_Check',18)]
     header_row = 4
     ws_mc.append([]); ws_mc.append([c[0] for c in cols])
     for i, (_, w) in enumerate(cols): ws_mc.column_dimensions[get_column_letter(i+1)].width = w; sc(ws_mc.cell(header_row, i+1), fo=fH, fi=pH, al=aC, bd=BD)
@@ -2385,13 +2531,14 @@ def export_gpcm_excel(base_period_str, base_qtr, target_code_list, screen_summar
     if all_mkt:
         for rd in all_mkt:
             vals = [rd.get('Company'), rd.get('Ticker'), rd.get('Period'), rd.get('Price_Date'), rd.get('Close'),rd.get('Outstanding_Shares'), rd.get('Market_Cap_100M'),rd.get('Shares_Source'), rd.get('Shares_RceptNo'), rd.get('Shares_StlmDt'), rd.get('Shares_Se'),rd.get('DART_Status'), rd.get('DART_Message'),
-                    rd.get('Pref_Codes'), rd.get('Pref_Close'), rd.get('Pref_Shares'), rd.get('Pref_Market_Cap_100M') or 0, rd.get('Pref_Source')]
+                    rd.get('Pref_Codes'), rd.get('Pref_Close'), rd.get('Pref_Shares'), rd.get('Pref_Market_Cap_100M') or 0, rd.get('Pref_Source'),
+                    rd.get('KRX_Listed'), rd.get('KRX_Date'), rd.get('DART_Issued'), rd.get('Treasury'), rd.get('Treasury_StlmDt'), rd.get('Shares_Check')]
             for i, v in enumerate(vals):
                 c = ws_mc.cell(r, i+1); c.value = v
-                nf = NP if i==4 else (NI_FMT if i in (5, 15) else (NB1 if i in (6, 16) else None)); al = aR if i in [4,5,6,14,15,16] else aL
+                nf = NP if i==4 else (NI_FMT if i in (5, 15, 18, 20, 21) else (NB1 if i in (6, 16) else None)); al = aR if i in [4,5,6,14,15,16,18,20,21] else aL
                 sc(c, fo=fA, fi=pW, al=al, nf=nf, bd=BD)
             r += 1
-    ws_mc.auto_filter.ref = f"A{header_row}:R{r-1}"; ws_mc.freeze_panes = f"A{header_row+1}"
+    ws_mc.auto_filter.ref = f"A{header_row}:X{r-1}"; ws_mc.freeze_panes = f"A{header_row+1}"
 
     # Sheet 4: LTM_Calc
     ws_ltm = wb.create_sheet('LTM_Calc')
@@ -3476,7 +3623,7 @@ if ui_mode == "GPCM Valuation (기존)":
         '• 공통: 연결재무제표 작성 시 CFS 우선, 미존재 시 OFS 기준으로 수집',
         '• PL: 요약 손익계산서에서 매출액/영업이익/당기순이익 3개 계정만 엄격 추출',
         '• PL Fetch: finstate(요약) → finstate_all(CFS/OFS) fallback',
-        '• Shares: DART(stockTotqySttus) 유통주식수(distb_stock_co) 우선, 미공시 시 DART 과거보고서 fallback',
+        '• Shares: 기준일이 결산일인 DART 보고서 유통주식수(distb_stock_co) 우선(기준일 KRX 상장주식수와 대사), 보고서 제출 전이면 기준일 KRX 상장주식수(명단 사본, 2026-03-08부터) − 직전 보고서 자기주식, 사본도 없으면 직전 보고서 유통주식수 — 대체 시 Data_Quality',
         '• EV = Market Cap + 우선주(상장 우선주는 시가, 아니면 장부) + IBD − Cash + NCI − NOA',
         '• Net Debt = IBD − Cash − NOA',
         '• IBD(Option): CB/EB/BW 등 메자닌은 기본적으로 IBD(Option)으로 태깅되어 EV/NetDebt에서 제외됨',
