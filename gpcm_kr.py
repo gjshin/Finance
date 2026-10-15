@@ -870,15 +870,21 @@ def _fetch_dart_distb_shares(api_key, corp_code: str, bsns_year: int, reprt_code
             c2 = df[df['se'].astype(str).str.contains('합계', na=False)]
             pick = c1 if not c1.empty else (c2 if not c2.empty else df)
             # 우선주 유통주식수 — 상장 우선주 시가총액에 쓴다(보통주 시가총액과 같은 보고서 기준)
-            cp = df[df['se'].astype(str).str.contains('우선', na=False)]
+            # 회사마다 '우선주'·'종류주식'으로 적는다(예: 한미반도체 '보통주식'·'종류주식').
+            # '종류주식'에는 비상장 상환전환우선주 등이 섞일 수 있어 우선주 시가 계산에서 상장주식수와 대사한다.
+            se_s = df['se'].astype(str)
+            cp = df[se_s.str.contains('우선', na=False)]
+            if cp.empty:
+                cp = df[se_s.str.contains('종류', na=False)]
             if not cp.empty:
                 prow = cp.iloc[0].to_dict()
                 ps = _to_int(prow.get('distb_stock_co'))
                 if ps is None:
                     pi, pt = _to_int(prow.get('istc_totqy')), _to_int(prow.get('tesstk_co'))
-                    if pi is not None and pt is not None:
-                        ps = pi - pt
-                meta['pref_shares'] = ps
+                    if pi is not None:
+                        ps = pi - (pt or 0)  # 자기주식 '-' 는 0주
+                meta['pref_shares'] = ps if ps and ps > 0 else None
+                meta['pref_se'] = prow.get('se')
         else:
             pick = df
 
@@ -938,12 +944,16 @@ def get_preferred_market_value(ticker: str, bds: str, df_krx: pd.DataFrame, sh_m
     items, problems, total = [], [], 0.0
     for code, name in prefs:
         price, pdate = get_stock_price(code, bds)
-        if len(prefs) == 1 and dart_pref:
+        row = roster[roster['Code'].astype(str) == code]
+        listed = _to_int(row.iloc[0].get('Stocks')) if not row.empty and 'Stocks' in row.columns else None
+        if len(prefs) == 1 and dart_pref and not (listed and dart_pref > listed):
             shares, src = dart_pref, 'DART 우선주 유통주식수'
+        elif len(prefs) == 1 and dart_pref:
+            # DART 우선주(종류주식) 합계가 이 종목 상장주식수보다 많다 — 비상장 종류주식이 섞인 것으로 보고
+            # 상장된 수량만 시가로 계산한다. 비상장분은 시가가 없다.
+            shares, src = listed, f'KRX 상장주식수(DART 우선주·종류주식 {dart_pref:,}주보다 적음 — 비상장분 제외)'
         else:
-            row = roster[roster['Code'].astype(str) == code]
-            shares = _to_int(row.iloc[0].get('Stocks')) if not row.empty and 'Stocks' in row.columns else None
-            src = 'KRX 상장주식수'
+            shares, src = listed, 'KRX 상장주식수'
         if price is None or not shares:
             problems.append(f"{name}({code}) " + ('종가' if price is None else '주식수') + ' 조회 실패')
             continue

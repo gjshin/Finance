@@ -839,8 +839,9 @@ check('5Y 가 1Y 보다 행이 많다', rowsC > rows, (rowsC, rows))
 _orig_listing, _orig_sh = M.get_krx_listing, M.get_outstanding_shares
 _orig_prl = M.get_krx_price_listing_as_of
 M.get_krx_price_listing_as_of = lambda a, max_back_days=10: (None, None, 'https://example/none.csv')
+# 상장주식수는 DART 유통주식수 이상이어야 현실적이다(유통 = 발행 − 자기주식)
 M.get_krx_listing = lambda: pd.DataFrame({'Code': ['005930', '005935'], 'Name': ['테스트', '테스트우'],
-                                          'Stocks': [100, 10]})
+                                          'Stocks': [1_000_000, 200_000]})
 M.get_outstanding_shares = lambda *a, **k: (1_000_000, 'DART(11012)', {'pref_shares': 200_000})
 try:
     rP = W.run_gpcm(['005930'], '2024.1Q')
@@ -863,7 +864,7 @@ try:
     # 기준일 명단에만 있는 우선주(그 뒤 상장폐지)
     M.get_krx_listing = lambda: pd.DataFrame({'Code': ['005930'], 'Name': ['테스트'], 'Stocks': [100]})
     M.get_krx_price_listing_as_of = lambda a, max_back_days=10: (
-        pd.DataFrame({'Code': ['005930', '005935'], 'Name': ['테스트', '테스트우'], 'Stocks': [100, 10]}),
+        pd.DataFrame({'Code': ['005930', '005935'], 'Name': ['테스트', '테스트우'], 'Stocks': [1_000_000, 200_000]}),
         '2024-03-29', 'https://example/2024-03-29.csv')
     rQ = W.run_gpcm(['005930'], '2024.1Q')
     W._jobs[rQ['job_id']]['thread'].join(timeout=60)
