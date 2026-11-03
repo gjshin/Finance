@@ -1,10 +1,10 @@
 # .mcpb 번들에 넣지 않을 것들.
 # 서버가 돌아가는 데 필요한 것만 담는다:
-#   gpcm_mcp.py, gpcm_kr.py, requirements-mcp.txt,
+#   gpcm_mcp.py, gpcm_kr.py, GPCM.py(해외판), requirements-mcp.txt,
 #   requirements.txt (requirements-mcp.txt가 -r 로 참조), manifest.json
 .git/
 .github/
-GPCM.py
+# GPCM.py 는 0.10.0 부터 번들에 넣는다 — run_gpcm_global 이 임포트한다
 run_kr.bat
 run_global.bat
 install_mcp.ps1
@@ -12,6 +12,7 @@ test_gpcm_kr.py
 test_gpcm_kr_quality.py
 test_gpcm_mcp.py
 test_gpcm_global.py
+test_gpcm_mcp_global.py
 README.md
 _먼저읽어보세요.md
 .gitattributes
