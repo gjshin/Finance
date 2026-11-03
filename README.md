@@ -161,8 +161,8 @@ powershell -ExecutionPolicy Bypass -File .\install_mcp.ps1
 run_gpcm으로 005930, 000660, 042700 돌려줘. 기간은 2025.4Q
 ```
 
-- 도구 7개:
-  - `run_gpcm`(실행) · `gpcm_status`(진행·결과) · `gpcm_review`(배수 이상치·베타 신뢰도 검토)
+- 도구 8개:
+  - `run_gpcm`(국내 실행) · `run_gpcm_global`(해외 실행 — 아래) · `gpcm_status`(진행·결과) · `gpcm_review`(배수 이상치·베타 신뢰도 검토)
   - `get_wacc_inputs`(기준일 국고채·회사채 금리를 출처와 함께)
   - `gpcm_doctor`(버전·인증키·연결 한 번에 점검) · `check_trading_gaps`(거래정지 흔적 — `as_of` 에 평가기준일을 넣으면 베타 관측 구간과 같은 창)
   - `list_krx_companies`(오늘
@@ -171,6 +171,22 @@ run_gpcm으로 005930, 000660, 042700 돌려줘. 기간은 2025.4Q
 - 결과 엑셀은 **문서\GPCM** 폴더에 저장된다. 시트 구성은 앱과 동일하다
   (GPCM·Data_Quality·WACC·Beta·BS_Full·PL_Data·Market_Cap·LTM_Calc…).
 - **숫자를 쓰기 전에 Data_Quality 시트부터** — 앱과 같은 원칙이다.
+
+## 해외 상장사도 대화에서 — `run_gpcm_global` (0.10.0~)
+
+`run_global.bat` 앱(야후파이낸스)과 같은 계산을 대화에서 돌린다. 인증키는 필요 없다.
+
+```
+run_gpcm_global 로 7273.T, MG.TO, 200880.KS 돌려줘. 기준은 2026.2Q
+```
+
+- **비교기업은 사용자가 미리 검토해 정한 티커를 직접 준다.** Claude 는 회사를 고르거나 티커를 고치지 않는다
+  (형식이 이상하면 되묻는다).
+- 입력은 앱 사이드바와 같다: 기준 분기, 무위험이자율·시장위험프리미엄·사이즈 프리미엄·타인자본비용·법인세율·베타 종류
+  (+ 선택: 과거 연수, 이상치 처리, 피평가회사 숫자 → `Implied_Valuation`).
+- 결과는 **문서\GPCM\Global_GPCM_….xlsx**. 시트 구성은 앱과 같고, `Data_Quality` 에 사용자 입력 티커와 금리 출처가 남는다.
+- 상태 보고에 자료를 못 받은 티커, EBITDA 가 없어 감가상각비 0 으로 처리된 회사가 함께 나온다.
+- `gpcm_doctor` 가 해외판 계산 파일과 야후파이낸스 연결도 점검한다.
 
 ## 폴더를 옮기면
 
@@ -300,7 +316,7 @@ Cash (현금성자산)         NCI (비지배지분)       발행주식수
 | `requirements.txt` | 필요한 라이브러리 목록 — 실행 파일이 알아서 쓴다 |
 | `install_mcp.ps1` | **Claude 데스크톱에 GPCM 등록** — 위 절 참고 |
 | `gpcm_mcp.py` / `requirements-mcp.txt` | 데스크톱 연동 본체 — 직접 실행할 일 없음 |
-| `test_gpcm_kr.py` 등 `test_*.py` | 개발자용 검증 코드 |
+| `test_gpcm_kr.py` 등 `test_*.py` | 개발자용 검증 코드 (`test_gpcm_mcp_global.py` = 해외판 대화 실행) |
 
 ---
 

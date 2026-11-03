@@ -94,6 +94,24 @@ def _load():
             print("gpcm-mcp: 계산 모듈 준비 완료", file=sys.stderr)
     return M
 
+# 해외판(GPCM.py — 야후파이낸스) 도 같은 방식으로 늦게 로드한다. 국내판과 따로 들고 있다.
+G = None
+_load_g_lock = threading.Lock()
+
+
+def _load_global():
+    """GPCM.py(해외 상장사·야후파이낸스 앱)를 (한 번만) 로드하고 돌려준다."""
+    global G
+    with _load_g_lock:
+        if G is None:
+            print("gpcm-mcp: 해외판 계산 모듈 로드 중...", file=sys.stderr)
+            with _muted_stdout():
+                import GPCM as _G
+            G = _G
+            print("gpcm-mcp: 해외판 계산 모듈 준비 완료", file=sys.stderr)
+    return G
+
+
 OUTPUT_DIR = Path.home() / "Documents" / "GPCM"
 
 # 사이드바 기본값과 동일하게 유지한다 (gpcm_kr.py 의 위젯 기본값)
@@ -133,7 +151,7 @@ _PERIOD_RE = re.compile(r"^\d{4}\.[1-4]Q$")
 
 # 이 서버가 내보내야 할 도구. 파이썬 3.14 에서 pydantic 이 깨져 등록이 중간에
 # 멈춘 적이 있어(첫 도구 하나만 남았다), gpcm_doctor 가 실제 등록분과 대조한다.
-EXPECTED_TOOLS = ("get_wacc_inputs", "run_gpcm", "gpcm_status", "gpcm_review",
+EXPECTED_TOOLS = ("get_wacc_inputs", "run_gpcm", "run_gpcm_global", "gpcm_status", "gpcm_review",
                   "list_krx_companies", "check_trading_gaps", "gpcm_doctor")
 
 # 설치 경로가 둘이라 버전이 어긋날 수 있다: 확장(.mcpb)은 설치 시점의 사본을 쓰고,
@@ -558,13 +576,24 @@ def gpcm_status(job_id: str | None = None) -> dict[str, Any]:
         result["file"] = job["file"]
         result["data_quality"] = job["dq"]
         result["target_wacc_pct"] = job["target_wacc"]
+        if job.get("wacc_detail"):
+            result["wacc_detail"] = job["wacc_detail"]
         if job.get("tax_basis"):
             # 세율을 자동으로 정했으면 무엇을 근거로 했는지 함께 보고한다
             result["tax_rate_basis"] = job["tax_basis"]
-        result["note"] = (
-            "숫자를 쓰기 전에 엑셀의 Data_Quality 시트를 먼저 확인하세요. "
-            "ERROR가 있으면 해당 값은 수집 실패로 0이 들어가 있습니다. "
-            "D&A는 자동 수집이 안 되므로 EBITDA는 엑셀에서 수기 입력이 필요합니다.")
+        if job.get("kind") == "global":
+            result["kind"] = "global (야후파이낸스)"
+            if job.get("failed_tickers"):
+                result["failed_tickers"] = job["failed_tickers"]
+            result["note"] = (
+                "숫자를 쓰기 전에 엑셀의 Data_Quality 시트와 GPCM 시트의 PL Date 열(실제로 쓴 손익 기간의 끝)을 먼저 확인하세요. "
+                "야후 자료는 회사·거래소에 따라 빠지는 항목이 있고, 빈 값은 0이 아니라 '받지 못함'입니다. "
+                "EBITDA 항목이 없는 회사는 감가상각비 0으로 처리돼 EV/EBITDA = EV/EBIT 이 됩니다(Data_Quality 'EBITDA').")
+        else:
+            result["note"] = (
+                "숫자를 쓰기 전에 엑셀의 Data_Quality 시트를 먼저 확인하세요. "
+                "ERROR가 있으면 해당 값은 수집 실패로 0이 들어가 있습니다. "
+                "D&A는 자동 수집이 안 되므로 EBITDA는 엑셀에서 수기 입력이 필요합니다.")
         if job.get("review", {}).get("toReview"):
             result["to_review"] = len(job["review"]["toReview"])
             result["note"] += (f' 배수·베타에서 재검토가 필요한 회사가 '
@@ -572,6 +601,264 @@ def gpcm_status(job_id: str | None = None) -> dict[str, Any]:
     elif job["state"] == "failed":
         result["error"] = job["error"]
     return result
+
+
+# ---------------------------------------------------------------- 해외 상장사(야후파이낸스) — run_gpcm_global
+# GPCM.py(run_global.bat 로 켜는 Streamlit 앱)의 계산을 그대로 부른다. 앱 사이드바의 입력을
+# 인자로 받고, 기간 조립도 사이드바 로직과 같다. 비교기업은 사용자가 미리 검토해 정한 티커만 받는다.
+_YAHOO_TICKER_RE = re.compile(r"^[A-Za-z0-9^][A-Za-z0-9.\-=^&]{0,24}$")
+GLOBAL_OUTLIER = ("none", "iqr", "pct")
+GLOBAL_TARGET_KEYS = ("Revenue", "EBITDA", "EBIT", "NI", "Equity", "IBD", "Cash", "NCI", "Shares")
+
+
+def _global_periods(base_period: str, lookback_years: int) -> list[str]:
+    """앱 사이드바와 같다: 기준 분기말 + 직전 N개 연말(기준이 연말이면 N−1개). 날짜 'YYYY-MM-DD' 목록."""
+    if not _PERIOD_RE.match(base_period or ""):
+        raise ValueError(f'기준 기간은 "2026.2Q" 형식입니다: {base_period}')
+    if not 1 <= int(lookback_years) <= 10:
+        raise ValueError(f"lookback_years 는 1~10 입니다: {lookback_years}")
+    year, qtr = _parse_period(base_period)
+    q_map = {"1Q": "-03-31", "2Q": "-06-30", "3Q": "-09-30", "4Q": "-12-31"}
+    base = f"{year}{q_map[qtr]}"
+    periods = [base]
+    n = int(lookback_years)
+    if base != f"{year}-12-31":
+        periods += [f"{year - i}-12-31" for i in range(1, n + 1)]
+    else:
+        periods += [f"{year - i}-12-31" for i in range(1, n)]
+    return sorted(set(periods))
+
+
+class _StProxy:
+    """GPCM.get_gpcm_data 안의 st.progress / st.empty / st.warning 자리를 받아 작업 기록으로 돌린다.
+    나머지 속성은 진짜 streamlit 그대로 (캐시 데코레이터 등)."""
+
+    def __init__(self, real, rec: "Recorder", job: dict[str, Any]):
+        self._real, self._rec, self._job = real, rec, job
+
+    def progress(self, value: Any = 0, *a: Any, **k: Any) -> "_StProxy._Bar":
+        self._rec.progress(value)
+        return _StProxy._Bar(self._rec)
+
+    def empty(self, *a: Any, **k: Any) -> "_StProxy._Slot":
+        return _StProxy._Slot(self._rec)
+
+    def warning(self, text: Any = "", *a: Any, **k: Any) -> None:
+        self._rec.write(text)
+        self._job.setdefault("warnings_shown", []).append(str(text)[:300])
+
+    class _Bar:
+        def __init__(self, rec: "Recorder"):
+            self._rec = rec
+
+        def progress(self, value: Any = 0, *a: Any, **k: Any) -> None:
+            self._rec.progress(value)
+
+        def empty(self) -> None:
+            pass
+
+    class _Slot:
+        def __init__(self, rec: "Recorder"):
+            self._rec = rec
+
+        def text(self, s: Any = "") -> None:
+            self._rec.write(s)
+
+        def empty(self) -> None:
+            pass
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
+def _work_global(job: dict[str, Any]) -> None:
+    with _muted_stdout():
+        _run_job_global(job, job["params"])
+
+
+def _run_job_global(job: dict[str, Any], p: dict[str, Any]) -> None:
+    real_st = G.st
+    try:
+        rec = Recorder(job)
+        G.st = _StProxy(real_st, rec, job)
+        try:
+            (all_period_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel, t_map,
+             avg_debt_ratio, wacc, dq_rows) = G.get_gpcm_data(
+                p["tickers"], p["periods"], mrp=p["mrp"], kd_pretax=p["kd_pretax"],
+                size_premium=p["size_premium"], target_tax_rate=p["tax_rate"],
+                user_rf_rate=p["rf"], beta_type=p["beta_type"],
+                beta_basis=p["beta_basis"], outlier_method=p["outlier_method"])
+        finally:
+            G.st = real_st
+        base = all_period_data.get("Y", {})
+        job["failed_tickers"] = [t for t in p["tickers"] if t not in base]
+        if not base:
+            raise RuntimeError("어느 티커도 자료를 받지 못했습니다. 티커 형식(거래소 접미사)을 확인하거나 "
+                               "잠시 뒤 다시 시도하세요(야후 조회 한도).")
+        if p.get("rate_source"):
+            # 조서에서 '이 rf·kd 는 어디서 왔나'에 답할 근거를 산출물 안에 남긴다
+            dq_rows.append({"Ticker": "(전체)", "Label": "Y", "Level": G.SEV_INFO,
+                            "Item": "Rf/Kd 출처", "Message": p["rate_source"]})
+        dq_rows.append({"Ticker": "(전체)", "Label": "Y", "Level": G.SEV_INFO, "Item": "비교기업 출처",
+                        "Message": "사용자가 사전에 검토해 입력한 티커 " + ", ".join(p["tickers"])
+                                   + " (Claude 데스크톱 run_gpcm_global 실행)"})
+        target_inputs = dict(p["target_inputs"])
+        target_inputs["beta_basis"] = p["beta_basis"]
+        book = G.create_excel(
+            all_period_data, raw_bs, raw_pl, mkt_rows, p_abs, p_rel, p["periods"][-1],
+            p["periods"], t_map, wacc, beta_type=p["beta_type"], data_quality_rows=dq_rows,
+            target_inputs=target_inputs, daily_price_span=p["daily_prices"])
+        out = Path(job["file"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(book.getvalue())
+        job["dq"] = {
+            "errors": sum(1 for r in dq_rows if r.get("Level") == G.SEV_ERROR),
+            "warnings": sum(1 for r in dq_rows if r.get("Level") == G.SEV_WARN),
+            "top": [f'{r.get("Level")} [{r.get("Ticker")}] {r.get("Item")}' for r in dq_rows
+                    if r.get("Level") in (G.SEV_ERROR, G.SEV_WARN)][:8],
+            "ebitda_missing": sorted({r["Ticker"] for r in dq_rows if r.get("Item") == "EBITDA"}),
+        }
+        job["target_wacc"] = round(wacc["Target_WACC"] * 100, 2)
+        job["wacc_detail"] = {
+            "ke_pct": round(wacc["Target_Ke"] * 100, 2),
+            "kd_aftertax_pct": round(wacc["Target_Kd_Aftertax"] * 100, 2),
+            "peer_avg_debt_ratio_pct": round(wacc["Avg_Debt_Ratio"] * 100, 1),
+            "avg_unlevered_beta": round(wacc["Avg_Unlevered_Beta"], 4),
+            "relevered_beta": round(wacc["Target_Relevered_Beta"], 4),
+            "beta_basis": wacc.get("Beta_Basis", ""),
+            "debt_ratio_basis": wacc.get("Debt_Ratio_Basis", ""),
+        }
+        job["state"] = "done"
+        job["pct"] = 100
+    except Exception:
+        job["state"] = "failed"
+        job["error"] = traceback.format_exc(limit=3)
+
+
+@mcp.tool()
+def run_gpcm_global(
+    tickers: list[str],
+    base_period: str,
+    lookback_years: int = 1,
+    rf: float = 3.3,
+    mrp: float = 8.0,
+    size_premium: float = 4.02,
+    kd_pretax: float = 3.5,
+    tax_rate: float = 26.4,
+    beta_type: str = "5Y",
+    beta_basis: str = "KOSPI",
+    outlier_method: str = "iqr",
+    daily_prices: str = "5Y",
+    rate_source: str = "",
+    target_financials: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """해외 상장사 GPCM(야후파이낸스 — run_global.bat 앱과 같은 계산)을 백그라운드로 실행해 엑셀을 만든다.
+
+    [비교기업 — 반드시 지킬 것]
+    tickers 는 **사용자가 사전에 별도로 검토해 정한 비교기업**을 사용자가 직접 준 그대로 넣는다.
+    Claude 가 회사를 고르거나 더하거나 빼거나 티커를 추측해 바꾸지 않는다. 사용자가 티커 목록을
+    주지 않았으면 실행하지 말고 "야후파이낸스 티커를 한 줄에 하나씩 주세요"라고 묻는다.
+    형식이 이상한 티커는 고치지 말고 사용자에게 확인한다(접미사: 도쿄 .T, 토론토 .TO,
+    프랑크푸르트 .F, 코스피 .KS, 코스닥 .KQ, 미국은 없음 — 모르면 finance.yahoo.com 검색 결과 그대로).
+
+    [호출 전 확인] 사용자가 값을 말하지 않았으면 하나씩 묻는다(기본값 제시):
+      1. base_period 기준 분기("2026.2Q" — 주가·시가총액 기준일 = 그 분기말)
+      2. rf 무위험이자율(기본 3.3%) — get_wacc_inputs 로 조회한 값·출처를 보여 주며 묻는다
+      3. mrp 시장위험프리미엄(기본 8.0%)
+      4. size_premium 사이즈 프리미엄(기본 4.02% — run_gpcm 과 같은 한국공인회계사회 구간)
+      5. kd_pretax 세전 타인자본비용(기본 3.5%)
+      6. tax_rate 피평가회사 법인세율(기본 26.4% — 한국 최고 구간 지방세 포함). 자동 산출 없음.
+      7. beta_type "5Y"(5년 월간) 또는 "2Y"(2년 주간)
+    "전부 기본값"이면 생략해도 된다. lookback_years·beta_basis·outlier_method·daily_prices 는
+    묻지 말고 기본값을 쓴다(사용자가 말하면 그 값).
+
+    티커당 수 초~수십 초 걸리므로 시작만 하고 바로 돌아온다. 진행·결과는 gpcm_status.
+    **결과를 전할 때는 파일 경로, Data_Quality 요약, 자료를 못 받은 티커를 반드시 함께 전한다.**
+
+    Args:
+        tickers: 야후파이낸스 티커 목록(사용자가 준 그대로). 최대 30개.
+        base_period: 기준 분기 "YYYY.NQ".
+        lookback_years: 과거 연간 추이 년수 1~10(기본 1 — 기준 분기 + 직전 연말).
+        rf, mrp, size_premium, kd_pretax, tax_rate: % 단위.
+        beta_type: "5Y" 또는 "2Y".
+        beta_basis: 한국 종목(.KS/.KQ)의 베타 기준지수 "KOSPI"(기본, 일괄) 또는 "MARKET"(소속시장).
+            해외 종목은 상장 국가 대표지수를 자동으로 쓴다.
+        outlier_method: 피어 평균(부채비율·무차입베타)의 이상치 처리 "iqr"(기본)·"pct"·"none".
+        daily_prices: 일별 주가 시트 구간 "off"·"1Y"·"2Y"·"3Y"·"5Y"(기본 5Y).
+        rate_source: rf·kd 근거 문장 — Data_Quality 시트에 INFO 로 남는다.
+        target_financials: (선택) 피평가회사 숫자(백만, 피어와 같은 통화) — 키 Revenue·EBITDA·EBIT·NI·
+            Equity·IBD·Cash·NCI·Shares. 넣으면 Implied_Valuation 시트에 미리 채워진다.
+    """
+    global _counter
+
+    codes = [t.strip() for t in tickers if t and t.strip()]
+    if not codes:
+        raise RuntimeError("tickers가 비어 있습니다. 사용자가 검토한 비교기업의 야후파이낸스 티커를 받으세요.")
+    bad = [t for t in codes if not _YAHOO_TICKER_RE.match(t)]
+    if bad:
+        raise RuntimeError(f"야후파이낸스 티커 형식이 아닙니다(고치지 말고 사용자에게 확인): {', '.join(bad)}")
+    dup = sorted({t for t in codes if codes.count(t) > 1})
+    if dup:
+        raise RuntimeError(f"같은 티커가 두 번 들어 있습니다: {', '.join(dup)}")
+    if len(codes) > MAX_TICKERS:
+        raise RuntimeError(f"{len(codes)}개는 너무 많습니다(상한 {MAX_TICKERS}).")
+    if beta_type not in BETA_TYPES:
+        raise RuntimeError(f'beta_type은 "5Y" 또는 "2Y"입니다: {beta_type}')
+    basis = (beta_basis or "KOSPI").strip().upper()
+    if basis not in ("KOSPI", "MARKET"):
+        raise RuntimeError(f'beta_basis 는 "KOSPI" 또는 "MARKET" 입니다: {beta_basis}')
+    om = (outlier_method or "iqr").strip().lower()
+    if om not in GLOBAL_OUTLIER:
+        raise RuntimeError(f'outlier_method 는 iqr·pct·none 중 하나입니다: {outlier_method}')
+    span = (daily_prices or "5Y").strip()
+    span = "off" if span.lower() == "off" else span.upper()
+    if span not in ("off", "1Y", "2Y", "3Y", "5Y"):
+        raise RuntimeError(f'daily_prices 는 off·1Y·2Y·3Y·5Y 중 하나입니다: {daily_prices}')
+    ti = {}
+    for k, v in (target_financials or {}).items():
+        if k not in GLOBAL_TARGET_KEYS:
+            raise RuntimeError(f"target_financials 키는 {', '.join(GLOBAL_TARGET_KEYS)} 중 하나입니다: {k}")
+        ti[k] = float(v) if v not in (None, "") else None
+    target_inputs = {k: (ti.get(k) or None) for k in GLOBAL_TARGET_KEYS}
+    periods = _global_periods(base_period, lookback_years)
+
+    _load_global()
+
+    with _lock:
+        running = [j for j in _jobs.values() if j["state"] == "running"]
+        if running:
+            raise RuntimeError(
+                f'이미 실행 중인 작업이 있습니다({running[0]["id"]}). '
+                "gpcm_status 로 완료를 확인한 뒤 다시 부르세요.")
+        _counter += 1
+        job_id = f"job-{_counter}"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        job: dict[str, Any] = {
+            "id": job_id, "kind": "global", "state": "running", "pct": 0, "log": [],
+            "file": str(OUTPUT_DIR / f"Global_GPCM_{periods[-1].replace('-', '')}_{stamp}.xlsx"),
+            "params": {
+                "tickers": codes, "periods": periods,
+                "rf": rf / 100, "mrp": mrp / 100, "size_premium": size_premium / 100,
+                "kd_pretax": kd_pretax / 100, "tax_rate": tax_rate / 100,
+                "beta_type": beta_type, "beta_basis": basis, "outlier_method": om,
+                "daily_prices": span, "rate_source": rate_source.strip(),
+                "target_inputs": target_inputs,
+            },
+        }
+        _jobs[job_id] = job
+
+    thread = threading.Thread(target=_work_global, args=(job,), daemon=True)
+    job["thread"] = thread
+    thread.start()
+    return {
+        "job_id": job_id,
+        "state": "running",
+        "kind": "global (야후파이낸스)",
+        "tickers": codes,
+        "periods": periods,
+        "output_file": job["file"],
+        "note": f"약 {len(codes) * 15}초 내외 걸립니다. gpcm_status로 확인하세요.",
+    }
 
 
 # 명단 메모이즈 — st.cache_resource 는 bare mode 에서 신뢰할 수 없어 자체로 든다
@@ -1083,6 +1370,23 @@ def _diagnose() -> list[dict[str, Any]]:
         except Exception as e:
             checks.append(_check("KRX 시세 목록", False, str(e)[:120],
                                  "잠시 뒤 다시 시도하세요."))
+
+    # 해외 상장사(야후파이낸스) — run_gpcm_global. 인증키가 필요 없고 국내 점검과 따로 본다.
+    has_g = (SERVER_DIR / "GPCM.py").exists()
+    checks.append(_check("해외판 계산 파일", has_g, "GPCM.py 있음" if has_g else "GPCM.py 없음",
+                         "확장 0.10.0 이상으로 다시 설치하세요(해외 상장사 실행에만 필요)."))
+    if has_g:
+        try:
+            import urllib.request
+            req = urllib.request.Request("https://query1.finance.yahoo.com/v8/finance/chart/AAPL?range=5d&interval=1d",
+                                         headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                ok_y = r.status == 200
+            checks.append(_check("야후파이낸스 연결", True if ok_y else None, "정상" if ok_y else f"응답 {r.status}",
+                                 "해외 상장사 실행만 영향을 받습니다. 잠시 뒤 다시 시도하세요."))
+        except Exception as e:
+            checks.append(_check("야후파이낸스 연결", None, f"실패 ({str(e)[:80]})",
+                                 "해외 상장사 실행만 영향을 받습니다. 사내망이 finance.yahoo.com 을 막는지 확인하세요."))
     return checks
 
 
@@ -1102,7 +1406,7 @@ def gpcm_doctor() -> dict[str, Any]:
         "실행 위치": str(SERVER_DIR),
         "판정": "정상" if not bad else f"{len(bad)}개 항목 실패",
         "점검": checks,
-        "다음": ("run_gpcm 을 써도 됩니다." if not bad else
+        "다음": ("run_gpcm(국내)·run_gpcm_global(해외, 야후파이낸스)을 써도 됩니다." if not bad else
                  "실패 항목의 조치를 먼저 처리하세요. 그래도 안 되면 이 결과를 그대로 보여주세요."),
     }
 
